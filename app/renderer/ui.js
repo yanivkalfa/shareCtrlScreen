@@ -115,7 +115,65 @@ App.UI = (function () {
   async function reloadConfig() {
     config = await window.native.configGet();
     $('my-uuid').textContent = config.uuid;
+    renderRecents();
     return config;
+  }
+
+  // A remote id shown compactly on a chip (UUIDs are long).
+  function shortId(id) {
+    return id.length > 14 ? id.slice(0, 8) + '…' : id;
+  }
+
+  // Populate the autocomplete <datalist> and the clickable "Recent:" chips row
+  // from config.recentIds.
+  function renderRecents() {
+    const ids = (config && config.recentIds) || [];
+
+    const dl = $('recent-ids');
+    dl.innerHTML = '';
+    for (const id of ids) {
+      const o = document.createElement('option');
+      o.value = id;
+      dl.appendChild(o);
+    }
+
+    const row = $('recents-row');
+    row.innerHTML = '';
+    if (!ids.length) return;
+
+    const label = document.createElement('span');
+    label.className = 'recents-label';
+    label.textContent = 'Recent:';
+    row.appendChild(label);
+
+    for (const id of ids) {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'recent-chip';
+      chip.textContent = shortId(id);
+      chip.title = id;
+      chip.addEventListener('click', () => {
+        const input = $('remote-id');
+        input.value = id;
+        input.dispatchEvent(new Event('input')); // re-validate + enable Connect
+        input.focus();
+      });
+      row.appendChild(chip);
+    }
+
+    const clear = document.createElement('button');
+    clear.type = 'button';
+    clear.className = 'recent-clear';
+    clear.textContent = 'Clear';
+    clear.addEventListener('click', async () => {
+      try {
+        config.recentIds = await window.native.recentsClear();
+      } catch (_) {
+        config.recentIds = [];
+      }
+      renderRecents();
+    });
+    row.appendChild(clear);
   }
 
   // ---- settings modal ----------------------------------------------------
@@ -128,6 +186,7 @@ App.UI = (function () {
     $('set-password-clear').checked = false;
     $('set-password-perm').value = config.passwordPermission;
     $('set-share-audio').checked = config.shareAudio !== false;
+    $('set-capture-shortcuts').checked = config.captureShortcuts === true;
     await populateDisplays();
     $('modal-settings').classList.remove('hidden');
   }
@@ -165,6 +224,7 @@ App.UI = (function () {
       mode: $('set-mode-password').checked ? 'password' : 'approve',
       passwordPermission: $('set-password-perm').value,
       shareAudio: $('set-share-audio').checked,
+      captureShortcuts: $('set-capture-shortcuts').checked,
       shareDisplayId: $('set-share-display').value || null
     };
 
@@ -189,6 +249,9 @@ App.UI = (function () {
 
     // §6: a serverUrl change triggers a signaling reconnect.
     if (config.serverUrl !== prevUrl && App.Signaling) App.Signaling.reconnectNow();
+
+    // Apply a captureShortcuts toggle immediately if a session is live.
+    if (App.Viewer) App.Viewer.updateShortcutCapture();
   }
 
   function wire() {
@@ -224,6 +287,7 @@ App.UI = (function () {
     countdown,
     validUuid,
     getConfig,
-    reloadConfig
+    reloadConfig,
+    renderRecents
   };
 })();

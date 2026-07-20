@@ -41,10 +41,13 @@
           placeholder="Remote ID (UUID)"
           spellcheck="false"
           autocomplete="off"
+          list="recent-ids"
         />
+        <datalist id="recent-ids"></datalist>
         <button id="btn-connect" class="btn btn-primary" disabled>Connect</button>
       </div>
       <div class="hint" id="connect-hint"></div>
+      <div class="recents" id="recents-row"></div>
     </div>
   </main>
 </section>
@@ -177,6 +180,16 @@
       <input type="checkbox" id="set-share-audio" />
       Share this machine's system audio when hosting
     </label>
+
+    <label class="radio">
+      <input type="checkbox" id="set-capture-shortcuts" />
+      Capture keyboard shortcuts (Alt+Tab, Win) and send them to the remote
+    </label>
+    <div class="hint">
+      Experimental. While viewing with control, these keys act on the remote
+      instead of your own machine. Click another window to release. Ctrl+Alt+Del
+      can't be captured (Windows security).
+    </div>
 
     <label class="field">
       <span>Monitor to share (when hosting)</span>

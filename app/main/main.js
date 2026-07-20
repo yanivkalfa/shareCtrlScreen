@@ -73,6 +73,14 @@ function createWindow() {
   win.webContents.on('will-navigate', (event) => event.preventDefault());
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
 
+  // Tie the global keyboard hook to focus: losing focus always removes it.
+  win.on('blur', reconcileHook);
+  win.on('focus', reconcileHook);
+  win.on('close', () => {
+    wantHook = false;
+    if (keyhook && keyhook.isInstalled()) keyhook.uninstall();
+  });
+
   win.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
 }
 
@@ -93,7 +101,9 @@ function publicConfig() {
     hasPassword: !!c.passwordHash, // never expose the hash itself
     iceServers: c.iceServers,
     shareAudio: c.shareAudio,
-    shareDisplayId: c.shareDisplayId
+    shareDisplayId: c.shareDisplayId,
+    recentIds: c.recentIds,
+    captureShortcuts: c.captureShortcuts
   };
 }
 
@@ -153,6 +163,13 @@ function registerIpc() {
       next.shareAudio = patch.shareAudio;
     }
 
+    if (patch.captureShortcuts !== undefined) {
+      if (typeof patch.captureShortcuts !== 'boolean') {
+        throw new Error('captureShortcuts must be a boolean');
+      }
+      next.captureShortcuts = patch.captureShortcuts;
+    }
+
     if (patch.shareDisplayId !== undefined) {
       // null / '' => primary; otherwise a display id string.
       if (patch.shareDisplayId === null || patch.shareDisplayId === '') {
@@ -166,6 +183,16 @@ function registerIpc() {
 
     config.save(next);
     return publicConfig();
+  });
+
+  ipcMain.handle('recents:add', (event, id) => {
+    if (!fromMainFrame(event)) return [];
+    return config.addRecent(id);
+  });
+
+  ipcMain.handle('recents:clear', (event) => {
+    if (!fromMainFrame(event)) return [];
+    return config.clearRecents();
   });
 
   ipcMain.handle('password:verify', async (event, plain) => {
@@ -251,6 +278,14 @@ function registerIpc() {
     // release nothing.
     if (input) input.releaseAll();
   });
+
+  // Viewer asks to enable/disable shortcut capture (VIEW_ACTIVE + control +
+  // the setting). Actual install is focus-gated in reconcileHook.
+  ipcMain.handle('keyhook:set', (event, enabled) => {
+    if (!fromMainFrame(event)) return;
+    wantHook = !!enabled && config.load().captureShortcuts;
+    reconcileHook();
+  });
 }
 
 // §4.4 input:inject — strict validation BEFORE input.js is touched.
@@ -259,6 +294,48 @@ let input = null;
 function getInput() {
   if (input === null) input = require('./input');
   return input;
+}
+
+// --- keyboard passthrough hook (viewer-side) --------------------------------
+// The hook is a global input hook, so its lifetime is tied tightly to window
+// focus: install only when the renderer wants it AND we are focused; uninstall
+// on blur/close. "Click away" therefore always removes it.
+let keyhook = null;
+let wantHook = false; // renderer asked for capture (VIEW_ACTIVE + control + setting)
+function getKeyhook() {
+  if (keyhook === null) keyhook = require('./keyhook');
+  return keyhook;
+}
+
+function forwardShortcut(code, isDown) {
+  if (win && !win.isDestroyed()) {
+    win.webContents.send('passthrough-key', { code, down: isDown });
+  }
+}
+
+// Reconcile the hook against desired state + focus. Fully guarded: any failure
+// (module load, koffi, Win32) just leaves the feature off — it must never throw
+// into an Electron event handler or IPC call.
+let keyhookBroken = false;
+function reconcileHook() {
+  try {
+    const shouldRun = wantHook && !!win && !win.isDestroyed() && win.isFocused();
+    if (keyhookBroken) return;
+    // Don't even load the module unless something wants the hook.
+    const kh = keyhook || (shouldRun ? getKeyhook() : null);
+    if (!kh) return;
+    if (shouldRun) {
+      if (!kh.isInstalled()) kh.install(forwardShortcut);
+    } else if (kh.isInstalled()) {
+      kh.uninstall();
+    }
+  } catch (err) {
+    console.error('[keyhook] disabled after error', err);
+    keyhookBroken = true;
+    try {
+      if (keyhook && keyhook.isInstalled()) keyhook.uninstall();
+    } catch (_) {}
+  }
 }
 
 const finite = (v) => typeof v === 'number' && Number.isFinite(v);

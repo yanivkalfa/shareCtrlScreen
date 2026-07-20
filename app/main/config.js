@@ -18,8 +18,32 @@ function defaults() {
     // share system loopback audio alongside the screen.
     shareAudio: true,
     // Which monitor to share: a display id (string) or null for the primary.
-    shareDisplayId: null
+    shareDisplayId: null,
+    // Remote IDs this machine has connected to, most-recent-first (autocomplete).
+    recentIds: [],
+    // Viewer-side: capture OS-reserved shortcuts (Alt+Tab, Win) locally and send
+    // them to the remote. Experimental global keyboard hook — off by default.
+    captureShortcuts: false
   };
+}
+
+const MAX_RECENTS = 10;
+
+// Prepend id, de-duplicate, and cap the list. Returns the new array.
+function addRecent(id) {
+  const cfg = load();
+  if (typeof id !== 'string') return cfg.recentIds;
+  const clean = id.trim();
+  if (!clean || clean.length > 64) return cfg.recentIds;
+
+  const next = [clean, ...cfg.recentIds.filter((x) => x !== clean)].slice(0, MAX_RECENTS);
+  save({ recentIds: next });
+  return next;
+}
+
+function clearRecents() {
+  save({ recentIds: [] });
+  return [];
 }
 
 function configPath() {
@@ -41,7 +65,11 @@ function normalize(raw) {
     passwordPermission: raw.passwordPermission === 'control' ? 'control' : 'view',
     iceServers: Array.isArray(raw.iceServers) ? raw.iceServers : d.iceServers,
     shareAudio: typeof raw.shareAudio === 'boolean' ? raw.shareAudio : d.shareAudio,
-    shareDisplayId: typeof raw.shareDisplayId === 'string' ? raw.shareDisplayId : null
+    shareDisplayId: typeof raw.shareDisplayId === 'string' ? raw.shareDisplayId : null,
+    recentIds: Array.isArray(raw.recentIds)
+      ? raw.recentIds.filter((x) => typeof x === 'string' && x.length <= 64).slice(0, MAX_RECENTS)
+      : [],
+    captureShortcuts: typeof raw.captureShortcuts === 'boolean' ? raw.captureShortcuts : false
   };
   return out;
 }
@@ -131,4 +159,13 @@ function verifyProof(nonce, proof) {
   return crypto.timingSafeEqual(a, b);
 }
 
-module.exports = { load, save, verifyPassword, verifyProof, hash, configPath };
+module.exports = {
+  load,
+  save,
+  addRecent,
+  clearRecents,
+  verifyPassword,
+  verifyProof,
+  hash,
+  configPath
+};

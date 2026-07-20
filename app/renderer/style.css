@@ -92,6 +92,31 @@ html, body {
 
 .hint { color: var(--muted); font-size: 12px; margin-top: 10px; }
 
+/* recent-connections chips */
+.recents { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-top: 12px; }
+.recents-label { color: var(--muted); font-size: 12px; margin-right: 2px; }
+.recent-chip {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  border-radius: 20px;
+  padding: 4px 11px;
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 12px;
+  cursor: pointer;
+}
+.recent-chip:hover { background: #2c3242; border-color: var(--accent); }
+.recent-clear {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+  text-decoration: underline;
+  padding: 4px 6px;
+}
+.recent-clear:hover { color: var(--fg); }
+
 /* ---------- controls ---------- */
 .input {
   flex: 1;

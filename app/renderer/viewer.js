@@ -271,6 +271,18 @@ App.Viewer = (function () {
     $('view-peer').textContent = peer || '';
     applyPermission(permission);
     UI.setState('VIEW_ACTIVE');
+
+    // A real connection was established — remember this remote for autocomplete.
+    if (peer) {
+      window.native
+        .recentsAdd(peer)
+        .then((list) => {
+          const cfg = UI.getConfig();
+          if (cfg) cfg.recentIds = list;
+          UI.renderRecents();
+        })
+        .catch(() => {});
+    }
   }
 
   // ---- step 5: host control messages -------------------------------------
@@ -296,6 +308,18 @@ App.Viewer = (function () {
     $('video-wrap').classList.toggle('control', permission === 'control');
 
     setCaptureEnabled(permission === 'control');
+    updateShortcutCapture();
+  }
+
+  // Ask main to (dis)arm the shortcut hook. It only runs when VIEW_ACTIVE +
+  // control + the setting is on; main further gates on window focus.
+  function updateShortcutCapture() {
+    const cfg = UI.getConfig();
+    const want =
+      UI.getState() === 'VIEW_ACTIVE' &&
+      permission === 'control' &&
+      !!(cfg && cfg.captureShortcuts);
+    window.native.keyhookSet(want).catch(() => {});
   }
 
   // ---- step 6: teardown ---------------------------------------------------
@@ -305,6 +329,7 @@ App.Viewer = (function () {
 
   function teardown(notify) {
     setCaptureEnabled(false);
+    window.native.keyhookSet(false).catch(() => {}); // always disarm the hook
 
     if (disconnectTimer) clearTimeout(disconnectTimer);
     disconnectTimer = null;
@@ -500,6 +525,20 @@ App.Viewer = (function () {
 
     // Alt-Tabbing away must not leave keys or buttons stuck down on the host.
     window.addEventListener('blur', releaseAllInput);
+
+    // Keys suppressed locally by the main-process hook (Alt+Tab, Win, …) arrive
+    // here instead of as DOM events. Route them through the same send + stuck-key
+    // tracking so a lost 'up' is still released on blur/teardown.
+    window.native.onPassthroughKey((code, down) => {
+      if (!captureEnabled) return;
+      if (down) {
+        keysDown.add(code);
+        sendCtl({ t: 'kd', code });
+      } else {
+        keysDown.delete(code);
+        sendCtl({ t: 'ku', code });
+      }
+    });
   }
 
   function cancelRequest() {
@@ -536,6 +575,7 @@ App.Viewer = (function () {
     onRemoteEnd,
     teardown,
     isPeer,
+    updateShortcutCapture,
     getPermission: () => permission,
     getPeer: () => peer,
     getPc: () => pc,

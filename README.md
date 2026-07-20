@@ -85,8 +85,12 @@ signing in v1, so Windows SmartScreen will warn on first run — that is expecte
   into UAC prompts or apps running as administrator — this is the Windows UIPI
   security boundary, not a bug. Run the host as administrator if you need to
   control elevated apps.
-- **OS-reserved key combinations cannot be captured** by the viewer: Ctrl+Alt+Del,
-  Win+L, and Alt+Tab are handled by Windows before the app sees them. F11 is
+- **Keyboard shortcut passthrough** (experimental, off by default): enable
+  ⚙ Settings → "Capture keyboard shortcuts" and, while viewing with control,
+  **Alt+Tab / Alt+Esc / the Win keys are captured locally and sent to the remote**
+  instead of acting on your machine (a focus-scoped low-level keyboard hook —
+  losing window focus releases it). Still **cannot** be captured, by Windows
+  design: **Ctrl+Alt+Del** and **Win+L** (kernel/secure-desktop level). F11 is
   deliberately left alone so local fullscreen still works.
 - **One session at a time** per machine. A second incoming request gets `busy`.
 - **Password uses challenge-response** — the viewer sends a proof derived from a

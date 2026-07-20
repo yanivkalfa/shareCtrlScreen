@@ -1,0 +1,16 @@
+{
+  // Signaling / rendezvous server for ShareCtrlScreen.
+  // Relays JSON only — never carries video or input data.
+  "name": "sharectrl-signal",
+  "main": "src/index.js",
+  "compatibility_date": "2026-07-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "SIGNAL", "class_name": "SignalingRoom" }
+    ]
+  },
+  // Must be new_sqlite_classes: only SQLite-backed DOs are allowed on the free plan.
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["SignalingRoom"] }
+  ]
+}

@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<meta charset="utf-8" />
+<meta
+  http-equiv="Content-Security-Policy"
+  content="default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src ws: wss:; media-src 'self' blob:; img-src 'self' data:"
+/>
+<title>ShareCtrlScreen</title>
+<link rel="stylesheet" href="style.css" />
+
+<!-- ===================== HOME (OFFLINE / READY) ===================== -->
+<section id="screen-home" class="screen">
+  <header class="topbar">
+    <div class="brand">ShareCtrlScreen</div>
+    <div class="spacer"></div>
+    <div id="status" class="status">
+      <span id="status-dot" class="dot dot-red"></span>
+      <span id="status-text">server: disconnected</span>
+    </div>
+    <button id="btn-settings" class="btn btn-ghost" title="Settings">&#9881;</button>
+  </header>
+
+  <div id="banner" class="banner hidden"></div>
+
+  <main class="home">
+    <div class="card">
+      <div class="card-label">Your ID</div>
+      <div class="uuid-row">
+        <div id="my-uuid" class="uuid">&hellip;</div>
+        <button id="btn-copy" class="btn">Copy</button>
+      </div>
+      <div class="hint">Give this ID to someone who should connect to this machine.</div>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Connect to a remote machine</div>
+      <div class="uuid-row">
+        <input
+          id="remote-id"
+          class="input mono"
+          type="text"
+          placeholder="Remote ID (UUID)"
+          spellcheck="false"
+          autocomplete="off"
+        />
+        <button id="btn-connect" class="btn btn-primary" disabled>Connect</button>
+      </div>
+      <div class="hint" id="connect-hint"></div>
+    </div>
+  </main>
+</section>
+
+<!-- ===================== HOST_ACTIVE ===================== -->
+<section id="screen-host" class="screen hidden">
+  <header class="topbar">
+    <div class="brand">Sharing screen</div>
+    <div class="spacer"></div>
+    <div id="host-status" class="status"><span class="dot dot-green"></span><span>connected</span></div>
+  </header>
+
+  <main class="home">
+    <div class="card">
+      <div class="card-label">Sharing screen with</div>
+      <div id="host-peer" class="uuid">&hellip;</div>
+
+      <div class="row">
+        <label for="host-perm">Permission</label>
+        <select id="host-perm" class="input">
+          <option value="view">view</option>
+          <option value="control">control</option>
+        </select>
+      </div>
+
+      <div class="row">
+        <button id="btn-host-end" class="btn btn-danger">End session</button>
+      </div>
+      <div class="hint">
+        Switching to <b>view</b> stops the remote user's mouse and keyboard immediately.
+      </div>
+    </div>
+  </main>
+</section>
+
+<!-- ===================== VIEW_ACTIVE ===================== -->
+<section id="screen-view" class="screen hidden">
+  <div class="view-bar">
+    <span id="view-peer" class="mono small">&hellip;</span>
+    <span id="view-badge" class="badge badge-view">VIEW ONLY</span>
+    <div class="spacer"></div>
+    <button id="btn-view-end" class="btn btn-danger btn-sm">Disconnect</button>
+  </div>
+  <div id="video-wrap" class="video-wrap">
+    <video id="video" autoplay playsinline></video>
+  </div>
+</section>
+
+<!-- ===================== MODALS ===================== -->
+
+<!-- REQUESTING -->
+<div id="modal-requesting" class="modal hidden">
+  <div class="modal-box">
+    <h3>Connecting&hellip;</h3>
+    <p class="mono small" id="requesting-peer"></p>
+    <p class="hint">Waiting for the remote machine to answer &mdash; <b id="requesting-count">30</b> s</p>
+    <div class="modal-actions">
+      <button id="btn-cancel-request" class="btn">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- PASSWORD_PROMPT -->
+<div id="modal-password" class="modal hidden">
+  <div class="modal-box">
+    <h3>Password required</h3>
+    <p class="hint">This machine is protected by a password.</p>
+    <input id="password-input" class="input" type="password" placeholder="Password" />
+    <div class="modal-actions">
+      <button id="btn-password-cancel" class="btn">Cancel</button>
+      <button id="btn-password-ok" class="btn btn-primary">OK</button>
+    </div>
+  </div>
+</div>
+
+<!-- INCOMING (host) -->
+<div id="modal-incoming" class="modal hidden">
+  <div class="modal-box">
+    <h3>Incoming connection</h3>
+    <p class="mono small" id="incoming-peer"></p>
+    <p class="hint">wants to connect to this machine &mdash; auto-deny in <b id="incoming-count">30</b> s</p>
+    <div class="modal-actions modal-actions-stack">
+      <button id="btn-incoming-deny" class="btn btn-danger">Deny</button>
+      <button id="btn-incoming-view" class="btn">Allow view only</button>
+      <button id="btn-incoming-control" class="btn btn-primary">Allow view + control</button>
+    </div>
+  </div>
+</div>
+
+<!-- SETTINGS -->
+<div id="modal-settings" class="modal hidden">
+  <div class="modal-box modal-wide">
+    <h3>Settings</h3>
+
+    <label class="field">
+      <span>Server URL</span>
+      <input id="set-server" class="input mono" type="text" spellcheck="false" />
+    </label>
+
+    <fieldset class="field">
+      <legend>Incoming connections</legend>
+      <label class="radio">
+        <input type="radio" name="mode" value="approve" id="set-mode-approve" />
+        Ask me for each connection
+      </label>
+      <label class="radio">
+        <input type="radio" name="mode" value="password" id="set-mode-password" />
+        Password
+      </label>
+    </fieldset>
+
+    <label class="field">
+      <span>Password</span>
+      <input id="set-password" class="input" type="password" />
+    </label>
+    <label class="radio">
+      <input type="checkbox" id="set-password-clear" />
+      Clear the saved password
+    </label>
+
+    <label class="field">
+      <span>When password is used, allow</span>
+      <select id="set-password-perm" class="input">
+        <option value="view">view</option>
+        <option value="control">control</option>
+      </select>
+    </label>
+
+    <label class="radio">
+      <input type="checkbox" id="set-share-audio" />
+      Share this machine's system audio when hosting
+    </label>
+
+    <label class="field">
+      <span>Monitor to share (when hosting)</span>
+      <select id="set-share-display" class="input">
+        <option value="">Primary monitor</option>
+      </select>
+    </label>
+
+    <div class="modal-actions">
+      <button id="btn-settings-cancel" class="btn">Cancel</button>
+      <button id="btn-settings-save" class="btn btn-primary">Save</button>
+    </div>
+  </div>
+</div>
+
+<div id="toasts" class="toasts"></div>
+
+<script src="ui.js"></script>
+<script src="signaling.js"></script>
+<script src="host.js"></script>
+<script src="viewer.js"></script>
+<script src="app.js"></script>

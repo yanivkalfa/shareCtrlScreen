@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Build output
+app/dist/
+dist/
+build/
+out/
+*.exe
+
+# Wrangler / Cloudflare local state (may contain local dev state; never commit)
+.wrangler/
+**/.wrangler/
+.dev.vars
+.dev.vars.*
+
+# Local runtime config that could hold secrets (belt-and-braces; app config lives in userData, not here)
+**/config.json
+!app/**/config.js
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / editor
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
+
+# Env files
+.env
+.env.*

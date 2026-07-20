@@ -68,12 +68,31 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build and publish to GitHub Release
-        run: npx electron-builder --win --publish always
+      # Build only (no electron-builder publisher — it races on multi-target and
+      # can't create the tag for a published release). Assets land in app/dist.
+      - name: Build Windows app
+        run: npx electron-builder --win
+
+      # gh creates the tag v<version>, the published release, and uploads both
+      # exes in one shot — atomic, no race, no draft.
+      - name: Publish GitHub release with assets
+        shell: bash
         env:
-          # electron-builder uses this to create the release (tag v<version>)
-          # and upload the installer + portable exe as assets.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="v${{ needs.check.outputs.version }}"
+          shopt -s nullglob
+          files=(dist/*.exe)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No .exe files found in app/dist — build produced nothing to release."
+            exit 1
+          fi
+          echo "Releasing $tag with: ${files[*]}"
+          gh release create "$tag" "${files[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "ShareCtrlScreen v${{ needs.check.outputs.version }}" \
+            --notes "Windows installer + portable build. Unsigned — SmartScreen will warn (More info → Run anyway)." \
+            --latest
 
       - name: Upload build artifacts (fallback download)
         uses: actions/upload-artifact@v4
@@ -82,5 +101,4 @@ jobs:
           name: ShareCtrlScreen-v${{ needs.check.outputs.version }}
           path: |
             app/dist/*.exe
-            app/dist/latest.yml
           if-no-files-found: warn

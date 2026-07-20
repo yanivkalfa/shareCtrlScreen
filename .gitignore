@@ -19,9 +19,10 @@ out/
 **/config.json
 !app/**/config.js
 
-# Logs
+# Logs / scratch
 *.log
 npm-debug.log*
+/Errors
 
 # OS / editor
 Thumbs.db

@@ -1,0 +1,91 @@
+name: Deploy Server
+
+# Idempotent, version-driven deploy of the signaling server to Cloudflare.
+#
+# Source of truth is the "version" field in server/package.json.
+# Clicking "Run workflow" (Actions -> Deploy Server -> Run workflow):
+#   1. reads that version, e.g. 1.0.0 -> gate tag "server-v1.0.0"
+#   2. if that gate tag already exists -> skips (already deployed, no-op)
+#   3. otherwise runs `wrangler deploy` to push the Worker + Durable Object to
+#      Cloudflare, then creates the gate tag to record the deploy.
+#
+# To redeploy after changing the server: bump "version" in server/package.json,
+# commit, push, run.
+#
+# Requires a repo secret named APP_TOKEN = a Cloudflare API token (see README /
+# the "Edit Cloudflare Workers" token template).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # Cheap job: read version, decide whether this version was already deployed.
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      exists: ${{ steps.exists.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from server/package.json
+        id: v
+        shell: bash
+        run: echo "version=$(node -p "require('./server/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether server-v<version> was already deployed
+        id: exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          tag="server-v${{ steps.v.outputs.version }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$tag already deployed — skipping."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$tag not deployed yet — will deploy to Cloudflare."
+          fi
+
+  # Deploy job: runs ONLY when this server version has not been deployed.
+  deploy:
+    needs: check
+    if: needs.check.outputs.exists == 'false'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Deploy to Cloudflare
+        run: npx wrangler deploy
+        env:
+          # APP_TOKEN is a Cloudflare API token stored in repo secrets.
+          CLOUDFLARE_API_TOKEN: ${{ secrets.APP_TOKEN }}
+          # Account ID is not secret (appears in dashboard URLs); pins the target account.
+          CLOUDFLARE_ACCOUNT_ID: 3f7efa1a7487365b0e114c3f3584f91f
+
+      - name: Record deploy (idempotency gate tag)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          gh release create "server-v${{ needs.check.outputs.version }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Signaling server v${{ needs.check.outputs.version }}" \
+            --notes "Deployed to Cloudflare Workers — wss://sharectrl-signal.netameta.workers.dev/ws" \
+            --latest=false

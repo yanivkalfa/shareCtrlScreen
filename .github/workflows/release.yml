@@ -1,35 +1,65 @@
 name: Release
 
-# Manual "Run workflow" button in the Actions tab. Builds the Windows app and
-# publishes the installer + portable exe to a GitHub Release (created as a DRAFT
-# by default — review it, then click "Publish release").
+# Idempotent, version-driven release.
+#
+# The single source of truth is the "version" field in app/package.json.
+# Clicking "Run workflow" (Actions -> Release -> Run workflow):
+#   1. reads that version, e.g. 1.0.0 -> tag "v1.0.0"
+#   2. if a GitHub Release with that tag already exists  -> skips (no-op)
+#   3. otherwise builds the Windows app and publishes the installer + portable
+#      exe to a new GitHub Release tagged v<version>.
+#
+# To cut a new release: bump "version" in app/package.json, commit, push, run.
 on:
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Release version, e.g. 1.0.1 (blank = keep package.json version)"
-        required: false
-        default: ""
 
-# Let the built-in GITHUB_TOKEN create releases and upload assets.
 permissions:
   contents: write
 
 jobs:
+  # Cheap Linux job: figure out the version and whether it's already released.
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      exists: ${{ steps.exists.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from app/package.json
+        id: v
+        shell: bash
+        run: echo "version=$(node -p "require('./app/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether release v<version> already exists
+        id: exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          tag="v${{ steps.v.outputs.version }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Release $tag already exists — skipping build & publish."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No release $tag yet — will build & publish."
+          fi
+
+  # Windows build job: runs ONLY when the release does not already exist.
   build-release:
-    # MUST be Windows: the app is Windows-only, uses the native koffi module,
-    # and builds an NSIS installer.
+    needs: check
+    if: needs.check.outputs.exists == 'false'
+    # MUST be Windows: Windows-only app, native koffi module, NSIS installer.
     runs-on: windows-latest
     defaults:
       run:
         working-directory: app
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
@@ -38,21 +68,18 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Set release version
-        if: inputs.version != ''
-        run: npm version "${{ inputs.version }}" --no-git-tag-version --allow-same-version
-
       - name: Build and publish to GitHub Release
         run: npx electron-builder --win --publish always
         env:
-          # electron-builder reads this to create the release and upload assets.
+          # electron-builder uses this to create the release (tag v<version>)
+          # and upload the installer + portable exe as assets.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload build artifacts (fallback download)
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ShareCtrlScreen-windows
+          name: ShareCtrlScreen-v${{ needs.check.outputs.version }}
           path: |
             app/dist/*.exe
             app/dist/latest.yml

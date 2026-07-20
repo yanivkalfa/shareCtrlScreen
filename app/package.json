@@ -32,7 +32,8 @@
       {
         "provider": "github",
         "owner": "yanivkalfa",
-        "repo": "shareCtrlScreen"
+        "repo": "shareCtrlScreen",
+        "releaseType": "release"
       }
     ],
     "win": {

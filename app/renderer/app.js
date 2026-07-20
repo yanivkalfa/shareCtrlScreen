@@ -10,5 +10,6 @@
 
   if (App.Host) App.Host.wire();
   if (App.Viewer) App.Viewer.wire();
+  if (App.Caps) App.Caps.init(); // detect codec/hardware capabilities
   if (App.Signaling) App.Signaling.start();
 })();

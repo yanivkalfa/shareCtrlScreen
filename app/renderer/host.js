@@ -22,6 +22,7 @@ App.Host = (function () {
   let negotiationTimer = null; // accept -> ctl-open watchdog
   let pendingIce = [];        // candidates that arrived before the remote description
   let challenge = null;       // { from, nonce } outstanding password challenge
+  let pendingViewerCaps = null; // viewer's decode codec list from connect-request
 
   // 16 random bytes as lower-case hex — the per-attempt password nonce (§3.2).
   function randomHex() {
@@ -38,6 +39,10 @@ App.Host = (function () {
   async function onConnectRequest(msg) {
     const from = msg.from;
     if (!UI.validUuid(from)) return;
+
+    // Remember the viewer's decode capabilities for codec negotiation (§3.2).
+    pendingViewerCaps =
+      msg.caps && Array.isArray(msg.caps.decode) ? msg.caps.decode : null;
 
     // 1. Busy if we are not idle. State alone is not enough: between accept()
     //    and the ctl channel opening (password path) the state is still READY,
@@ -255,7 +260,7 @@ App.Host = (function () {
 
     // f. Tuning — each guard is independent; the app must work if all fail (§11.4).
     tuneSender(sender);
-    tuneCodecs();
+    await negotiateCodecs(); // pick the best codec both peers can handle
 
     // g. ICE + offer.
     pc.onicecandidate = (e) => {
@@ -278,7 +283,11 @@ App.Host = (function () {
 
     try {
       const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
+      // Tune Opus for system audio (music), not speech: stereo, higher bitrate,
+      // in-band FEC for loss resilience, and DTX OFF (DTX on continuous audio is
+      // a common source of clicking/ticking). Fail-safe: unchanged if no match.
+      const sdp = tuneOpus(offer.sdp);
+      await pc.setLocalDescription({ type: 'offer', sdp });
       App.Signaling.send({
         type: 'signal',
         to: peer,
@@ -290,12 +299,35 @@ App.Host = (function () {
     }
   }
 
+  // Rewrite the Opus fmtp line for high-quality stereo system audio.
+  function tuneOpus(sdp) {
+    try {
+      if (!sdp) return sdp;
+      const rtpmap = sdp.match(/^a=rtpmap:(\d+) opus\/48000\/2.*$/im);
+      if (!rtpmap) return sdp;
+      const pt = rtpmap[1];
+      const params =
+        'minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1;maxaveragebitrate=128000;usedtx=0';
+
+      const fmtpRe = new RegExp('^a=fmtp:' + pt + ' .*$', 'im');
+      if (fmtpRe.test(sdp)) {
+        return sdp.replace(fmtpRe, 'a=fmtp:' + pt + ' ' + params);
+      }
+      // No fmtp line yet — add one right after the rtpmap line.
+      return sdp.replace(rtpmap[0], rtpmap[0] + '\r\na=fmtp:' + pt + ' ' + params);
+    } catch (_) {
+      return sdp; // never break the offer over an audio tweak
+    }
+  }
+
   function tuneSender(sender) {
     try {
       const params = sender.getParameters();
       params.degradationPreference = 'maintain-resolution';
       if (!params.encodings || !params.encodings.length) params.encodings = [{}];
-      params.encodings[0].maxBitrate = 4000000;
+      // H.264 needs more bitrate than VP9/AV1 for equally sharp text, so give
+      // the (now hardware) encoder more headroom to keep quality up.
+      params.encodings[0].maxBitrate = 8000000;
       params.encodings[0].scalabilityMode = 'L1T1';
       sender.setParameters(params).catch((e) => console.warn('[host] setParameters', e));
     } catch (err) {
@@ -303,24 +335,19 @@ App.Host = (function () {
     }
   }
 
-  function tuneCodecs() {
+  // Negotiate the video codec: the best one this host can HARDWARE-encode and
+  // the viewer advertised it can decode. App.Caps does the hardware detection
+  // (encode-timing probe) and the intersection; we just wait for it (bounded)
+  // and apply the result to the sender before the offer is built.
+  async function negotiateCodecs() {
     try {
-      const caps = RTCRtpSender.getCapabilities('video');
-      if (!caps || !caps.codecs) return;
-
-      const rank = (c) => {
-        const m = (c.mimeType || '').toLowerCase();
-        if (m === 'video/av1') return 0;
-        if (m === 'video/vp9') return 1;
-        if (m === 'video/h264') return 2;
-        return 3;
-      };
-      const ordered = caps.codecs.slice().sort((a, b) => rank(a) - rank(b));
-
-      const tx = pc.getTransceivers().find((t) => t.sender && t.sender.track && t.sender.track.kind === 'video');
-      if (tx && tx.setCodecPreferences) tx.setCodecPreferences(ordered);
+      if (!App.Caps) return;
+      await App.Caps.whenReady(1500); // don't block a session if the probe is slow
+      const order = App.Caps.negotiate(pendingViewerCaps);
+      App.Caps.applyPreferences(pc, order);
+      console.log('[host] negotiated codec order:', order, 'viewer decode:', pendingViewerCaps);
     } catch (err) {
-      console.warn('[host] codec preference skipped', err);
+      console.warn('[host] codec negotiation skipped', err);
     }
   }
 
@@ -462,6 +489,7 @@ App.Host = (function () {
     negotiating = false;
     pendingIce = [];
     challenge = null;
+    pendingViewerCaps = null;
 
     // Whatever the session injected and never released (viewer died mid-press,
     // mid-drag, etc.) must not stay stuck on this machine.

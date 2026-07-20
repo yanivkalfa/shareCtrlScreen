@@ -41,7 +41,15 @@ App.Viewer = (function () {
     peer = target;
     lastPassword = password === undefined ? null : password;
 
-    const sent = App.Signaling.send({ type: 'connect-request', to: target, password: lastPassword });
+    // Advertise what this machine can decode so the host can pick the best codec
+    // it can hardware-encode AND we can play (omitted if caps aren't ready yet).
+    const req = { type: 'connect-request', to: target, password: lastPassword };
+    if (App.Caps) {
+      const decode = App.Caps.decodeList();
+      if (decode.length) req.caps = { decode };
+    }
+
+    const sent = App.Signaling.send(req);
     if (!sent) {
       // Socket down at this instant — fail loudly now instead of a silent
       // 30 s wait for an answer that was never asked for.
@@ -245,13 +253,36 @@ App.Viewer = (function () {
     await pc.setRemoteDescription({ type: 'offer', sdp });
     await flushPendingIce();
     const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
+    // We are the audio RECEIVER, so our answer's Opus fmtp configures the host's
+    // ENCODER: ask for stereo, 128 kbps, in-band FEC, and DTX OFF (DTX on
+    // continuous system audio causes the ticking). Fail-safe: unchanged on miss.
+    await pc.setLocalDescription({ type: 'answer', sdp: tuneOpus(answer.sdp) });
 
     App.Signaling.send({
       type: 'signal',
       to: peer,
       data: { kind: 'answer', sdp: pc.localDescription.sdp }
     });
+  }
+
+  // Rewrite the Opus fmtp line for high-quality stereo system audio.
+  function tuneOpus(sdp) {
+    try {
+      if (!sdp) return sdp;
+      const rtpmap = sdp.match(/^a=rtpmap:(\d+) opus\/48000\/2.*$/im);
+      if (!rtpmap) return sdp;
+      const pt = rtpmap[1];
+      const params =
+        'minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1;maxaveragebitrate=128000;usedtx=0';
+
+      const fmtpRe = new RegExp('^a=fmtp:' + pt + ' .*$', 'im');
+      if (fmtpRe.test(sdp)) {
+        return sdp.replace(fmtpRe, 'a=fmtp:' + pt + ' ' + params);
+      }
+      return sdp.replace(rtpmap[0], rtpmap[0] + '\r\na=fmtp:' + pt + ' ' + params);
+    } catch (_) {
+      return sdp;
+    }
   }
 
   async function flushPendingIce() {

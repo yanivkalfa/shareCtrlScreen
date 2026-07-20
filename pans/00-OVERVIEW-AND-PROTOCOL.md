@@ -109,6 +109,12 @@ All of the following are **relayed** messages (app sends with `to`, receiver get
 plaintext) when responding to `password-required` — see the challenge-response
 note under Step 2.
 
+Optional `caps` field (v1.1): the viewer MAY include
+`"caps":{"decode":["H264","VP9","AV1","VP8"]}` listing the codecs it can decode.
+The host uses it to negotiate the best codec it can hardware-encode and the
+viewer can decode, then sets that on its SDP offer. Absent/unknown → the host
+falls back to a safe default (H.264 first). The server relays the field opaquely.
+
 **Step 2 — Host decides.** Host behavior on receiving `connect-request` (with `from`):
 
 - If host already has an active session → reply `connect-response` with

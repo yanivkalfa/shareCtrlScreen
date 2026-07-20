@@ -1,0 +1,59 @@
+name: Release
+
+# Manual "Run workflow" button in the Actions tab. Builds the Windows app and
+# publishes the installer + portable exe to a GitHub Release (created as a DRAFT
+# by default — review it, then click "Publish release").
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, e.g. 1.0.1 (blank = keep package.json version)"
+        required: false
+        default: ""
+
+# Let the built-in GITHUB_TOKEN create releases and upload assets.
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    # MUST be Windows: the app is Windows-only, uses the native koffi module,
+    # and builds an NSIS installer.
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: app
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Set release version
+        if: inputs.version != ''
+        run: npm version "${{ inputs.version }}" --no-git-tag-version --allow-same-version
+
+      - name: Build and publish to GitHub Release
+        run: npx electron-builder --win --publish always
+        env:
+          # electron-builder reads this to create the release and upload assets.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload build artifacts (fallback download)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ShareCtrlScreen-windows
+          path: |
+            app/dist/*.exe
+            app/dist/latest.yml
+          if-no-files-found: warn

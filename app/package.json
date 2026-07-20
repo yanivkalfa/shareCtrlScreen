@@ -28,6 +28,13 @@
     "asarUnpack": [
       "**/node_modules/koffi/**"
     ],
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "yanivkalfa",
+        "repo": "shareCtrlScreen"
+      }
+    ],
     "win": {
       "target": [
         "nsis",

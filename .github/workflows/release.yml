@@ -68,10 +68,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # Build only (no electron-builder publisher — it races on multi-target and
-      # can't create the tag for a published release). Assets land in app/dist.
+      # Build only. --publish never is required: electron-builder auto-publishes
+      # when it detects CI + a publish config, which would demand GH_TOKEN here
+      # and race on multi-target. We publish separately via gh below.
       - name: Build Windows app
-        run: npx electron-builder --win
+        run: npx electron-builder --win --publish never
 
       # gh creates the tag v<version>, the published release, and uploads both
       # exes in one shot — atomic, no race, no draft.

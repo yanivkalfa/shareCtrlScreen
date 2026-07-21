@@ -428,6 +428,15 @@ impl Engine {
         }
     }
 
+    /// Viewer action: ask the host for a fresh keyframe ("Refresh" button — e.g.
+    /// to clear residual smear after packet loss).
+    pub fn request_refresh(&self) {
+        if matches!(&*self.role.lock(), Role::Viewer { .. }) {
+            #[cfg(windows)]
+            pipeline::send_ctl(self, &ControlMsg::KeyframeRequest);
+        }
+    }
+
     /// End the session locally and tell the peer (best-effort, contract §3.2 s5).
     pub fn end_session(&self) {
         let peer = match &*self.role.lock() {

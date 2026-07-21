@@ -177,6 +177,9 @@ function openSettings() {
 
 function closeSettings() {
   $('modal-settings').classList.add('hidden');
+  // If settings were opened mid-session, the native video surface was hidden so
+  // the modal could be seen (it sits above the WebView) — bring it back.
+  if (state === 'VIEW_ACTIVE') invoke('set_video_visible', { visible: true });
 }
 
 async function saveSettings() {
@@ -212,6 +215,17 @@ async function saveSettings() {
 $('btn-settings').addEventListener('click', openSettings);
 $('btn-settings-cancel').addEventListener('click', closeSettings);
 $('btn-settings-save').addEventListener('click', saveSettings);
+
+// Session menu bar (revealed by hovering the top edge of the video).
+$('btn-view-refresh').addEventListener('click', () => {
+  invoke('request_refresh');
+  toast('Requested a fresh frame');
+});
+$('btn-view-settings').addEventListener('click', () => {
+  // Hide the native video so the settings modal (web UI) is visible above it.
+  invoke('set_video_visible', { visible: false });
+  openSettings();
+});
 
 $('btn-copy').addEventListener('click', async () => {
   try {

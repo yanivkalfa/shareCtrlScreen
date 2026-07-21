@@ -135,6 +135,22 @@ fn end_session(state: tauri::State<'_, AppState>) {
     state.engine.end_session();
 }
 
+/// Viewer: ask the host for a fresh keyframe (clears smear after packet loss).
+#[tauri::command]
+fn request_refresh(state: tauri::State<'_, AppState>) {
+    state.engine.request_refresh();
+}
+
+/// Viewer: hide/show the native video surface so web modals (settings) are
+/// visible mid-session — the video child HWND otherwise covers them.
+#[tauri::command]
+fn set_video_visible(visible: bool) {
+    #[cfg(windows)]
+    engine::pipeline::set_video_visible(visible);
+    #[cfg(not(windows))]
+    let _ = visible;
+}
+
 #[tauri::command]
 async fn approve(
     state: tauri::State<'_, AppState>,
@@ -258,6 +274,8 @@ fn main() {
             submit_password,
             set_permission,
             end_session,
+            request_refresh,
+            set_video_visible,
             approve,
             save_settings,
         ])

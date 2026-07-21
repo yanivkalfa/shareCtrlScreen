@@ -170,11 +170,8 @@ impl Encoder {
 
         // Async (hardware) MFTs drive encode via the event generator; a sync
         // software MFT does not implement it.
-        let events: Option<IMFMediaEventGenerator> = if is_hw {
-            Some(transform.cast()?)
-        } else {
-            None
-        };
+        let events: Option<IMFMediaEventGenerator> =
+            if is_hw { Some(transform.cast()?) } else { None };
         let converter = crate::convert::Converter::new(device, cfg.width, cfg.height)?;
         // SAFETY: standard immediate-context fetch.
         let context: ID3D11DeviceContext = unsafe { device.GetImmediateContext()? };
@@ -349,7 +346,10 @@ impl Encoder {
             unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut tex))? };
             self.staging = tex;
         }
-        let staging = self.staging.clone().ok_or(Error::NoEncoder(self.cfg.codec))?;
+        let staging = self
+            .staging
+            .clone()
+            .ok_or(Error::NoEncoder(self.cfg.codec))?;
 
         let total = w * h * 3 / 2;
         // SAFETY: GPU copy + CPU map of the staging texture; unmapped before use.
@@ -645,7 +645,12 @@ fn set_input_type(
 /// keep the encoder's default for that property.
 fn apply_low_latency_recipe(api: &ICodecAPI, cfg: &EncoderConfig) {
     // Single-picture slice, no multi-frame lookahead.
-    set_codec_value(api, &CODECAPI_AVLowLatencyMode, &boolv(true), "AVLowLatencyMode");
+    set_codec_value(
+        api,
+        &CODECAPI_AVLowLatencyMode,
+        &boolv(true),
+        "AVLowLatencyMode",
+    );
     // CBR rate control fed by BWE.
     set_codec_value(
         api,

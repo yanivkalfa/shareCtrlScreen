@@ -211,7 +211,11 @@ impl Decoder {
             }
             // NV12 worst case if the MFT reports 0 (some do before first output).
             let fallback = self.width * self.height * 3 / 2;
-            let size = if info.cbSize > 0 { info.cbSize } else { fallback };
+            let size = if info.cbSize > 0 {
+                info.cbSize
+            } else {
+                fallback
+            };
             let buffer = if info.cbAlignment > 1 {
                 MFCreateAlignedMemoryBuffer(size, info.cbAlignment - 1)?
             } else {
@@ -335,8 +339,14 @@ impl Decoder {
                 0,
             )?);
         }
-        let staging = self.upload_staging.clone().ok_or(Error::NoDecoder(Codec::H264))?;
-        let tex = self.upload_tex.clone().ok_or(Error::NoDecoder(Codec::H264))?;
+        let staging = self
+            .upload_staging
+            .clone()
+            .ok_or(Error::NoDecoder(Codec::H264))?;
+        let tex = self
+            .upload_tex
+            .clone()
+            .ok_or(Error::NoDecoder(Codec::H264))?;
 
         // SAFETY: MF buffer lock + D3D map, both released before returning.
         unsafe {
@@ -430,7 +440,11 @@ unsafe fn copy_nv12(
         let src_uv = src.add(src_pitch * src_rows.max(h));
         let dst_uv = dst.add(dst_pitch * dst_rows.max(h));
         for y in 0..(h / 2) {
-            std::ptr::copy_nonoverlapping(src_uv.add(y * src_pitch), dst_uv.add(y * dst_pitch), row);
+            std::ptr::copy_nonoverlapping(
+                src_uv.add(y * src_pitch),
+                dst_uv.add(y * dst_pitch),
+                row,
+            );
         }
     }
 }
@@ -482,18 +496,13 @@ fn input_subtype(codec: Codec) -> windows::core::GUID {
 /// decode; otherwise the host may negotiate a codec (e.g. AV1) the viewer cannot
 /// decode, which black-screens the session (§3 negotiation).
 pub fn can_decode(codec: Codec) -> bool {
-    can_decode_with(
-        codec,
-        MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
-    ) || can_decode_with(codec, MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER)
+    can_decode_with(codec, MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER)
+        || can_decode_with(codec, MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER)
 }
 
 /// Is there a **hardware** decoder for `codec`?
 pub fn can_decode_hw(codec: Codec) -> bool {
-    can_decode_with(
-        codec,
-        MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
-    )
+    can_decode_with(codec, MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER)
 }
 
 fn can_decode_with(codec: Codec, flags: MFT_ENUM_FLAG) -> bool {

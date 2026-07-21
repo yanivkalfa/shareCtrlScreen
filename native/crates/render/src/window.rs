@@ -55,6 +55,45 @@ pub enum VideoInput {
 /// or no session), so we never capture when we shouldn't.
 static INPUT_SINK: Mutex<Option<Sender<VideoInput>>> = Mutex::new(None);
 
+/// Hover-reveal state for the session menu bar (§7): the native video surface
+/// covers the whole client area *including* the web UI's session bar, so pushing
+/// the cursor to the top edge slides the video down to reveal the bar (with its
+/// Disconnect/settings buttons), and moving back into the video slides it up.
+/// 0 = bar hidden (video at y=0); >0 = revealed by that many physical px.
+static REVEAL_OFFSET: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+/// Session menu bar height in CSS px (the web `.view-bar`); scaled by DPI.
+const BAR_CSS_PX: i32 = 40;
+/// Cursor deeper than this many physical px into the video re-hides the bar.
+const UNREVEAL_DEPTH_PX: i32 = 56;
+
+/// The bar height in physical pixels for this window's monitor DPI.
+fn bar_phys(hwnd: HWND) -> i32 {
+    // SAFETY: valid HWND; returns 96 on failure paths.
+    let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
+    let dpi = if dpi == 0 { 96 } else { dpi as i32 };
+    BAR_CSS_PX * dpi / 96
+}
+
+/// Slide the video down (reveal the web session bar) or back up.
+fn set_reveal(hwnd: HWND, reveal: bool) {
+    use std::sync::atomic::Ordering;
+    let bar = if reveal { bar_phys(hwnd) } else { 0 };
+    if REVEAL_OFFSET.swap(bar, Ordering::SeqCst) == bar {
+        return; // no change
+    }
+    // SAFETY: valid child HWND; parent lookup + move on the UI thread (wndproc).
+    unsafe {
+        if let Ok(parent) = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd) {
+            let mut rc = RECT::default();
+            if GetClientRect(parent, &mut rc).is_ok() {
+                let w = (rc.right - rc.left).max(1);
+                let h = (rc.bottom - rc.top).max(1);
+                let _ = MoveWindow(hwnd, 0, bar, w, (h - bar).max(1), true);
+            }
+        }
+    }
+}
+
 /// Install the input sink (viewer session start).
 pub fn set_input_sink(tx: Sender<VideoInput>) {
     *INPUT_SINK.lock().unwrap() = Some(tx);
@@ -131,10 +170,9 @@ impl VideoWindow {
 /// (created by Tauri *after* this window) otherwise sits above it, and the video
 /// presents perfectly — invisibly — behind the web page ("airspace", §7).
 pub fn show(hwnd_raw: isize) {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        SetWindowPos, HWND_TOP, SWP_SHOWWINDOW,
-    };
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, HWND_TOP, SWP_SHOWWINDOW};
     let hwnd = HWND(hwnd_raw as *mut _);
+    REVEAL_OFFSET.store(0, std::sync::atomic::Ordering::SeqCst);
     // SAFETY: valid child HWND created by `VideoWindow::create`.
     unsafe {
         let parent = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd);
@@ -155,9 +193,38 @@ pub fn show(hwnd_raw: isize) {
     }
 }
 
-/// Hide the video surface (back to the home screen).
+/// Keep the video child sized to the parent's client area (minus any hover
+/// reveal offset). Called periodically from the render loop so mid-session
+/// window resizes track without a WM_SIZE hook into the Tauri parent; no-ops
+/// when the size already matches.
+pub fn fit(hwnd_raw: isize) {
+    use std::sync::atomic::Ordering;
+    let hwnd = HWND(hwnd_raw as *mut _);
+    let offset = REVEAL_OFFSET.load(Ordering::SeqCst);
+    // SAFETY: valid child HWND; reads two client rects and conditionally moves.
+    unsafe {
+        let Ok(parent) = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd) else {
+            return;
+        };
+        let mut prc = RECT::default();
+        let mut crc = RECT::default();
+        if GetClientRect(parent, &mut prc).is_err() || GetClientRect(hwnd, &mut crc).is_err() {
+            return;
+        }
+        let want_w = (prc.right - prc.left).max(1);
+        let want_h = ((prc.bottom - prc.top) - offset).max(1);
+        let cur_w = crc.right - crc.left;
+        let cur_h = crc.bottom - crc.top;
+        if cur_w != want_w || cur_h != want_h {
+            let _ = MoveWindow(hwnd, 0, offset, want_w, want_h, true);
+        }
+    }
+}
+
+/// Hide the video surface (back to the home screen / settings overlay).
 pub fn hide(hwnd_raw: isize) {
     let hwnd = HWND(hwnd_raw as *mut _);
+    REVEAL_OFFSET.store(0, std::sync::atomic::Ordering::SeqCst);
     // SAFETY: valid child HWND.
     unsafe {
         let _ = ShowWindow(hwnd, SW_HIDE);
@@ -200,6 +267,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
     match msg {
         WM_MOUSEMOVE => {
+            // Hover-reveal of the session menu bar (§7): top edge → slide the
+            // video down to expose the web bar; deep re-entry → slide back up.
+            {
+                use std::sync::atomic::Ordering;
+                let y_phys = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+                let revealed = REVEAL_OFFSET.load(Ordering::SeqCst) > 0;
+                if !revealed && y_phys <= 2 {
+                    set_reveal(hwnd, true);
+                } else if revealed && y_phys > UNREVEAL_DEPTH_PX {
+                    set_reveal(hwnd, false);
+                }
+            }
             let (nx, ny) = norm_pos(lparam);
             emit(VideoInput::Move { nx, ny });
             return LRESULT(0);

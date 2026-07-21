@@ -123,6 +123,13 @@ pub struct Renderer {
     height: u32,
     /// Diagnostics: successful Present count (first one logged).
     presented: u64,
+    /// SRV cache keyed by (texture ptr, array slice): creating two SRVs per frame
+    /// costs measurable CPU (§5c note); decode textures are a small stable set
+    /// (software path: one; hardware: the decoder's texture-array slices).
+    srv_cache: std::collections::HashMap<
+        (usize, u32),
+        (ID3D11ShaderResourceView, ID3D11ShaderResourceView),
+    >,
 }
 
 impl Renderer {
@@ -191,6 +198,7 @@ impl Renderer {
             width,
             height,
             presented: 0,
+            srv_cache: std::collections::HashMap::new(),
         })
     }
 
@@ -208,18 +216,28 @@ impl Renderer {
         // SAFETY: waitable handle from the swapchain.
         unsafe { WaitForSingleObjectEx(self.waitable, 1000, false) };
 
-        let luma = self.srv(nv12, DXGI_FORMAT_R8_UNORM, array_index)?;
-        let chroma = self.srv(nv12, DXGI_FORMAT_R8G8_UNORM, array_index)?;
+        // SRVs from the per-slice cache (created once per texture/slice).
+        let key = (nv12.as_raw() as usize, array_index);
+        if !self.srv_cache.contains_key(&key) {
+            let luma = self.srv(nv12, DXGI_FORMAT_R8_UNORM, array_index)?;
+            let chroma = self.srv(nv12, DXGI_FORMAT_R8G8_UNORM, array_index)?;
+            // Bound: decoders recycle a small texture set; if something churns
+            // textures (e.g. re-init), don't let dead entries pile up.
+            if self.srv_cache.len() > 64 {
+                self.srv_cache.clear();
+            }
+            self.srv_cache.insert(key, (luma, chroma));
+        }
+        let (luma, chroma) = self.srv_cache[&key].clone();
 
         // SAFETY: all resources valid; single-threaded present.
         unsafe {
             let rtvs = [self.rtv.clone()];
-            // Sentinel clear (dark navy, not black): if the window shows navy the
-            // present path works and the NV12 draw is what failed; if it stays
-            // pure black the present/z-order never reached the screen at all.
+            // Clear before draw (flip-discard backbuffer is undefined) — also the
+            // letterbox color when the frame doesn't cover the full target.
             if let Some(rtv) = &rtvs[0] {
                 self.context
-                    .ClearRenderTargetView(rtv, &[0.02, 0.02, 0.12, 1.0]);
+                    .ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0]);
             }
             self.context.OMSetRenderTargets(Some(&rtvs), None);
             let vp = D3D11_VIEWPORT {

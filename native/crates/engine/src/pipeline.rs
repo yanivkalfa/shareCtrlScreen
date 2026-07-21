@@ -689,6 +689,22 @@ pub fn send_ctl(_engine: &Engine, msg: &ControlMsg) {
     }
 }
 
+/// Viewer: temporarily hide/show the native video surface so web UI overlays
+/// (the settings modal) are visible during a session — the video child HWND
+/// sits above the WebView2 and would otherwise cover them. The stream keeps
+/// running; only presentation is hidden.
+pub fn set_video_visible(visible: bool) {
+    let hwnd_raw = RENDER_HWND.load(Ordering::SeqCst);
+    if hwnd_raw == 0 {
+        return;
+    }
+    if visible {
+        render::window::show(hwnd_raw);
+    } else {
+        render::window::hide(hwnd_raw);
+    }
+}
+
 /// Host: flip the injection gate when the live permission changes (§4.2). When
 /// control is revoked the transport thread releases any held input.
 pub fn set_control(allow: bool) {
@@ -768,6 +784,13 @@ fn transport_driver(d: Driver) {
 
     let mut buf = [0u8; 2048];
     let mut video_count: u64 = 0;
+    // Viewer: frame-id continuity tracking. The video channel is unreliable and
+    // delta frames reference their predecessors, so a LOST frame corrupts every
+    // frame after it (the on-screen "smear") until a keyframe arrives — and with
+    // an effectively-infinite GOP one never does on its own. Detect the gap and
+    // ask the host for a keyframe immediately (rate-limited).
+    let mut last_frame_id: Option<u32> = None;
+    let mut last_gap_req = std::time::Instant::now() - std::time::Duration::from_secs(5);
     while !stop.load(Ordering::SeqCst) {
         // 0) Host: if control was just revoked (view-only), release any input we
         // are holding down so the host is never left with a stuck key/button.
@@ -896,6 +919,28 @@ fn transport_driver(d: Driver) {
                                     frame.keyframe
                                 );
                             }
+                            // Continuity check: a skipped frame id means a delta
+                            // was lost → decoder refs are broken → smear. Request
+                            // a keyframe to restart cleanly (§6 recovery).
+                            if let Some(last) = last_frame_id {
+                                let expected = last.wrapping_add(1);
+                                if frame.frame_id != expected
+                                    && !frame.keyframe
+                                    && last_gap_req.elapsed()
+                                        >= std::time::Duration::from_millis(700)
+                                {
+                                    tracing::info!(
+                                        "viewer: frame gap ({} -> {}) — requesting keyframe",
+                                        last,
+                                        frame.frame_id
+                                    );
+                                    let _ = tp.send_ctl(&serialize(
+                                        &protocol::ControlMsg::KeyframeRequest,
+                                    ));
+                                    last_gap_req = std::time::Instant::now();
+                                }
+                            }
+                            last_frame_id = Some(frame.frame_id);
                             if let Some(tx) = &video_tx {
                                 let _ = tx.send((frame.data, frame.keyframe));
                             }
@@ -1107,6 +1152,8 @@ fn viewer_media_loop(
     let mut undecoded_streak: u32 = 0;
     let mut last_kf_req = std::time::Instant::now();
     while !stop.load(Ordering::SeqCst) {
+        // Track window resizes (and hover-reveal offsets) — no-op when unchanged.
+        render::window::fit(hwnd_raw);
         match video_rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok((au, keyframe)) => {
                 // 100-ns MF units at ~60 fps — decoders (esp. the software AV1
@@ -1141,8 +1188,7 @@ fn viewer_media_loop(
                             && last_kf_req.elapsed() >= std::time::Duration::from_secs(1)
                         {
                             tracing::info!("viewer: no decodable frames — requesting keyframe");
-                            let _ = ctl_tx
-                                .send(serialize(&protocol::ControlMsg::KeyframeRequest));
+                            let _ = ctl_tx.send(serialize(&protocol::ControlMsg::KeyframeRequest));
                             last_kf_req = std::time::Instant::now();
                         }
                     }

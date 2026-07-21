@@ -93,10 +93,15 @@
 
     <!-- ===================== VIEW_ACTIVE ===================== -->
     <section id="screen-view" class="screen hidden">
+      <!-- Session menu bar: the native video covers the client area, so this bar
+           is revealed by pushing the cursor to the TOP EDGE of the video (the
+           video slides down); moving back into the video hides it again. -->
       <div class="view-bar">
         <span id="view-peer" class="mono small">&hellip;</span>
         <span id="view-badge" class="badge badge-view">VIEW ONLY</span>
         <div class="spacer"></div>
+        <button id="btn-view-refresh" class="btn btn-sm" title="Request a fresh keyframe (fixes artifacts)">Refresh</button>
+        <button id="btn-view-settings" class="btn btn-ghost btn-sm" title="Settings">&#9881;</button>
         <button id="btn-view-end" class="btn btn-danger btn-sm">Disconnect</button>
       </div>
       <!-- The native D3D11 swapchain window is parented here (§7). -->

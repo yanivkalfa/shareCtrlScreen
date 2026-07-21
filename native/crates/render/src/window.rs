@@ -126,24 +126,31 @@ impl VideoWindow {
 /// Show the video surface and size it to the parent's client area (session
 /// start). Safe to call from the render thread — `ShowWindow`/`MoveWindow`
 /// marshal to the owning thread.
+///
+/// The child is raised to the TOP of the sibling z-order: the WebView2 child
+/// (created by Tauri *after* this window) otherwise sits above it, and the video
+/// presents perfectly — invisibly — behind the web page ("airspace", §7).
 pub fn show(hwnd_raw: isize) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, HWND_TOP, SWP_SHOWWINDOW,
+    };
     let hwnd = HWND(hwnd_raw as *mut _);
     // SAFETY: valid child HWND created by `VideoWindow::create`.
     unsafe {
         let parent = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd);
+        let mut w = 1;
+        let mut h = 1;
         if let Ok(parent) = parent {
             let mut rc = RECT::default();
             if GetClientRect(parent, &mut rc).is_ok() {
-                let _ = MoveWindow(
-                    hwnd,
-                    0,
-                    0,
-                    (rc.right - rc.left).max(1),
-                    (rc.bottom - rc.top).max(1),
-                    true,
-                );
+                w = (rc.right - rc.left).max(1);
+                h = (rc.bottom - rc.top).max(1);
             }
         }
+        tracing::info!("video window: show {w}x{h} (raise to top)");
+        let _ = MoveWindow(hwnd, 0, 0, w, h, true);
+        // Raise above the WebView2 sibling AND show in one call.
+        let _ = SetWindowPos(hwnd, Some(HWND_TOP), 0, 0, w, h, SWP_SHOWWINDOW);
         let _ = ShowWindow(hwnd, SW_SHOW);
     }
 }

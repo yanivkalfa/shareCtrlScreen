@@ -1100,6 +1100,7 @@ fn viewer_media_loop(
 
     let mut ts = 0i64;
     let mut rendered: u64 = 0;
+    let mut render_errors: u64 = 0;
     // Keyframe watchdog: if AUs arrive but the decoder produces nothing, the
     // keyframe was lost (unreliable channel) — ask the host for a fresh one,
     // rate-limited to ~1/s so a slow link isn't flooded.
@@ -1116,14 +1117,23 @@ fn viewer_media_loop(
                         undecoded_streak = 0;
                         rendered += 1;
                         if rendered == 1 || rendered % 120 == 0 {
-                            tracing::info!("viewer: rendered frame #{rendered}");
+                            tracing::info!("viewer: decoded frame #{rendered}");
                         }
                         // Draw the out-of-band cursor sprite on top (§7).
                         let cursor = match *CURSOR.lock() {
                             Some((x, y, true)) => Some((x, y)),
                             _ => None,
                         };
-                        let _ = renderer.render_frame(&frame.texture, frame.array_index, cursor);
+                        // A failing render is NOT silent: this was exactly the
+                        // place a black screen hid (decode fine, render dead).
+                        if let Err(e) =
+                            renderer.render_frame(&frame.texture, frame.array_index, cursor)
+                        {
+                            render_errors += 1;
+                            if render_errors <= 10 || render_errors % 120 == 0 {
+                                tracing::warn!("render error #{render_errors}: {e}");
+                            }
+                        }
                     }
                     Ok(None) => {
                         undecoded_streak += 1;

@@ -52,6 +52,9 @@ pub struct Decoder {
     /// supported, but STAGING Map + CopyResource always is.
     upload_staging: Option<ID3D11Texture2D>,
     upload_tex: Option<ID3D11Texture2D>,
+    /// Coded surface height of the decoder's output (e.g. 1088 for 1080p) — the
+    /// source chroma plane starts at `stride * src_height` in NV12 layout.
+    src_height: u32,
     /// Diagnostics: AUs fed / frames decoded / drains that produced nothing.
     fed_count: u64,
     decoded_count: u64,
@@ -141,6 +144,7 @@ impl Decoder {
             context,
             upload_staging: None,
             upload_tex: None,
+            src_height: height,
             fed_count: 0,
             decoded_count: 0,
             no_output_count: 0,
@@ -247,15 +251,17 @@ impl Decoder {
                 }
                 if e.code() == MF_E_TRANSFORM_STREAM_CHANGE {
                     // The decoder announced its real output format (normal on the
-                    // first decodable frame). Re-negotiate NV12 and retry — the
-                    // frame is still pending inside the transform.
-                    tracing::debug!("decoder: output format change — renegotiating NV12");
-                    set_decoder_output_type(
-                        &self.transform,
-                        self.output_id,
-                        self.width,
-                        self.height,
-                    )?;
+                    // first decodable frame). Adopt the type it advertises AS-IS —
+                    // H.264 codes 1080p as 1920x1088 internally, so forcing our
+                    // 1080 frame size back onto it fails with MF_E_INVALIDMEDIATYPE.
+                    // Then retry — the frame is still pending inside the transform.
+                    tracing::debug!("decoder: output format change — adopting new NV12 type");
+                    let (_, coded_h) = adopt_decoder_output_type(&self.transform, self.output_id)?;
+                    // Source chroma plane starts at stride*coded_height (1088 for
+                    // 1080p) — remember it for the upload copy.
+                    if coded_h > 0 {
+                        self.src_height = coded_h;
+                    }
                     continue;
                 }
                 tracing::warn!(
@@ -341,7 +347,11 @@ impl Decoder {
             let dst = mapped.pData as *mut u8;
             let dst_pitch = mapped.RowPitch as usize;
 
-            // Prefer IMF2DBuffer (authoritative stride; chroma at stride*height).
+            // The decoder's surface height (coded, e.g. 1088) locates its chroma
+            // plane; the destination texture is exactly `h` rows tall.
+            let src_rows = self.src_height as usize;
+
+            // Prefer IMF2DBuffer (authoritative stride; chroma at stride*rows).
             let copied = if let Ok(two_d) = buffer.cast::<IMF2DBuffer>() {
                 let mut scan0: *mut u8 = std::ptr::null_mut();
                 let mut pitch: i32 = 0;
@@ -350,7 +360,7 @@ impl Decoder {
                     .ok()
                     .map(|()| {
                         let sp = pitch.unsigned_abs() as usize;
-                        copy_nv12(scan0, sp, dst, dst_pitch, w, h);
+                        copy_nv12(scan0, sp, src_rows, dst, dst_pitch, h, w, h);
                         let _ = two_d.Unlock2D();
                     })
                     .is_some()
@@ -363,7 +373,7 @@ impl Decoder {
                 let mut ptr: *mut u8 = std::ptr::null_mut();
                 if buffer.Lock(&mut ptr, None, None).is_ok() {
                     let sp = self.src_stride();
-                    copy_nv12(ptr, sp, dst, dst_pitch, w, h);
+                    copy_nv12(ptr, sp, src_rows, dst, dst_pitch, h, w, h);
                     let _ = buffer.Unlock();
                 }
             }
@@ -395,27 +405,30 @@ impl Decoder {
     }
 }
 
-/// Copy an NV12 image (Y plane `h` rows then interleaved UV plane `h/2` rows,
-/// each `w` bytes wide) between buffers with independent row pitches. The chroma
-/// plane starts at `pitch * h` in both source and destination (NV12 layout).
+/// Copy an NV12 image between buffers with independent row pitches AND
+/// independent surface heights: the chroma plane starts at `pitch * rows` where
+/// `rows` is each side's full surface height (1088-coded vs 1080-display).
+/// Copies `h` luma rows and `h/2` chroma rows of `w` bytes.
 ///
-/// SAFETY: `src` readable and `dst` writable for the NV12 extent at their pitches.
+/// SAFETY: `src` readable and `dst` writable for their NV12 extents.
 unsafe fn copy_nv12(
     src: *const u8,
     src_pitch: usize,
+    src_rows: usize,
     dst: *mut u8,
     dst_pitch: usize,
+    dst_rows: usize,
     w: usize,
     h: usize,
 ) {
     let row = w.min(src_pitch).min(dst_pitch);
-    // SAFETY: caller guarantees src/dst are valid for the NV12 extent.
+    // SAFETY: caller guarantees src/dst are valid for their NV12 extents.
     unsafe {
         for y in 0..h {
             std::ptr::copy_nonoverlapping(src.add(y * src_pitch), dst.add(y * dst_pitch), row);
         }
-        let src_uv = src.add(src_pitch * h);
-        let dst_uv = dst.add(dst_pitch * h);
+        let src_uv = src.add(src_pitch * src_rows.max(h));
+        let dst_uv = dst.add(dst_pitch * dst_rows.max(h));
         for y in 0..(h / 2) {
             std::ptr::copy_nonoverlapping(src_uv.add(y * src_pitch), dst_uv.add(y * dst_pitch), row);
         }
@@ -595,6 +608,33 @@ fn set_decoder_input_type(
         transform.SetInputType(input_id, &mt, 0)?;
     }
     Ok(())
+}
+
+/// After `MF_E_TRANSFORM_STREAM_CHANGE`: pick the decoder's advertised NV12
+/// output type unmodified (its frame size is authoritative — e.g. 1920x1088 for
+/// coded 1080p) and return the coded `(width, height)` so the upload path reads
+/// the chroma plane from the right offset.
+fn adopt_decoder_output_type(
+    transform: &IMFTransform,
+    output_id: u32,
+) -> Result<(u32, u32), Error> {
+    // SAFETY: standard available-type iteration.
+    unsafe {
+        let mut i = 0u32;
+        while let Ok(mt) = transform.GetOutputAvailableType(output_id, i) {
+            let sub = mt.GetGUID(&MF_MT_SUBTYPE).unwrap_or_default();
+            if sub == MFVideoFormat_NV12 {
+                let size = mt.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(0);
+                let (w, h) = ((size >> 32) as u32, size as u32);
+                let stride = mt.GetUINT32(&MF_MT_DEFAULT_STRIDE).unwrap_or(0);
+                tracing::info!("decoder: new output type NV12 {w}x{h} (stride {stride})");
+                transform.SetOutputType(output_id, &mt, 0)?;
+                return Ok((w, h));
+            }
+            i += 1;
+        }
+    }
+    Err(Error::NoDecoder(Codec::H264))
 }
 
 fn set_decoder_output_type(

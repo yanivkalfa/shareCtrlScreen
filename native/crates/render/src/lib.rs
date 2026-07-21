@@ -121,6 +121,8 @@ pub struct Renderer {
     allow_tearing: bool,
     width: u32,
     height: u32,
+    /// Diagnostics: successful Present count (first one logged).
+    presented: u64,
 }
 
 impl Renderer {
@@ -188,6 +190,7 @@ impl Renderer {
             allow_tearing,
             width,
             height,
+            presented: 0,
         })
     }
 
@@ -211,6 +214,13 @@ impl Renderer {
         // SAFETY: all resources valid; single-threaded present.
         unsafe {
             let rtvs = [self.rtv.clone()];
+            // Sentinel clear (dark navy, not black): if the window shows navy the
+            // present path works and the NV12 draw is what failed; if it stays
+            // pure black the present/z-order never reached the screen at all.
+            if let Some(rtv) = &rtvs[0] {
+                self.context
+                    .ClearRenderTargetView(rtv, &[0.02, 0.02, 0.12, 1.0]);
+            }
             self.context.OMSetRenderTargets(Some(&rtvs), None);
             let vp = D3D11_VIEWPORT {
                 TopLeftX: 0.0,
@@ -241,7 +251,15 @@ impl Renderer {
             } else {
                 windows::Win32::Graphics::Dxgi::DXGI_PRESENT(0)
             };
-            self.swapchain.Present(0, present_flags).ok()?;
+            let hr = self.swapchain.Present(0, present_flags);
+            if hr.is_err() {
+                tracing::warn!("renderer: Present failed hr={:#010x}", hr.0);
+            }
+            hr.ok()?;
+            self.presented += 1;
+            if self.presented == 1 {
+                tracing::info!("renderer: first frame presented");
+            }
         }
         Ok(())
     }

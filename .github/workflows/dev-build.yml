@@ -1,0 +1,85 @@
+name: Dev Build
+
+# Fast, throwaway test builds of the app exe — NOT the full installer release.
+#
+# Every push to main that touches native/ (and manual "Run workflow") does just
+# `cargo build -p app --release` (~1 min with cache), then publishes the single
+# standalone sharectrl.exe to a rolling pre-release tagged "dev". The download URL
+# is stable, so "grab the latest test build" is always:
+#
+#   https://github.com/<owner>/<repo>/releases/download/dev/sharectrl.exe
+#
+# This skips everything the real Release does (NSIS installer, SYSTEM service,
+# cargo-deny gate, tauri-cli). Use the Release workflow for a distributable,
+# versioned build; use this to test a change across the two machines quickly.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "native/**"
+      - ".github/workflows/dev-build.yml"
+  workflow_dispatch:
+
+# A newer push supersedes an in-flight dev build — no point finishing a stale one.
+concurrency:
+  group: dev-build
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # MUST be Windows: DXGI / Media Foundation / WebView2.
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: native
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+
+      # Just the app binary — the Tauri build embeds the UI; no bundling needed.
+      - name: Build app (release)
+        run: cargo build -p app --release
+
+      - name: Short SHA
+        id: sha
+        shell: bash
+        run: echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Refresh the rolling "dev" pre-release: move its tag to this commit and
+      # replace the attached exe. Deleting + recreating keeps the tag, release
+      # body and asset all pointing at the newest build.
+      - name: Publish to rolling dev pre-release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          exe=target/release/sharectrl.exe
+          if [ ! -f "$exe" ]; then
+            echo "::error::$exe not found — build produced no app binary."
+            exit 1
+          fi
+          gh release delete dev --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create dev "$exe" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "Dev build ${{ steps.sha.outputs.short }}" \
+            --notes "Fast test build of \`sharectrl.exe\` from commit ${{ steps.sha.outputs.short }} on main. App only — no installer, no SYSTEM service. Unsigned: SmartScreen warns (More info -> Run anyway). Copy to both test machines and overwrite the old exe."
+
+      # Also expose it as a workflow artifact (survives even if the release step
+      # is ever restricted).
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sharectrl-dev-${{ steps.sha.outputs.short }}
+          path: native/target/release/sharectrl.exe
+          if-no-files-found: warn
+          retention-days: 14

@@ -52,6 +52,9 @@ pub struct Decoder {
     /// supported, but STAGING Map + CopyResource always is.
     upload_staging: Option<ID3D11Texture2D>,
     upload_tex: Option<ID3D11Texture2D>,
+    /// Diagnostics: frames decoded / drains that produced nothing.
+    decoded_count: u64,
+    no_output_count: u64,
 }
 
 impl Decoder {
@@ -111,6 +114,20 @@ impl Decoder {
         // SAFETY: valid device.
         let context: ID3D11DeviceContext = unsafe { device.GetImmediateContext()? };
 
+        if !is_hw {
+            // Log what the software MFT expects for output — dwFlags tells us
+            // whether it provides samples; cbSize/cbAlignment size our buffers.
+            // SAFETY: standard stream-info query.
+            if let Ok(info) = unsafe { transform.GetOutputStreamInfo(output_id) } {
+                tracing::info!(
+                    "software decoder stream info: flags={:#x} cbSize={} cbAlignment={}",
+                    info.dwFlags,
+                    info.cbSize,
+                    info.cbAlignment
+                );
+            }
+        }
+
         Ok(Self {
             transform,
             input_id,
@@ -123,6 +140,8 @@ impl Decoder {
             context,
             upload_staging: None,
             upload_tex: None,
+            decoded_count: 0,
+            no_output_count: 0,
         })
     }
 
@@ -150,52 +169,119 @@ impl Decoder {
         self.drain_output()
     }
 
-    fn drain_output(&mut self) -> Result<Option<DecodedFrame>, Error> {
-        let mut out_buffer = MFT_OUTPUT_DATA_BUFFER {
-            dwStreamID: self.output_id,
-            pSample: std::mem::ManuallyDrop::new(None),
-            dwStatus: 0,
-            pEvents: std::mem::ManuallyDrop::new(None),
-        };
-        let mut status = 0u32;
-        // SAFETY: single-element output-buffer array.
-        let hr = unsafe {
-            self.transform
-                .ProcessOutput(0, std::slice::from_mut(&mut out_buffer), &mut status)
-        };
-        // SAFETY: taken exactly once.
-        let sample = unsafe { std::mem::ManuallyDrop::take(&mut out_buffer.pSample) };
-        let _ = unsafe { std::mem::ManuallyDrop::take(&mut out_buffer.pEvents) };
-
-        if let Err(e) = hr {
-            if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT {
-                return Ok(None);
-            }
-            if e.code() == MF_E_TRANSFORM_STREAM_CHANGE {
-                // The decoder announced its real output format (common on the very
-                // first frame, especially for software decoders). Re-negotiate the
-                // NV12 output type; the next ProcessOutput then yields a frame.
-                set_decoder_output_type(&self.transform, self.output_id, self.width, self.height)?;
-                return Ok(None);
-            }
-            return Err(Error::Win(e));
+    /// A sync software MFT does **not** allocate its own output samples (only
+    /// hardware/DXGI MFTs set `MFT_OUTPUT_STREAM_PROVIDES_SAMPLES`) — the caller
+    /// must hand ProcessOutput a sample with a big-enough buffer, or it fails on
+    /// every call and no frame ever comes out. Query the stream info fresh each
+    /// time (cbSize changes after a format change).
+    fn make_output_sample(&self) -> Result<Option<IMFSample>, Error> {
+        if !self.software {
+            return Ok(None); // hardware decoder provides DXGI samples
         }
-        let Some(sample) = sample else {
-            return Ok(None);
-        };
-        let timestamp = unsafe { sample.GetSampleTime().unwrap_or(0) };
-        // Hardware: the sample already wraps a GPU texture. Software: upload the
-        // system-memory NV12 into a shared texture for the renderer.
-        let (texture, array_index) = if self.software {
-            (self.upload_software_sample(&sample)?, 0)
-        } else {
-            sample_to_texture(&sample)?
-        };
-        Ok(Some(DecodedFrame {
-            texture,
-            array_index,
-            timestamp,
-        }))
+        // SAFETY: standard stream-info query + sample/buffer construction.
+        unsafe {
+            let info = self.transform.GetOutputStreamInfo(self.output_id)?;
+            if info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32) != 0 {
+                return Ok(None);
+            }
+            // NV12 worst case if the MFT reports 0 (some do before first output).
+            let fallback = self.width * self.height * 3 / 2;
+            let size = if info.cbSize > 0 { info.cbSize } else { fallback };
+            let buffer = if info.cbAlignment > 1 {
+                MFCreateAlignedMemoryBuffer(size, info.cbAlignment - 1)?
+            } else {
+                MFCreateMemoryBuffer(size)?
+            };
+            let sample = MFCreateSample()?;
+            sample.AddBuffer(&buffer)?;
+            Ok(Some(sample))
+        }
+    }
+
+    fn drain_output(&mut self) -> Result<Option<DecodedFrame>, Error> {
+        // Retry loop: a format change is renegotiated and retried immediately —
+        // the decoded frame that triggered it is still queued inside the MFT.
+        for attempt in 0..3 {
+            let provided = self.make_output_sample()?;
+            let mut out_buffer = MFT_OUTPUT_DATA_BUFFER {
+                dwStreamID: self.output_id,
+                pSample: std::mem::ManuallyDrop::new(provided),
+                dwStatus: 0,
+                pEvents: std::mem::ManuallyDrop::new(None),
+            };
+            let mut status = 0u32;
+            // SAFETY: single-element output-buffer array.
+            let hr = unsafe {
+                self.transform
+                    .ProcessOutput(0, std::slice::from_mut(&mut out_buffer), &mut status)
+            };
+            // SAFETY: taken exactly once (recovers ownership of provided/returned).
+            let sample = unsafe { std::mem::ManuallyDrop::take(&mut out_buffer.pSample) };
+            let _ = unsafe { std::mem::ManuallyDrop::take(&mut out_buffer.pEvents) };
+
+            if let Err(e) = hr {
+                if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT {
+                    self.log_drain(attempt, "need-more-input", out_buffer.dwStatus);
+                    return Ok(None);
+                }
+                if e.code() == MF_E_TRANSFORM_STREAM_CHANGE {
+                    // The decoder announced its real output format (normal on the
+                    // first decodable frame). Re-negotiate NV12 and retry — the
+                    // frame is still pending inside the transform.
+                    tracing::debug!("decoder: output format change — renegotiating NV12");
+                    set_decoder_output_type(
+                        &self.transform,
+                        self.output_id,
+                        self.width,
+                        self.height,
+                    )?;
+                    continue;
+                }
+                tracing::warn!(
+                    "decoder: ProcessOutput failed hr={:#010x} status={:#x}",
+                    e.code().0,
+                    out_buffer.dwStatus
+                );
+                return Err(Error::Win(e));
+            }
+            let Some(sample) = sample else {
+                self.log_drain(attempt, "ok-but-no-sample", out_buffer.dwStatus);
+                return Ok(None);
+            };
+            let timestamp = unsafe { sample.GetSampleTime().unwrap_or(0) };
+            if self.decoded_count == 0 {
+                tracing::info!(
+                    "decoder: first frame out (attempt {attempt}, software={})",
+                    self.software
+                );
+            }
+            self.decoded_count += 1;
+            // Hardware: the sample already wraps a GPU texture. Software: upload
+            // the system-memory NV12 into a shared texture for the renderer.
+            let (texture, array_index) = if self.software {
+                (self.upload_software_sample(&sample)?, 0)
+            } else {
+                sample_to_texture(&sample)?
+            };
+            return Ok(Some(DecodedFrame {
+                texture,
+                array_index,
+                timestamp,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Rate-limited debug trace of no-output drains, so a silent decoder leaves a
+    /// visible trail in the log instead of an unexplained black screen.
+    fn log_drain(&mut self, attempt: u32, why: &str, status: u32) {
+        self.no_output_count += 1;
+        if self.no_output_count <= 10 || self.no_output_count % 120 == 0 {
+            tracing::debug!(
+                "decoder: no output #{} ({why}, attempt {attempt}, status={status:#x})",
+                self.no_output_count
+            );
+        }
     }
 
     /// Software path: copy an NV12 system-memory sample into a reusable DYNAMIC
@@ -526,6 +612,9 @@ fn make_input_sample(au: &[u8], timestamp: i64) -> Result<IMFSample, Error> {
         let sample = MFCreateSample()?;
         sample.AddBuffer(&buffer)?;
         sample.SetSampleTime(timestamp)?;
+        // Some decoders (notably the software AV1 MFT) want a duration on every
+        // input sample before they'll emit output. 60 fps in 100-ns units.
+        sample.SetSampleDuration(166_667)?;
         Ok(sample)
     }
 }

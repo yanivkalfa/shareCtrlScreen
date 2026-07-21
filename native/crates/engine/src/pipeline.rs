@@ -1107,7 +1107,9 @@ fn viewer_media_loop(
     while !stop.load(Ordering::SeqCst) {
         match video_rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(au) => {
-                ts += 1;
+                // 100-ns MF units at ~60 fps — decoders (esp. the software AV1
+                // MFT) can stall on nonsense timestamps like 1,2,3….
+                ts += 166_667;
                 match decoder.decode(&au, ts) {
                     Ok(Some(frame)) => {
                         undecoded_streak = 0;

@@ -1008,6 +1008,12 @@ fn transport_driver(d: Driver) {
             }
         }
     }
+
+    // Host: whatever ends the session (disconnect, teardown, transport error),
+    // never leave remotely-injected keys/buttons held down on this machine.
+    if let Some(inj) = injector.as_mut() {
+        inj.release_all();
+    }
 }
 
 // ---- Host capture → encode --------------------------------------------------

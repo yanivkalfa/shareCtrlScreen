@@ -19,9 +19,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetClientRect, MoveWindow, RegisterClassW, ShowWindow,
     CS_HREDRAW, CS_VREDRAW, HMENU, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_CHILD,
-    WS_CLIPSIBLINGS,
+    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS,
 };
 
 const CLASS_NAME: PCWSTR = w!("ShareCtrlVideoWindow");
@@ -94,6 +94,53 @@ fn set_reveal(hwnd: HWND, reveal: bool) {
     }
 }
 
+/// Keys/buttons currently held down inside the video window, so a focus loss
+/// (Alt+Tab away, Win key, app switch) can synthesize the matching releases.
+/// Without this the host receives `Alt down` but never `Alt up` — the classic
+/// remote-desktop stuck-modifier: Windows takes the focus mid-combo and the
+/// key-up lands in some other window, never reaching our wndproc.
+static HELD_KEYS: Mutex<Vec<(u16, bool)>> = Mutex::new(Vec::new());
+static HELD_BUTTONS: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+/// Last normalized cursor position (for synthesized button releases).
+static LAST_POS: Mutex<(f64, f64)> = Mutex::new((0.5, 0.5));
+
+/// Synthesize key-up / button-up for everything currently held (focus loss or
+/// session end) so the host never keeps a stuck modifier.
+fn release_all_held() {
+    let keys: Vec<(u16, bool)> = HELD_KEYS
+        .lock()
+        .map(|mut v| v.drain(..).collect())
+        .unwrap_or_default();
+    let buttons: Vec<u8> = HELD_BUTTONS
+        .lock()
+        .map(|mut v| v.drain(..).collect())
+        .unwrap_or_default();
+    if keys.is_empty() && buttons.is_empty() {
+        return;
+    }
+    let (nx, ny) = LAST_POS.lock().map(|p| *p).unwrap_or((0.5, 0.5));
+    tracing::debug!(
+        "video window: focus lost — releasing {} held key(s), {} button(s)",
+        keys.len(),
+        buttons.len()
+    );
+    for (scancode, extended) in keys {
+        emit(VideoInput::Key {
+            scancode,
+            extended,
+            down: false,
+        });
+    }
+    for button in buttons {
+        emit(VideoInput::Button {
+            button,
+            down: false,
+            nx,
+            ny,
+        });
+    }
+}
+
 /// Install the input sink (viewer session start).
 pub fn set_input_sink(tx: Sender<VideoInput>) {
     *INPUT_SINK.lock().unwrap() = Some(tx);
@@ -102,6 +149,13 @@ pub fn set_input_sink(tx: Sender<VideoInput>) {
 /// Remove the input sink (session end / view-only).
 pub fn clear_input_sink() {
     *INPUT_SINK.lock().unwrap() = None;
+    // Stale held state must not leak into the next session.
+    if let Ok(mut k) = HELD_KEYS.lock() {
+        k.clear();
+    }
+    if let Ok(mut b) = HELD_BUTTONS.lock() {
+        b.clear();
+    }
 }
 
 fn emit(ev: VideoInput) {
@@ -280,6 +334,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
             }
             let (nx, ny) = norm_pos(lparam);
+            if let Ok(mut p) = LAST_POS.lock() {
+                *p = (nx, ny);
+            }
             emit(VideoInput::Move { nx, ny });
             return LRESULT(0);
         }
@@ -292,6 +349,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 WM_MBUTTONDOWN => 1,
                 _ => 2,
             };
+            if let Ok(mut held) = HELD_BUTTONS.lock() {
+                if !held.contains(&button) {
+                    held.push(button);
+                }
+            }
             emit(VideoInput::Button {
                 button,
                 down: true,
@@ -307,6 +369,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 WM_MBUTTONUP => 1,
                 _ => 2,
             };
+            if let Ok(mut held) = HELD_BUTTONS.lock() {
+                held.retain(|&b| b != button);
+            }
             emit(VideoInput::Button {
                 button,
                 down: false,
@@ -329,11 +394,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let scancode = ((lparam.0 >> 16) & 0xff) as u16;
             let extended = (lparam.0 & (1 << 24)) != 0;
             let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+            if let Ok(mut held) = HELD_KEYS.lock() {
+                if down {
+                    if !held.contains(&(scancode, extended)) {
+                        held.push((scancode, extended));
+                    }
+                } else {
+                    held.retain(|&k| k != (scancode, extended));
+                }
+            }
             emit(VideoInput::Key {
                 scancode,
                 extended,
                 down,
             });
+            return LRESULT(0);
+        }
+        // Focus left the video window mid-combo (Alt+Tab away, Win key, app
+        // switch): the key-ups will land elsewhere, so synthesize them NOW or
+        // the host keeps a stuck modifier.
+        WM_KILLFOCUS => {
+            release_all_held();
             return LRESULT(0);
         }
         _ => {}

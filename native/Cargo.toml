@@ -1,0 +1,72 @@
+# Native Rust rewrite — Cargo workspace (Plan 04 §4).
+# Single workspace; each crate is one clear responsibility so agents can work in
+# parallel behind the `protocol` interfaces.
+[workspace]
+resolver = "2"
+members = [
+    "crates/protocol",
+    "crates/capture",
+    "crates/codec",
+    "crates/transport",
+    "crates/signaling",
+    "crates/input",
+    "crates/render",
+    "crates/elevation",
+    "crates/engine",
+    "app",
+    "service",
+]
+
+[workspace.package]
+version = "2.0.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Proprietary"
+publish = false
+authors = ["ShareCtrlScreen"]
+
+# Shared dependency versions (Plan 04 §3 — verified crates/versions/licenses).
+# Do not substitute versions without re-running `cargo deny check` (§11).
+[workspace.dependencies]
+# Windows APIs — MIT OR Apache-2.0 (§3).
+windows = "0.62"
+windows-core = "0.62"
+windows-numerics = "0.3"
+# Transport — MIT OR Apache-2.0 (§3, §6).
+str0m = "0.21"
+quinn-udp = "0.6"
+# FEC — MIT AND BSD-3-Clause (§3, §6).
+reed-solomon-simd = "3"
+# Serialization / misc (all permissive).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+sha2 = "0.10"
+hex = "0.4"
+uuid = { version = "1", features = ["v4"] }
+bytes = "1"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+
+# Workspace-wide lints (§4).
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+rust_2018_idioms = "warn"
+
+[workspace.lints.clippy]
+# COM/Win32 interop legitimately uses many args and manual patterns.
+too_many_arguments = "allow"
+missing_safety_doc = "allow"
+
+# Release profile tuned for latency-sensitive media code.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

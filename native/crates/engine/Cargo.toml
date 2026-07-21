@@ -1,0 +1,42 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+protocol = { path = "../protocol" }
+signaling = { path = "../signaling" }
+transport = { path = "../transport" }
+input = { path = "../input" }
+tracing.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
+tokio = { workspace = true }
+rand = "0.8"
+sha2.workspace = true
+hex.workspace = true
+
+str0m.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+capture = { path = "../capture" }
+codec = { path = "../codec" }
+render = { path = "../render" }
+elevation = { path = "../elevation" }
+
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+]
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

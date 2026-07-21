@@ -9,6 +9,7 @@ machine's address. To connect somewhere, you type its UUID.
 
 - `server/` — signaling/rendezvous server (Cloudflare Worker + Durable Object). Relays JSON only; never sees pixels or input.
 - `app/` — Electron desktop app. Both roles (host and viewer) live in the same binary.
+- `native/` — **native Rust rewrite** (Tauri + DXGI/Media Foundation/str0m) targeting AnyDesk-class latency, per `pans/04-NATIVE-REWRITE-PLAN.md`. Reuses the same signaling server and protocol. See [`native/README.md`](native/README.md).
 - `pans/` — the design documents. `00-OVERVIEW-AND-PROTOCOL.md` is the wire contract.
 
 ## Running it locally

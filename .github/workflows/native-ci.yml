@@ -1,0 +1,52 @@
+# CI for the native Rust rewrite (Plan 04 §10). Build + test + license gates.
+# `cargo-deny` enforces the §11 allowlist / banned-crate list; `cargo-about`
+# regenerates the third-party-licenses page. Runs on Windows (the only target).
+name: native-ci
+
+on:
+  push:
+    paths:
+      - "native/**"
+      - ".github/workflows/native-ci.yml"
+  pull_request:
+    paths:
+      - "native/**"
+      - ".github/workflows/native-ci.yml"
+
+defaults:
+  run:
+    working-directory: native
+
+jobs:
+  build-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+      - name: Format check
+        run: cargo fmt --all --check
+      - name: Build
+        run: cargo build --workspace --release
+      - name: Test
+        run: cargo test --workspace
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
+
+  license-gate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny + cargo-about
+        run: |
+          cargo install cargo-deny --locked
+          cargo install cargo-about --locked
+      - name: cargo-deny (license + banned-crate enforcement, §11)
+        run: cargo deny check
+      - name: Regenerate third-party-licenses.html (§10)
+        run: cargo about generate about.hbs --output-file third-party-licenses.html

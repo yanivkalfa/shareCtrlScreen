@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core IPC surface the ShareCtrlScreen UI is allowed to call (Tauri 2 blocks undeclared IPC by default, Plan 04 §7).",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:window:default"
+  ]
+}

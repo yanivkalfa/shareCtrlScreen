@@ -1,0 +1,17 @@
+# cargo-about config — Plan 04 §10/§11. Generates third-party-licenses.html.
+# Run: `cargo about generate about.hbs > third-party-licenses.html`
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CC0-1.0",
+    "BSL-1.0",
+]
+targets = ["x86_64-pc-windows-msvc"]

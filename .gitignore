@@ -33,3 +33,8 @@ Thumbs.db
 # Env files
 .env
 .env.*
+
+# Native Rust rewrite build artifacts
+native/target/
+native/third-party-licenses.html
+native/app/gen/schemas/

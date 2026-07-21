@@ -1,0 +1,27 @@
+[package]
+name = "service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "sharectrl-service"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+elevation = { path = "../crates/elevation" }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+]

@@ -1,0 +1,23 @@
+[package]
+name = "signaling"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+protocol = { path = "../protocol" }
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+# tokio-tungstenite enables rustls without selecting a crypto provider, so the
+# process-level provider must be installed explicitly (see `ensure_crypto`).
+# aws-lc-rs is already in the tree via str0m, so this adds no new native build.
+rustls = { version = "0.23", features = ["aws_lc_rs"] }

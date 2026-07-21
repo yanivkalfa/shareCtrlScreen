@@ -1,0 +1,55 @@
+# cargo-deny config — Plan 04 §11.1. CI-enforced license allowlist + banned crates.
+# Run: `cargo deny check` (gate in CI, §10). Keeps the product proprietary + legal.
+
+[graph]
+targets = [{ triple = "x86_64-pc-windows-msvc" }]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# §11.1 Allow: permissive + file-level copyleft (MPL-2.0) only.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CC0-1.0",
+    "BSL-1.0",
+]
+confidence-threshold = 0.9
+# GPL-*, AGPL-*, LGPL-*, SSPL and unlicensed crates are denied by simply not
+# appearing in `allow` (version-2 semantics: anything not allowed fails the build).
+
+[[licenses.clarify]]
+crate = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+# §11.1 Explicitly banned crates (AGPL / no-license / GPL-linked).
+deny = [
+    { crate = "dxgcap", reason = "AGPL-3.0 (capture) — §11.1" },
+    { crate = "dxgcap2", reason = "AGPL-3.0 (capture) — §11.1" },
+    { crate = "captrs", reason = "AGPL-3.0 (capture) — §11.1" },
+    { crate = "hwcodec", reason = "no license file / RustDesk-org — §11.1" },
+    { crate = "x264", reason = "GPL — §11.1" },
+    { crate = "x265", reason = "GPL — §11.1" },
+    { crate = "rivet-codec", reason = "non-standard unverified license — §11.1" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

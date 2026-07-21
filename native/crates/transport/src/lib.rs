@@ -178,9 +178,17 @@ impl Transport {
     /// Returns `None` for events the engine does not need to act on.
     pub fn on_event(&mut self, event: Event) -> Option<Inbound> {
         match event {
-            Event::Connected => Some(Inbound::Connected),
-            Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
-                Some(Inbound::Disconnected)
+            Event::Connected => {
+                tracing::info!("transport: DTLS/ICE connected");
+                Some(Inbound::Connected)
+            }
+            Event::IceConnectionStateChange(state) => {
+                tracing::info!("transport: ICE state = {state:?}");
+                if state == IceConnectionState::Disconnected {
+                    Some(Inbound::Disconnected)
+                } else {
+                    None
+                }
             }
             Event::ChannelOpen(id, label) => {
                 // Learn ids on the viewer side (channels created by the host).

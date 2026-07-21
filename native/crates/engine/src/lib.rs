@@ -119,6 +119,7 @@ impl Engine {
     pub async fn handle_signaling(&self, event: SigEvent) {
         match event {
             SigEvent::Registered => {
+                tracing::info!("signaling: registered with server");
                 let _ = self.ui.send(UiEvent::ServerStatus("connected"));
             }
             SigEvent::RegisterError(reason) => {

@@ -107,24 +107,120 @@ fn local_host_candidates(port: u16) -> Vec<std::net::SocketAddr> {
     out
 }
 
-/// Bind the session UDP socket and register its host candidates on `rtc` **before**
+/// Bind the session UDP socket and register its candidates on `rtc` **before**
 /// the SDP offer/answer is generated, so str0m embeds them and the peer learns
-/// how to reach us (§6 LAN direct path). Returns the socket to hand to the
-/// transport thread. STUN/TURN for restrictive NATs remains the documented
-/// fallback (not yet wired).
-fn bind_and_gather(rtc: &mut str0m::Rtc) -> Option<std::net::UdpSocket> {
+/// how to reach us. Gathers host candidates (LAN direct path, §6) AND a
+/// server-reflexive (srflx) candidate via STUN (the machine's public `ip:port`),
+/// which is what lets two machines on *different* networks traverse typical NATs.
+/// Symmetric/strict NATs still need TURN (not yet wired). `stun_urls` come from
+/// the config's `iceServers`.
+fn bind_and_gather(rtc: &mut str0m::Rtc, stun_urls: &[String]) -> Option<std::net::UdpSocket> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    let _ = socket.set_nonblocking(true);
     let port = socket.local_addr().ok()?.port();
-    for addr in local_host_candidates(port) {
-        if let Ok(cand) = str0m::Candidate::host(addr, "udp") {
+
+    let host = local_host_candidates(port);
+    for addr in &host {
+        if let Ok(cand) = str0m::Candidate::host(*addr, "udp") {
             rtc.add_local_candidate(cand);
         }
     }
+
+    // STUN discovery for the public address (done while the socket is still
+    // blocking, with a short read timeout), then switch to non-blocking for the
+    // transport loop.
+    if let Some(srflx) = gather_srflx(&socket, stun_urls, &host) {
+        tracing::info!("STUN srflx candidate: {srflx}");
+        // Base = a local IPv4 host candidate matching the srflx family.
+        if let Some(base) = host.iter().find(|a| a.is_ipv4() == srflx.is_ipv4()) {
+            match str0m::Candidate::server_reflexive(srflx, *base, "udp") {
+                Ok(cand) => {
+                    rtc.add_local_candidate(cand);
+                }
+                Err(e) => tracing::warn!("srflx candidate rejected: {e}"),
+            }
+        }
+    } else {
+        tracing::warn!("no STUN srflx candidate — cross-network may fail (need TURN)");
+    }
+
+    let _ = socket.set_nonblocking(true);
     Some(socket)
 }
 
+/// Query the configured STUN servers for this socket's public `ip:port`.
+fn gather_srflx(
+    socket: &std::net::UdpSocket,
+    stun_urls: &[String],
+    _host: &[std::net::SocketAddr],
+) -> Option<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    let _ = socket.set_read_timeout(Some(std::time::Duration::from_millis(800)));
+    for url in stun_urls {
+        // "stun:host:port" (or "stun:host:port?transport=udp").
+        let hostport = url
+            .strip_prefix("stun:")
+            .or_else(|| url.strip_prefix("stuns:"))
+            .unwrap_or(url);
+        let hostport = hostport.split(['?', '&']).next().unwrap_or(hostport);
+        let Ok(addrs) = hostport.to_socket_addrs() else {
+            continue;
+        };
+        for server in addrs {
+            if let Some(mapped) = stun_query(socket, server) {
+                return Some(mapped);
+            }
+        }
+    }
+    None
+}
+
+/// Send one STUN Binding Request and parse the mapped address from the reply.
+fn stun_query(
+    socket: &std::net::UdpSocket,
+    server: std::net::SocketAddr,
+) -> Option<std::net::SocketAddr> {
+    use rand::RngCore;
+    // Hand-build a minimal RFC 5389 Binding Request (no attributes): a public
+    // STUN server replies with our XOR-MAPPED-ADDRESS.
+    let mut tid = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut tid);
+    let mut req = [0u8; 20];
+    req[0..2].copy_from_slice(&0x0001u16.to_be_bytes()); // Binding Request
+    req[2..4].copy_from_slice(&0u16.to_be_bytes()); // length 0
+    req[4..8].copy_from_slice(&0x2112_A442u32.to_be_bytes()); // magic cookie
+    req[8..20].copy_from_slice(&tid);
+
+    socket.send_to(&req, server).ok()?;
+    let mut buf = [0u8; 512];
+    // Try a couple of reads (unrelated packets may arrive first).
+    for _ in 0..3 {
+        let (n, _from) = socket.recv_from(&mut buf).ok()?;
+        if let Ok(msg) = str0m::ice::StunMessage::parse(&buf[..n]) {
+            if let Some(mapped) = msg.mapped_address() {
+                return Some(mapped);
+            }
+        }
+    }
+    None
+}
+
 const DEFAULT_BITRATE: u32 = 8_000_000;
+
+/// STUN server URLs from the config's `iceServers` (contract §5). Falls back to
+/// Google's public STUN if none are usable.
+fn stun_urls_from(engine: &Engine) -> Vec<String> {
+    let mut urls: Vec<String> = engine
+        .config()
+        .ice_servers
+        .into_iter()
+        .map(|s| s.urls)
+        .filter(|u| u.starts_with("stun:") || u.starts_with("stuns:"))
+        .collect();
+    if urls.is_empty() {
+        urls.push("stun:stun.l.google.com:19302".to_string());
+    }
+    urls
+}
 
 /// The negotiated codec for the current/next session (§3), set by the host when
 /// it accepts a viewer whose `caps` it has seen. 0=H264, 1=HEVC, 2=AV1.
@@ -183,7 +279,8 @@ pub fn begin_host(engine: &Engine, peer: String, permission: Permission) {
     // (the peer learns how to reach us). Then relay the offer through the
     // Cloudflare signaling (opaque `signal.data`, §6).
     let mut rtc = str0m::Rtc::new(std::time::Instant::now());
-    let socket = match bind_and_gather(&mut rtc) {
+    let stun_urls = stun_urls_from(engine);
+    let socket = match bind_and_gather(&mut rtc, &stun_urls) {
         Some(s) => s,
         None => {
             tracing::error!("host: failed to bind UDP socket");
@@ -278,9 +375,10 @@ fn start_viewer_transport(engine: &Engine, peer: String, offer_sdp: String) {
     let (video_tx, video_rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
     let mut rtc = str0m::Rtc::new(std::time::Instant::now());
-    // Bind + register our host candidates before accepting the offer, so the
-    // answer str0m generates carries them back to the host (§6 LAN direct path).
-    let socket = match bind_and_gather(&mut rtc) {
+    // Bind + gather host/srflx candidates before accepting the offer, so the
+    // answer str0m generates carries them back to the host (§6 + NAT traversal).
+    let stun_urls = stun_urls_from(engine);
+    let socket = match bind_and_gather(&mut rtc, &stun_urls) {
         Some(s) => s,
         None => {
             tracing::error!("viewer: failed to bind UDP socket");
@@ -491,6 +589,7 @@ fn transport_driver(d: Driver) {
     }
 
     let mut buf = [0u8; 2048];
+    let mut video_count: u64 = 0;
     while !stop.load(Ordering::SeqCst) {
         // 0) Host: if control was just revoked (view-only), release any input we
         // are holding down so the host is never left with a stuck key/button.
@@ -571,7 +670,23 @@ fn transport_driver(d: Driver) {
             Ok(str0m::Output::Event(ev)) => {
                 if let Some(inbound) = tp.on_event(ev) {
                     match inbound {
+                        Inbound::Connected => {
+                            tracing::info!(
+                                "transport connected ({})",
+                                if inject.is_some() { "host" } else { "viewer" }
+                            );
+                        }
+                        Inbound::ChannelOpen(_, label) => {
+                            tracing::info!("data channel open: {label}");
+                        }
                         Inbound::Video(frame) => {
+                            video_count += 1;
+                            if video_count == 1 || video_count % 120 == 0 {
+                                tracing::info!(
+                                    "viewer: received video frame #{video_count} ({} bytes)",
+                                    frame.data.len()
+                                );
+                            }
                             if let Some(tx) = &video_tx {
                                 let _ = tx.send(frame.data);
                             }
@@ -611,8 +726,10 @@ fn transport_driver(d: Driver) {
                                 *CURSOR.lock() = Some((x, y, visible));
                             }
                         }
-                        Inbound::Disconnected => break,
-                        _ => {}
+                        Inbound::Disconnected => {
+                            tracing::info!("transport disconnected");
+                            break;
+                        }
                     }
                 }
             }
@@ -643,9 +760,16 @@ fn host_media_loop(
     };
     // Encoder shares the capture device (§5c zero-copy).
     let mut encoder = Encoder::new(dup.device(), cfg)?;
+    tracing::info!(
+        "host: capture+encoder ready ({}x{}, {})",
+        cfg.width,
+        cfg.height,
+        codec.as_caps_str()
+    );
     // The first emitted frame must be an IDR so the viewer can start decoding.
     encoder.force_keyframe();
     let mut applied_bitrate = cfg.bitrate_bps;
+    let mut sent: u64 = 0;
 
     while !stop.load(Ordering::SeqCst) {
         // §6 adaptive bitrate: feed the current BWE target to the encoder.
@@ -685,10 +809,18 @@ fn host_media_loop(
                 match encoder.encode(&frame.texture) {
                     Ok(units) => {
                         for u in units {
+                            sent += 1;
+                            if sent == 1 || sent % 120 == 0 {
+                                tracing::info!(
+                                    "host: encoded+sent AU #{sent} ({} bytes, keyframe={})",
+                                    u.data.len(),
+                                    u.keyframe
+                                );
+                            }
                             let _ = frame_tx.send((u.data, u.keyframe));
                         }
                     }
-                    Err(e) => tracing::debug!("encode: {e}"),
+                    Err(e) => tracing::warn!("encode error: {e}"),
                 }
                 dup.release();
             }
@@ -728,14 +860,23 @@ fn viewer_media_loop(
     let renderer_dev = create_render_device()?;
     let mut decoder = Decoder::new(&renderer_dev, negotiated_codec(), 1920, 1080)?;
     let mut renderer = render::Renderer::new(&renderer_dev, hwnd, 1920, 1080)?;
+    tracing::info!(
+        "viewer: decoder+renderer ready ({})",
+        negotiated_codec().as_caps_str()
+    );
 
     let mut ts = 0i64;
+    let mut rendered: u64 = 0;
     while !stop.load(Ordering::SeqCst) {
         match video_rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(au) => {
                 ts += 1;
                 match decoder.decode(&au, ts) {
                     Ok(Some(frame)) => {
+                        rendered += 1;
+                        if rendered == 1 || rendered % 120 == 0 {
+                            tracing::info!("viewer: rendered frame #{rendered}");
+                        }
                         // Draw the out-of-band cursor sprite on top (§7).
                         let cursor = match *CURSOR.lock() {
                             Some((x, y, true)) => Some((x, y)),
@@ -744,7 +885,7 @@ fn viewer_media_loop(
                         let _ = renderer.render_frame(&frame.texture, frame.array_index, cursor);
                     }
                     Ok(None) => {}
-                    Err(e) => tracing::debug!("decode: {e}"),
+                    Err(e) => tracing::warn!("decode error: {e}"),
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}

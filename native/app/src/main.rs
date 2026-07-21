@@ -185,10 +185,38 @@ fn config_path() -> PathBuf {
     base.join("ShareCtrlScreen").join("config.json")
 }
 
+/// Log to a file next to the config, since the release build has no console.
+/// `%APPDATA%\ShareCtrlScreen\app.log`. `RUST_LOG` still overrides the level.
+fn init_logging() {
+    let path = config_path().with_file_name("app.log");
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // Verbose for our own media/transport crates so a black screen leaves a
+    // trail (encode/decode errors, ICE state); quiet for noisy dependencies.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(
+            "info,engine=debug,transport=debug,codec=debug,capture=debug,signaling=debug,str0m=warn",
+        )
+    });
+    match std::fs::File::create(&path) {
+        Ok(file) => {
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .with_env_filter(filter)
+                .init();
+            tracing::info!("log file: {}", path.display());
+        }
+        Err(_) => {
+            // Fall back to stdout (debug build with a console).
+            tracing_subscriber::fmt().with_env_filter(filter).init();
+        }
+    }
+}
+
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    init_logging();
 
     // The engine spawns its signaling task with `tokio::spawn`, so a Tokio
     // runtime must exist *and be entered* before `Engine::start`. Hand the same

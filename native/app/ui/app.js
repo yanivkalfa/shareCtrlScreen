@@ -170,7 +170,6 @@ function openSettings() {
   $('set-password-clear').checked = false;
   $('set-password-perm').value = config.passwordPermission;
   $('set-share-audio').checked = config.shareAudio !== false;
-  $('set-capture-shortcuts').checked = config.captureShortcuts === true;
   $('set-share-display').value = config.shareDisplayId || '';
   $('modal-settings').classList.remove('hidden');
 }
@@ -188,7 +187,6 @@ async function saveSettings() {
     mode: $('set-mode-password').checked ? 'password' : 'approve',
     passwordPermission: $('set-password-perm').value,
     shareAudio: $('set-share-audio').checked,
-    captureShortcuts: $('set-capture-shortcuts').checked,
     shareDisplayId: $('set-share-display').value || null
   };
 

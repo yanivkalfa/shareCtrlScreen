@@ -44,6 +44,42 @@ static STATE: Mutex<HookState> = Mutex::new(HookState {
     forward: None,
 });
 
+/// Top-level window of the viewer session (raw HWND). The hook only suppresses
+/// combos while this window is FOREGROUND — matching keyhook.js, which installed
+/// on focus and removed on blur. Clicking any other window instantly gives the
+/// user their keyboard back (§8a guaranteed escape). 0 = gate open never.
+static FOCUS_ROOT: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// Record the session window: pass the video child HWND (raw); its top-level
+/// ancestor becomes the focus gate. Pass 0 to clear (session end).
+pub fn set_focus_root(child_hwnd_raw: isize) {
+    use std::sync::atomic::Ordering;
+    if child_hwnd_raw == 0 {
+        FOCUS_ROOT.store(0, Ordering::SeqCst);
+        return;
+    }
+    // SAFETY: valid HWND from the video window; GA_ROOT walk is read-only.
+    let root = unsafe {
+        windows::Win32::UI::WindowsAndMessaging::GetAncestor(
+            windows::Win32::Foundation::HWND(child_hwnd_raw as *mut _),
+            windows::Win32::UI::WindowsAndMessaging::GA_ROOT,
+        )
+    };
+    FOCUS_ROOT.store(root.0 as isize, Ordering::SeqCst);
+}
+
+/// Is the session window currently foreground?
+fn session_focused() -> bool {
+    use std::sync::atomic::Ordering;
+    let root = FOCUS_ROOT.load(Ordering::SeqCst);
+    if root == 0 {
+        return false;
+    }
+    // SAFETY: pure state read.
+    let fg = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+    fg.0 as isize == root
+}
+
 /// Win32 virtual key → DOM `KeyboardEvent.code` for the small suppressed set.
 fn vk_to_code(vk: u32) -> Option<&'static str> {
     match vk as i32 {
@@ -94,19 +130,60 @@ unsafe extern "system" fn hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARA
     // Ignore our own injected input so we can't feed ourselves a loop.
     let injected =
         (info.flags.0 & LLKHF_INJECTED.0) != 0 || info.dwExtraInfo == super::INJECT_SENTINEL;
-    if injected || !should_suppress(info.vkCode) {
+    if injected {
+        return fallthrough();
+    }
+
+    // If we synthesized an Alt-down for the remote (see below), mirror the REAL
+    // Alt release to the remote — the video window may not have keyboard focus,
+    // so its wndproc can't be relied on for the matching key-up. Never
+    // suppressed locally.
+    {
+        use std::sync::atomic::Ordering;
+        if info.vkCode as i32 == VK_MENU && is_up && SYNTH_ALT.swap(false, Ordering::SeqCst) {
+            forward_key("AltLeft", false);
+        }
+    }
+
+    if !should_suppress(info.vkCode) {
+        return fallthrough();
+    }
+    // Focus gate: only act while the session window is foreground. Anywhere
+    // else on this machine, Alt+Tab/Win behave completely normally.
+    if !session_focused() {
         return fallthrough();
     }
 
     if let Some(code) = vk_to_code(info.vkCode) {
-        if let Ok(state) = STATE.lock() {
-            if let Some(f) = state.forward.as_ref() {
-                // Forwarding must never break the keyboard.
-                f(code, is_down);
+        // Alt+Tab / Alt+Esc: the remote only opens its switcher if it has Alt
+        // down. The user's Alt may have gone to the WebView (not the video
+        // window), so guarantee it: synthesize AltLeft-down once per hold.
+        {
+            use std::sync::atomic::Ordering;
+            let vk = info.vkCode as i32;
+            if (vk == VK_TAB || vk == VK_ESCAPE)
+                && is_down
+                && !SYNTH_ALT.swap(true, Ordering::SeqCst)
+            {
+                forward_key("AltLeft", true);
             }
         }
+        forward_key(code, is_down);
     }
     LRESULT(1) // non-zero => suppress locally
+}
+
+/// Whether we synthesized an AltLeft-down for the remote that still needs its
+/// matching release when the user lets go of the real Alt.
+static SYNTH_ALT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn forward_key(code: &str, down: bool) {
+    if let Ok(state) = STATE.lock() {
+        if let Some(f) = state.forward.as_ref() {
+            // Forwarding must never break the keyboard.
+            f(code, down);
+        }
+    }
 }
 
 /// Install the hook. `forward(code, is_down)` is called for each suppressed key.
@@ -142,6 +219,8 @@ pub fn install(forward: Forward) -> bool {
 
 /// Remove the hook. Safe to call when not installed.
 pub fn uninstall() {
+    set_focus_root(0);
+    SYNTH_ALT.store(false, std::sync::atomic::Ordering::SeqCst);
     if let Ok(mut state) = STATE.lock() {
         if state.hook != 0 {
             // SAFETY: valid HHOOK we installed.

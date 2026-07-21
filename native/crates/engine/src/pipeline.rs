@@ -612,9 +612,15 @@ fn start_viewer_transport(engine: &Engine, peer: String, offer_sdp: String) {
 
     let mut threads = vec![t, r, i];
 
-    // Optional shortcut capture (§8a, experimental, off by default): grab
-    // Alt+Tab / Win locally via WH_KEYBOARD_LL and forward them to the host.
-    if engine.config().capture_shortcuts {
+    // Shortcut capture (§8a): grab OS-reserved combos (Alt+Tab, Win) via
+    // WH_KEYBOARD_LL and forward them to the host — but ONLY while the session
+    // window is foreground (focus gate inside the hook), so clicking any other
+    // window instantly returns the keyboard to this machine. Always on for a
+    // session: this is what makes Alt+Tab act on the REMOTE, the expected
+    // remote-desktop behavior. (Previously gated behind an opt-in setting that
+    // also only took effect on the next session — nobody could discover it.)
+    {
+        input::keyhook::set_focus_root(RENDER_HWND.load(Ordering::SeqCst));
         let ctl = ctl_tx.clone();
         let stop_k = stop.clone();
         let k = std::thread::spawn(move || {

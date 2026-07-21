@@ -163,6 +163,61 @@ fn input_subtype(codec: Codec) -> windows::core::GUID {
     }
 }
 
+/// Cheap probe: is there a hardware decoder for `codec` on this machine? Mirrors
+/// [`crate::encode::can_encode`] — counts `MFTEnumEx` results without activating
+/// them. The viewer uses this so it advertises only codecs it can actually
+/// decode; otherwise the host may negotiate a codec (e.g. AV1) the viewer cannot
+/// decode, which black-screens the session (§3 negotiation).
+pub fn can_decode(codec: Codec) -> bool {
+    super::encode::ensure_mf_startup();
+    let input_info = MFT_REGISTER_TYPE_INFO {
+        guidMajorType: MFMediaType_Video,
+        guidSubtype: input_subtype(codec),
+    };
+    let flags = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER;
+    let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
+    let mut count: u32 = 0;
+    // SAFETY: out-array/count pair per MFTEnumEx; we free the array below.
+    unsafe {
+        if MFTEnumEx(
+            MFT_CATEGORY_VIDEO_DECODER,
+            flags,
+            Some(&input_info),
+            None,
+            &mut activates,
+            &mut count,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        if !activates.is_null() {
+            let slice = std::slice::from_raw_parts_mut(activates, count as usize);
+            for a in slice.iter_mut() {
+                let _ = a.take();
+            }
+            windows::Win32::System::Com::CoTaskMemFree(Some(activates as *const _));
+        }
+    }
+    count > 0
+}
+
+/// The codecs this viewer can hardware-decode, in the plan's preference order
+/// (§3). H.264 is always included as the guaranteed baseline so negotiation
+/// against any host still resolves (the host defaults to H.264 regardless).
+pub fn viewer_decodable() -> Vec<Codec> {
+    let mut v = Vec::new();
+    for c in [Codec::Av1, Codec::Hevc, Codec::H264] {
+        if can_decode(c) {
+            v.push(c);
+        }
+    }
+    if !v.contains(&Codec::H264) {
+        v.push(Codec::H264);
+    }
+    v
+}
+
 fn enumerate_decoder(subtype: windows::core::GUID) -> Result<Option<IMFTransform>, Error> {
     let input_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,

@@ -324,13 +324,18 @@ impl Engine {
 
     /// UI action: connect out to `host_uuid`. Sends the first connect-request.
     pub fn connect_to(&self, host_uuid: String) {
+        // Advertise only codecs this viewer can actually hardware-decode. A
+        // hardcoded list (e.g. always claiming AV1) makes the host negotiate a
+        // codec we cannot decode → the viewer media loop dies → black screen.
+        #[cfg(windows)]
+        let decode = pipeline::viewer_decode_caps();
+        #[cfg(not(windows))]
+        let decode = vec!["H264".to_string()];
         let _ = self.signaling.send(SignalMsg::ConnectRequest {
             to: Some(host_uuid.clone()),
             from: None,
             password: None,
-            caps: Some(protocol::signaling::Caps {
-                decode: vec!["H264".into(), "HEVC".into(), "AV1".into()],
-            }),
+            caps: Some(protocol::signaling::Caps { decode }),
         });
         self.update_config(|c| c.add_recent(&host_uuid));
     }

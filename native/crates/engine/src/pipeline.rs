@@ -192,16 +192,93 @@ fn stun_query(
 
     socket.send_to(&req, server).ok()?;
     let mut buf = [0u8; 512];
-    // Try a couple of reads (unrelated packets may arrive first).
+    // Try a couple of reads (unrelated packets may arrive first). Parse the
+    // XOR-MAPPED-ADDRESS by hand — str0m's StunMessage::parse is built for ICE
+    // connectivity checks and rejects a bare RFC 5389 Binding Success Response
+    // (no MESSAGE-INTEGRITY/FINGERPRINT), which is all a public STUN server sends.
     for _ in 0..3 {
-        let (n, _from) = socket.recv_from(&mut buf).ok()?;
-        if let Ok(msg) = str0m::ice::StunMessage::parse(&buf[..n]) {
-            if let Some(mapped) = msg.mapped_address() {
-                return Some(mapped);
-            }
+        let Ok((n, from)) = socket.recv_from(&mut buf) else {
+            return None; // read timeout / error — give up on this server
+        };
+        if from != server {
+            continue; // not the STUN reply we're waiting for
+        }
+        if let Some(mapped) = parse_stun_mapped_address(&buf[..n], &tid) {
+            return Some(mapped);
         }
     }
     None
+}
+
+/// Parse `XOR-MAPPED-ADDRESS` (preferred) or `MAPPED-ADDRESS` from a STUN Binding
+/// Success Response (RFC 5389 §15.1–15.2). Returns the reflexive `ip:port`.
+fn parse_stun_mapped_address(buf: &[u8], tid: &[u8; 12]) -> Option<std::net::SocketAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    const MAGIC: u32 = 0x2112_A442;
+    if buf.len() < 20 {
+        return None;
+    }
+    // Binding Success Response = 0x0101.
+    if u16::from_be_bytes([buf[0], buf[1]]) != 0x0101 {
+        return None;
+    }
+    let msg_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+    let end = (20 + msg_len).min(buf.len());
+    let magic = MAGIC.to_be_bytes();
+
+    let mut i = 20;
+    let mut plain: Option<SocketAddr> = None;
+    while i + 4 <= end {
+        let atype = u16::from_be_bytes([buf[i], buf[i + 1]]);
+        let alen = u16::from_be_bytes([buf[i + 2], buf[i + 3]]) as usize;
+        let vstart = i + 4;
+        let vend = vstart + alen;
+        if vend > end {
+            break;
+        }
+        // XOR-MAPPED-ADDRESS (0x0020) or MAPPED-ADDRESS (0x0001).
+        if (atype == 0x0020 || atype == 0x0001) && alen >= 4 {
+            let val = &buf[vstart..vend];
+            let xored = atype == 0x0020;
+            let family = val[1];
+            let port = u16::from_be_bytes([val[2], val[3]]) ^ if xored { 0x2112 } else { 0 };
+            let ip = match family {
+                0x01 if val.len() >= 8 => {
+                    let mut a = [val[4], val[5], val[6], val[7]];
+                    if xored {
+                        for k in 0..4 {
+                            a[k] ^= magic[k];
+                        }
+                    }
+                    Some(IpAddr::V4(Ipv4Addr::new(a[0], a[1], a[2], a[3])))
+                }
+                0x02 if val.len() >= 20 => {
+                    let mut a = [0u8; 16];
+                    a.copy_from_slice(&val[4..20]);
+                    if xored {
+                        for k in 0..4 {
+                            a[k] ^= magic[k];
+                        }
+                        for k in 0..12 {
+                            a[4 + k] ^= tid[k];
+                        }
+                    }
+                    Some(IpAddr::V6(Ipv6Addr::from(a)))
+                }
+                _ => None,
+            };
+            if let Some(ip) = ip {
+                let sa = SocketAddr::new(ip, port);
+                if xored {
+                    return Some(sa); // XOR form is authoritative
+                }
+                plain = Some(sa); // keep as fallback, prefer XOR if it appears
+            }
+        }
+        // Advance past the value + 4-byte padding.
+        i = vend + ((4 - (alen % 4)) % 4);
+    }
+    plain
 }
 
 const DEFAULT_BITRATE: u32 = 8_000_000;
@@ -216,8 +293,16 @@ fn stun_urls_from(engine: &Engine) -> Vec<String> {
         .map(|s| s.urls)
         .filter(|u| u.starts_with("stun:") || u.starts_with("stuns:"))
         .collect();
-    if urls.is_empty() {
-        urls.push("stun:stun.l.google.com:19302".to_string());
+    // Always append public fallbacks (dedup) so a single slow/blocked server
+    // doesn't lose us the srflx candidate cross-network.
+    for fallback in [
+        "stun:stun.l.google.com:19302",
+        "stun:stun1.l.google.com:19302",
+        "stun:stun.cloudflare.com:3478",
+    ] {
+        if !urls.iter().any(|u| u == fallback) {
+            urls.push(fallback.to_string());
+        }
     }
     urls
 }
@@ -255,6 +340,17 @@ pub fn set_negotiated_codec_from_caps(viewer_decode: &[String]) -> String {
     NEGOTIATED_CODEC.store(codec_to_u8(chosen), Ordering::SeqCst);
     tracing::info!("negotiated codec: {}", chosen.as_caps_str());
     chosen.as_caps_str().to_string()
+}
+
+/// Viewer: the codecs this machine can actually hardware-decode, as caps strings
+/// (§3). Advertised in the connect-request so the host never negotiates a codec
+/// this viewer cannot decode — the exact failure that black-screens a session
+/// (host encodes AV1, viewer has no AV1 decoder, viewer media loop dies).
+pub fn viewer_decode_caps() -> Vec<String> {
+    codec::decode::viewer_decodable()
+        .iter()
+        .map(|c| c.as_caps_str().to_string())
+        .collect()
 }
 
 /// Viewer: record the codec the host said it will stream, so the decoder uses
@@ -920,4 +1016,43 @@ fn create_render_device(
         )?;
     }
     device.ok_or_else(|| "device creation returned null".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_stun_mapped_address;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn parses_xor_mapped_address_ipv4() {
+        let tid = [7u8; 12];
+        let ip = Ipv4Addr::new(203, 0, 113, 5);
+        let port: u16 = 12345;
+        let magic: u32 = 0x2112_A442;
+        let mb = magic.to_be_bytes();
+
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&0x0101u16.to_be_bytes()); // Binding Success Response
+        msg.extend_from_slice(&12u16.to_be_bytes()); // attr header(4) + value(8)
+        msg.extend_from_slice(&magic.to_be_bytes());
+        msg.extend_from_slice(&tid);
+        msg.extend_from_slice(&0x0020u16.to_be_bytes()); // XOR-MAPPED-ADDRESS
+        msg.extend_from_slice(&8u16.to_be_bytes());
+        msg.push(0x00);
+        msg.push(0x01); // IPv4 family
+        msg.extend_from_slice(&(port ^ 0x2112).to_be_bytes());
+        let o = ip.octets();
+        msg.extend_from_slice(&[o[0] ^ mb[0], o[1] ^ mb[1], o[2] ^ mb[2], o[3] ^ mb[3]]);
+
+        let got = parse_stun_mapped_address(&msg, &tid).unwrap();
+        assert_eq!(got, SocketAddr::new(IpAddr::V4(ip), port));
+    }
+
+    #[test]
+    fn rejects_non_success_response() {
+        // A request (0x0001), not a success response — must not yield an address.
+        let mut msg = vec![0u8; 20];
+        msg[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
+        assert!(parse_stun_mapped_address(&msg, &[0u8; 12]).is_none());
+    }
 }

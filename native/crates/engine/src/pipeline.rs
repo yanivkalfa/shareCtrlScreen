@@ -67,8 +67,8 @@ struct Driver {
     ctl_rx: Receiver<Vec<u8>>,
     /// Host: encoded AUs to send on the video channel.
     frame_rx: Option<Receiver<(Vec<u8>, bool)>>,
-    /// Viewer: reassembled AUs out to the decode/render thread.
-    video_tx: Option<Sender<Vec<u8>>>,
+    /// Viewer: reassembled AUs (+ keyframe flag) out to the decode/render thread.
+    video_tx: Option<Sender<(Vec<u8>, bool)>>,
     /// Host: injection gate (Some ⇒ this side injects remote input).
     inject: Option<Arc<AtomicBool>>,
     /// Host: serialized cursor updates to send on the cursor channel.
@@ -533,7 +533,7 @@ fn start_viewer_transport(engine: &Engine, peer: String, offer_sdp: String) {
     let stop = Arc::new(AtomicBool::new(false));
     let (signal_tx, signal_rx) = std::sync::mpsc::channel::<SignalData>();
     let (ctl_tx, ctl_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    let (video_tx, video_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (video_tx, video_rx) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
 
     let mut rtc = str0m::Rtc::new(std::time::Instant::now());
     // Bind + gather host/srflx candidates before accepting the offer, so the
@@ -889,14 +889,15 @@ fn transport_driver(d: Driver) {
                         }
                         Inbound::Video(frame) => {
                             video_count += 1;
-                            if video_count == 1 || video_count % 120 == 0 {
+                            if video_count <= 5 || video_count % 120 == 0 {
                                 tracing::info!(
-                                    "viewer: received video frame #{video_count} ({} bytes)",
-                                    frame.data.len()
+                                    "viewer: received video frame #{video_count} ({} bytes, keyframe={})",
+                                    frame.data.len(),
+                                    frame.keyframe
                                 );
                             }
                             if let Some(tx) = &video_tx {
-                                let _ = tx.send(frame.data);
+                                let _ = tx.send((frame.data, frame.keyframe));
                             }
                         }
                         Inbound::Ctl(bytes) => {
@@ -1072,7 +1073,7 @@ fn host_media_loop(
 // ---- Viewer decode → render -------------------------------------------------
 
 fn viewer_media_loop(
-    video_rx: Receiver<Vec<u8>>,
+    video_rx: Receiver<(Vec<u8>, bool)>,
     ctl_tx: Sender<Vec<u8>>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1106,11 +1107,11 @@ fn viewer_media_loop(
     let mut last_kf_req = std::time::Instant::now();
     while !stop.load(Ordering::SeqCst) {
         match video_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(au) => {
+            Ok((au, keyframe)) => {
                 // 100-ns MF units at ~60 fps — decoders (esp. the software AV1
                 // MFT) can stall on nonsense timestamps like 1,2,3….
                 ts += 166_667;
-                match decoder.decode(&au, ts) {
+                match decoder.decode(&au, keyframe, ts) {
                     Ok(Some(frame)) => {
                         undecoded_streak = 0;
                         rendered += 1;

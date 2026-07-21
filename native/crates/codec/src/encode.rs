@@ -9,7 +9,10 @@
 use std::sync::Once;
 
 use windows::core::Interface;
-use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
+use windows::Win32::Graphics::Direct3D11::{
+    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+};
 use windows::Win32::Media::MediaFoundation::*;
 
 use crate::variant::{boolv, u32v};
@@ -49,47 +52,93 @@ impl Default for EncoderConfig {
     }
 }
 
-/// A configured MF hardware encoder bound to the shared D3D11 device.
+/// A configured MF encoder bound to the shared D3D11 device. Hardware MFTs run
+/// the async event pump with zero-copy GPU input; the software fallback (the
+/// Microsoft H.264 encoder, present on every Windows) is a sync MFT fed CPU NV12
+/// read back from the GPU converter — used when a machine's hardware encoder for
+/// the negotiated codec is missing or broken.
 pub struct Encoder {
     transform: IMFTransform,
-    events: IMFMediaEventGenerator,
+    /// Some for async (hardware) MFTs; sync software MFTs have no generator.
+    events: Option<IMFMediaEventGenerator>,
     codec_api: Option<ICodecAPI>,
     input_id: u32,
     output_id: u32,
     cfg: EncoderConfig,
-    _dxgi_mgr: IMFDXGIDeviceManager,
+    _dxgi_mgr: Option<IMFDXGIDeviceManager>,
     frame_index: i64,
     /// GPU BGRA→NV12 converter (§5b — DDA gives BGRA, the encoder wants NV12).
     converter: crate::convert::Converter,
+    /// Software path: staging NV12 texture for GPU→CPU readback (lazy).
+    software: bool,
+    context: ID3D11DeviceContext,
+    device: ID3D11Device,
+    staging: Option<ID3D11Texture2D>,
 }
 
 impl Encoder {
-    /// Enumerate, instantiate and configure the HW MFT for `cfg.codec`, sharing
+    /// Enumerate, instantiate and configure the MFT for `cfg.codec`, sharing
     /// `device` with capture so input textures need no cross-device copy (§5c).
+    /// If the hardware path fails **anywhere** during construction (some machines
+    /// have HW MFTs that enumerate but die on activation/configuration with
+    /// E_UNEXPECTED), retry the whole build against the software encoder.
     pub fn new(device: &ID3D11Device, cfg: EncoderConfig) -> Result<Self, Error> {
         ensure_mf_startup();
+        match Self::build(device, cfg, true) {
+            Ok(enc) => Ok(enc),
+            Err(e) => {
+                tracing::warn!(
+                    "hardware {:?} encoder failed ({e}) — trying the software encoder",
+                    cfg.codec
+                );
+                Self::build(device, cfg, false)
+            }
+        }
+    }
+
+    fn build(device: &ID3D11Device, cfg: EncoderConfig, is_hw: bool) -> Result<Self, Error> {
         let subtype = output_subtype(cfg.codec);
 
-        // §5b enumerate/instantiate: HARDWARE | ASYNCMFT | SORTANDFILTER, matched
-        // on the desired output subtype.
-        let transform = enumerate_encoder(subtype)?.ok_or(Error::NoEncoder(cfg.codec))?;
+        // §5b enumerate/instantiate, matched on the desired output subtype.
+        let flags = if is_hw {
+            MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER
+        } else {
+            MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER
+        };
+        let transform =
+            enumerate_encoder_with(subtype, flags)?.ok_or(Error::NoEncoder(cfg.codec))?;
+        if !is_hw {
+            tracing::warn!(
+                "no hardware {:?} encoder — using the software encoder (CPU)",
+                cfg.codec
+            );
+        }
 
         // Unlock async + request low latency on the transform attributes (§5b).
+        // Sync software MFTs have no async contract — skip the unlock there.
         // SAFETY: freshly-activated transform.
         unsafe {
-            let attrs = transform.GetAttributes()?;
-            attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)?;
-            let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
+            if let Ok(attrs) = transform.GetAttributes() {
+                if is_hw {
+                    attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)?;
+                }
+                let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
+            }
         }
 
         // Zero-copy GPU input: bind a DXGI device manager wrapping the shared
-        // device (§5b). MFCreateDXGIDeviceManager → ResetDevice → SET_D3D_MANAGER.
-        let dxgi_mgr = create_dxgi_manager(device)?;
-        // SAFETY: manager is a valid IUnknown; encoder is D3D11-aware.
-        unsafe {
-            let mgr_ptr = dxgi_mgr.as_raw() as usize;
-            transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, mgr_ptr)?;
-        }
+        // device (§5b). Software MFTs read CPU memory — no manager.
+        let dxgi_mgr = if is_hw {
+            let mgr = create_dxgi_manager(device)?;
+            // SAFETY: manager is a valid IUnknown; encoder is D3D11-aware.
+            unsafe {
+                let mgr_ptr = mgr.as_raw() as usize;
+                transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, mgr_ptr)?;
+            }
+            Some(mgr)
+        } else {
+            None
+        };
 
         let (input_id, output_id) = stream_ids(&transform);
 
@@ -119,8 +168,24 @@ impl Encoder {
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
         }
 
-        let events: IMFMediaEventGenerator = transform.cast()?;
+        // Async (hardware) MFTs drive encode via the event generator; a sync
+        // software MFT does not implement it.
+        let events: Option<IMFMediaEventGenerator> = if is_hw {
+            Some(transform.cast()?)
+        } else {
+            None
+        };
         let converter = crate::convert::Converter::new(device, cfg.width, cfg.height)?;
+        // SAFETY: standard immediate-context fetch.
+        let context: ID3D11DeviceContext = unsafe { device.GetImmediateContext()? };
+
+        tracing::info!(
+            "encoder ready: {:?} ({}, {}x{})",
+            cfg.codec,
+            if is_hw { "hardware" } else { "software" },
+            cfg.width,
+            cfg.height
+        );
 
         Ok(Self {
             transform,
@@ -132,6 +197,10 @@ impl Encoder {
             _dxgi_mgr: dxgi_mgr,
             frame_index: 0,
             converter,
+            software: !is_hw,
+            context,
+            device: device.clone(),
+            staging: None,
         })
     }
 
@@ -166,7 +235,17 @@ impl Encoder {
 
         // BGRA (DDA) → NV12 (encoder input) on the GPU.
         let nv12 = self.converter.convert_to_nv12(texture)?;
-        let sample = wrap_texture_sample(nv12, sample_time, duration)?;
+        let sample = if self.software {
+            // Software MFT reads CPU memory: read the NV12 back and wrap it.
+            let nv12 = nv12.clone();
+            self.readback_nv12_sample(&nv12, sample_time, duration)?
+        } else {
+            wrap_texture_sample(nv12, sample_time, duration)?
+        };
+
+        if self.events.is_none() {
+            return self.encode_sync(&sample);
+        }
 
         let mut out = Vec::new();
         let mut fed = false;
@@ -178,6 +257,8 @@ impl Encoder {
             // (NeedInput → HaveOutput) — correct for the low-latency 1:1 pump.
             let event = unsafe {
                 self.events
+                    .as_ref()
+                    .expect("async pump requires event generator")
                     .GetEvent(MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(0))?
             };
             // GetType yields the raw MediaEventType; compare against the MFT
@@ -206,11 +287,134 @@ impl Encoder {
         Ok(out)
     }
 
+    /// Sync (software) MFT pump: feed the input, then drain until the encoder
+    /// asks for more input. The MS software H.264 encoder is 1-in/1-out at
+    /// steady state, with a possible short warm-up delay.
+    fn encode_sync(&mut self, sample: &IMFSample) -> Result<Vec<EncodedFrame>, Error> {
+        // SAFETY: configured sync transform; sample owned by caller.
+        unsafe {
+            match self.transform.ProcessInput(self.input_id, sample, 0) {
+                Ok(()) => {}
+                Err(e) if e.code() == MF_E_NOTACCEPTING => {
+                    // Output pending — drain, then retry the input once.
+                    let mut out = Vec::new();
+                    while let Some(f) = self.drain_output()? {
+                        out.push(f);
+                    }
+                    self.transform.ProcessInput(self.input_id, sample, 0)?;
+                    while let Some(f) = self.drain_output()? {
+                        out.push(f);
+                    }
+                    return Ok(out);
+                }
+                Err(e) => return Err(Error::Win(e)),
+            }
+        }
+        let mut out = Vec::new();
+        while let Some(f) = self.drain_output()? {
+            out.push(f);
+        }
+        Ok(out)
+    }
+
+    /// Read the GPU NV12 conversion result back to CPU memory and wrap it in an
+    /// `IMFSample` for a software encoder. Staging texture is created lazily and
+    /// reused; rows are tightly packed (stride = width) as MF expects for NV12
+    /// with no MF_MT_DEFAULT_STRIDE override.
+    fn readback_nv12_sample(
+        &mut self,
+        nv12: &ID3D11Texture2D,
+        time: i64,
+        duration: i64,
+    ) -> Result<IMFSample, Error> {
+        let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
+        if self.staging.is_none() {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: self.cfg.width,
+                Height: self.cfg.height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
+            };
+            let mut tex = None;
+            // SAFETY: valid device + desc.
+            unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut tex))? };
+            self.staging = tex;
+        }
+        let staging = self.staging.clone().ok_or(Error::NoEncoder(self.cfg.codec))?;
+
+        let total = w * h * 3 / 2;
+        // SAFETY: GPU copy + CPU map of the staging texture; unmapped before use.
+        unsafe {
+            self.context.CopyResource(&staging, nv12);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.context
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            let src = mapped.pData as *const u8;
+            let pitch = mapped.RowPitch as usize;
+
+            let buffer = MFCreateMemoryBuffer(total as u32)?;
+            let mut dst: *mut u8 = std::ptr::null_mut();
+            buffer.Lock(&mut dst, None, None)?;
+            // Y plane rows, then interleaved UV rows (chroma at pitch*h).
+            for y in 0..h {
+                std::ptr::copy_nonoverlapping(src.add(y * pitch), dst.add(y * w), w);
+            }
+            let src_uv = src.add(pitch * h);
+            let dst_uv = dst.add(w * h);
+            for y in 0..(h / 2) {
+                std::ptr::copy_nonoverlapping(src_uv.add(y * pitch), dst_uv.add(y * w), w);
+            }
+            buffer.Unlock()?;
+            buffer.SetCurrentLength(total as u32)?;
+            self.context.Unmap(&staging, 0);
+
+            let sample = MFCreateSample()?;
+            sample.AddBuffer(&buffer)?;
+            sample.SetSampleTime(time)?;
+            sample.SetSampleDuration(duration)?;
+            Ok(sample)
+        }
+    }
+
     /// Pull one compressed sample via `ProcessOutput` and copy its bytes out.
+    /// When the MFT does not provide its own output samples (software encoders),
+    /// hand it one sized from `GetOutputStreamInfo`.
     fn drain_output(&self) -> Result<Option<EncodedFrame>, Error> {
+        // SAFETY: stream-info query + optional sample/buffer construction.
+        let provided: Option<IMFSample> = unsafe {
+            let info = self.transform.GetOutputStreamInfo(self.output_id)?;
+            if info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32) != 0 {
+                None
+            } else {
+                let size = if info.cbSize > 0 {
+                    info.cbSize
+                } else {
+                    // Compressed worst case: a raw frame won't be exceeded.
+                    self.cfg.width * self.cfg.height * 3 / 2
+                };
+                let buffer = if info.cbAlignment > 1 {
+                    MFCreateAlignedMemoryBuffer(size, info.cbAlignment - 1)?
+                } else {
+                    MFCreateMemoryBuffer(size)?
+                };
+                let sample = MFCreateSample()?;
+                sample.AddBuffer(&buffer)?;
+                Some(sample)
+            }
+        };
+
         let mut out_buffer = MFT_OUTPUT_DATA_BUFFER {
             dwStreamID: self.output_id,
-            pSample: std::mem::ManuallyDrop::new(None),
+            pSample: std::mem::ManuallyDrop::new(provided),
             dwStatus: 0,
             pEvents: std::mem::ManuallyDrop::new(None),
         };
@@ -220,18 +424,23 @@ impl Encoder {
             self.transform
                 .ProcessOutput(0, std::slice::from_mut(&mut out_buffer), &mut status)
         };
+        // SAFETY: taken exactly once (recovers provided or MFT-returned sample).
+        let sample = unsafe { std::mem::ManuallyDrop::take(&mut out_buffer.pSample) };
+        // Drop any event collection the MFT attached.
+        let _ = unsafe { std::mem::ManuallyDrop::take(&mut out_buffer.pEvents) };
         if let Err(e) = hr {
             // MF_E_TRANSFORM_NEED_MORE_INPUT is normal — no output yet.
             if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT {
                 return Ok(None);
             }
+            tracing::warn!(
+                "encoder: ProcessOutput failed hr={:#010x} status={:#x}",
+                e.code().0,
+                out_buffer.dwStatus
+            );
             return Err(Error::Win(e));
         }
 
-        // SAFETY: ProcessOutput populated pSample; taken exactly once here.
-        let sample = unsafe { std::mem::ManuallyDrop::take(&mut out_buffer.pSample) };
-        // Drop any event collection the MFT attached.
-        let _ = unsafe { std::mem::ManuallyDrop::take(&mut out_buffer.pEvents) };
         let Some(sample) = sample else {
             return Ok(None);
         };
@@ -289,18 +498,18 @@ pub fn can_encode(codec: Codec) -> bool {
     count > 0
 }
 
-/// The codecs this host can hardware-encode, in the plan's preference order
-/// (§3). H.264 is the guaranteed baseline.
+/// The codecs this host can encode, in the plan's preference order (§3). H.264
+/// is always included: even with no (or a broken) hardware encoder, the
+/// Microsoft software H.264 encoder exists on every Windows and `Encoder::new`
+/// falls back to it.
 pub fn host_encodable() -> Vec<Codec> {
     let mut v = Vec::new();
-    for c in [Codec::Av1, Codec::Hevc, Codec::H264] {
+    for c in [Codec::Av1, Codec::Hevc] {
         if can_encode(c) {
             v.push(c);
         }
     }
-    if v.is_empty() {
-        v.push(Codec::H264); // assume the universal baseline
-    }
+    v.push(Codec::H264); // guaranteed baseline (software fallback)
     v
 }
 
@@ -313,15 +522,16 @@ fn output_subtype(codec: Codec) -> windows::core::GUID {
     }
 }
 
-/// §5b enumerate: `MFTEnumEx(VIDEO_ENCODER, HARDWARE|ASYNCMFT|SORTANDFILTER)`
-/// for the desired output subtype; activate the first result → `IMFTransform`.
-fn enumerate_encoder(subtype: windows::core::GUID) -> Result<Option<IMFTransform>, Error> {
+/// §5b enumerate with explicit flags (hardware-async or software-sync) for the
+/// desired output subtype; activate the first result → `IMFTransform`.
+fn enumerate_encoder_with(
+    subtype: windows::core::GUID,
+    flags: MFT_ENUM_FLAG,
+) -> Result<Option<IMFTransform>, Error> {
     let output_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: subtype,
     };
-    let flags = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER;
-
     let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
     let mut count: u32 = 0;
     // SAFETY: out-array pointer/count pair per the MFTEnumEx contract.

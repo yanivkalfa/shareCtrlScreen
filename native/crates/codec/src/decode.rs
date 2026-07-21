@@ -52,7 +52,8 @@ pub struct Decoder {
     /// supported, but STAGING Map + CopyResource always is.
     upload_staging: Option<ID3D11Texture2D>,
     upload_tex: Option<ID3D11Texture2D>,
-    /// Diagnostics: frames decoded / drains that produced nothing.
+    /// Diagnostics: AUs fed / frames decoded / drains that produced nothing.
+    fed_count: u64,
     decoded_count: u64,
     no_output_count: u64,
 }
@@ -140,6 +141,7 @@ impl Decoder {
             context,
             upload_staging: None,
             upload_tex: None,
+            fed_count: 0,
             decoded_count: 0,
             no_output_count: 0,
         })
@@ -147,14 +149,30 @@ impl Decoder {
 
     /// Feed one compressed access unit and return any decoded frame it produced.
     /// Returns `Ok(None)` when the decoder needs more input (normal for the
-    /// first few packets of a stream).
-    pub fn decode(&mut self, au: &[u8], timestamp: i64) -> Result<Option<DecodedFrame>, Error> {
-        let sample = make_input_sample(au, timestamp)?;
+    /// first few packets of a stream). `keyframe` comes from the transport frame
+    /// header and is stamped as `MFSampleExtension_CleanPoint` — decoders use it
+    /// to know where a decodable stream starts.
+    pub fn decode(
+        &mut self,
+        au: &[u8],
+        keyframe: bool,
+        timestamp: i64,
+    ) -> Result<Option<DecodedFrame>, Error> {
+        self.fed_count += 1;
+        if self.fed_count <= 10 || self.fed_count % 120 == 0 {
+            tracing::debug!(
+                "decoder: feeding AU #{} ({} bytes, keyframe={keyframe}, pts={timestamp})",
+                self.fed_count,
+                au.len()
+            );
+        }
+        let sample = make_input_sample(au, keyframe, timestamp)?;
         // SAFETY: valid transform + sample.
         unsafe {
             match self.transform.ProcessInput(self.input_id, &sample, 0) {
                 Ok(()) => {}
                 Err(e) if e.code() == MF_E_NOTACCEPTING => {
+                    tracing::debug!("decoder: input not accepted — draining first");
                     // Drain first, then retry once.
                     if let Some(f) = self.drain_output()? {
                         // Re-feed after draining.
@@ -163,7 +181,10 @@ impl Decoder {
                     }
                     self.transform.ProcessInput(self.input_id, &sample, 0)?;
                 }
-                Err(e) => return Err(Error::Win(e)),
+                Err(e) => {
+                    tracing::warn!("decoder: ProcessInput failed hr={:#010x}", e.code().0);
+                    return Err(Error::Win(e));
+                }
             }
         }
         self.drain_output()
@@ -448,66 +469,69 @@ fn input_subtype(codec: Codec) -> windows::core::GUID {
 /// decode; otherwise the host may negotiate a codec (e.g. AV1) the viewer cannot
 /// decode, which black-screens the session (§3 negotiation).
 pub fn can_decode(codec: Codec) -> bool {
+    can_decode_with(
+        codec,
+        MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+    ) || can_decode_with(codec, MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER)
+}
+
+/// Is there a **hardware** decoder for `codec`?
+pub fn can_decode_hw(codec: Codec) -> bool {
+    can_decode_with(
+        codec,
+        MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+    )
+}
+
+fn can_decode_with(codec: Codec, flags: MFT_ENUM_FLAG) -> bool {
     super::encode::ensure_mf_startup();
     let input_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: input_subtype(codec),
     };
-    // Count hardware MFTs first, then software (e.g. the Microsoft H.264 decoder
-    // and the AV1 Video Extension are software MFTs). Either kind means we can
-    // decode this codec — the decoder picks HW when present, SW otherwise.
-    for flags in [
-        MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
-        MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
-    ] {
-        let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
-        let mut count: u32 = 0;
-        // SAFETY: out-array/count pair per MFTEnumEx; we free the array below.
-        unsafe {
-            if MFTEnumEx(
-                MFT_CATEGORY_VIDEO_DECODER,
-                flags,
-                Some(&input_info),
-                None,
-                &mut activates,
-                &mut count,
-            )
-            .is_ok()
-            {
-                if !activates.is_null() {
-                    let slice = std::slice::from_raw_parts_mut(activates, count as usize);
-                    for a in slice.iter_mut() {
-                        let _ = a.take();
-                    }
-                    windows::Win32::System::Com::CoTaskMemFree(Some(activates as *const _));
-                }
-                if count > 0 {
-                    return true;
-                }
+    let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
+    let mut count: u32 = 0;
+    // SAFETY: out-array/count pair per MFTEnumEx; we free the array below.
+    unsafe {
+        if MFTEnumEx(
+            MFT_CATEGORY_VIDEO_DECODER,
+            flags,
+            Some(&input_info),
+            None,
+            &mut activates,
+            &mut count,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        if !activates.is_null() {
+            let slice = std::slice::from_raw_parts_mut(activates, count as usize);
+            for a in slice.iter_mut() {
+                let _ = a.take();
             }
+            windows::Win32::System::Com::CoTaskMemFree(Some(activates as *const _));
         }
     }
-    false
+    count > 0
 }
 
-/// The codecs this viewer can decode (hardware or software), in the plan's
-/// preference order (§3). H.264 is always included as the guaranteed baseline.
+/// The codecs this viewer advertises for negotiation (§3), preference order.
 ///
-/// Note we advertise software-decodable codecs (AV1/HEVC) too, not just
-/// hardware ones: the host may be able to *encode* only some codecs, and the
-/// negotiated pick must be one the host can produce. On real hardware where the
-/// host can encode H.264 that's chosen (light); where the host can only encode
-/// AV1, advertising AV1 lets the session succeed via software AV1 decode.
+/// AV1/HEVC are advertised only when **hardware**-decodable: their software
+/// extensions are unreliable for real-time (the AV1 Video Extension accepts
+/// input yet never emits output under a low-latency trickle — observed in the
+/// field). H.264 is always advertised: hardware where present, and the mature
+/// Microsoft software H.264 decoder everywhere else. The host guarantees H.264
+/// on its side too (software encoder fallback), so negotiation always closes.
 pub fn viewer_decodable() -> Vec<Codec> {
     let mut v = Vec::new();
-    for c in [Codec::Av1, Codec::Hevc, Codec::H264] {
-        if can_decode(c) {
+    for c in [Codec::Av1, Codec::Hevc] {
+        if can_decode_hw(c) {
             v.push(c);
         }
     }
-    if !v.contains(&Codec::H264) {
-        v.push(Codec::H264);
-    }
+    v.push(Codec::H264);
     v
 }
 
@@ -598,7 +622,7 @@ fn set_decoder_output_type(
 
 /// Build an input `IMFSample` from a CPU byte slice (the AU reassembled from the
 /// transport). Uses a memory buffer + copy; the compressed side is tiny.
-fn make_input_sample(au: &[u8], timestamp: i64) -> Result<IMFSample, Error> {
+fn make_input_sample(au: &[u8], keyframe: bool, timestamp: i64) -> Result<IMFSample, Error> {
     // SAFETY: standard MF buffer/sample construction; copy bounded by len.
     unsafe {
         let buffer = MFCreateMemoryBuffer(au.len() as u32)?;
@@ -615,6 +639,10 @@ fn make_input_sample(au: &[u8], timestamp: i64) -> Result<IMFSample, Error> {
         // Some decoders (notably the software AV1 MFT) want a duration on every
         // input sample before they'll emit output. 60 fps in 100-ns units.
         sample.SetSampleDuration(166_667)?;
+        // Mark IDRs: decoders use CleanPoint to find where decoding can start.
+        if keyframe {
+            let _ = sample.SetUINT32(&MFSampleExtension_CleanPoint, 1);
+        }
         Ok(sample)
     }
 }

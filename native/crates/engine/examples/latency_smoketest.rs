@@ -56,7 +56,7 @@ fn main() {
         let mut t_dec = 0.0;
         if let (Some(dec), Some(u)) = (decoder.as_mut(), units.first()) {
             let t2 = Instant::now();
-            let _ = dec.decode(&u.data, samples.len() as i64);
+            let _ = dec.decode(&u.data, u.keyframe, samples.len() as i64);
             t_dec = t2.elapsed().as_secs_f64() * 1000.0;
         }
         dup.release();

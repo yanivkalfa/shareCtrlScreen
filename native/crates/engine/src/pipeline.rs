@@ -73,7 +73,55 @@ struct Driver {
     inject: Option<Arc<AtomicBool>>,
     /// Host: serialized cursor updates to send on the cursor channel.
     cursor_rx: Option<Receiver<Vec<u8>>>,
+    /// The bound UDP socket (candidates were gathered from it before the SDP was
+    /// generated, so the peer receives them embedded in the offer/answer).
+    socket: std::net::UdpSocket,
     stop: Arc<AtomicBool>,
+}
+
+/// Real host ICE candidates: one per non-loopback local interface address, all
+/// on the bound `port` (the socket listens on `0.0.0.0`, so any interface's
+/// `ip:port` reaches it). This replaces advertising the useless wildcard
+/// `0.0.0.0:port`, which no peer could route to. Link-local IPv6 (`fe80::`) is
+/// skipped (needs a scope id str0m's plain `Candidate::host` can't carry).
+fn local_host_candidates(port: u16) -> Vec<std::net::SocketAddr> {
+    let mut out = Vec::new();
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for iface in ifaces {
+            if iface.is_loopback() {
+                continue;
+            }
+            let ip = iface.ip();
+            if let std::net::IpAddr::V6(v6) = ip {
+                if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                    continue; // link-local
+                }
+            }
+            out.push(std::net::SocketAddr::new(ip, port));
+        }
+    }
+    // Offline same-machine testing: fall back to loopback so ICE still forms.
+    if out.is_empty() {
+        out.push(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+    }
+    out
+}
+
+/// Bind the session UDP socket and register its host candidates on `rtc` **before**
+/// the SDP offer/answer is generated, so str0m embeds them and the peer learns
+/// how to reach us (§6 LAN direct path). Returns the socket to hand to the
+/// transport thread. STUN/TURN for restrictive NATs remains the documented
+/// fallback (not yet wired).
+fn bind_and_gather(rtc: &mut str0m::Rtc) -> Option<std::net::UdpSocket> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    let _ = socket.set_nonblocking(true);
+    let port = socket.local_addr().ok()?.port();
+    for addr in local_host_candidates(port) {
+        if let Ok(cand) = str0m::Candidate::host(addr, "udp") {
+            rtc.add_local_candidate(cand);
+        }
+    }
+    Some(socket)
 }
 
 const DEFAULT_BITRATE: u32 = 8_000_000;
@@ -130,9 +178,18 @@ pub fn begin_host(engine: &Engine, peer: String, permission: Permission) {
     let (frame_tx, frame_rx) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
     let (cursor_tx, cursor_rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
-    // Build the offerer Rtc and its data channels via the SDP API, then relay
-    // the offer through the Cloudflare signaling (opaque `signal.data`, §6).
+    // Build the offerer Rtc, bind the UDP socket, and register our host
+    // candidates BEFORE generating the offer so str0m embeds them in the SDP
+    // (the peer learns how to reach us). Then relay the offer through the
+    // Cloudflare signaling (opaque `signal.data`, §6).
     let mut rtc = str0m::Rtc::new(std::time::Instant::now());
+    let socket = match bind_and_gather(&mut rtc) {
+        Some(s) => s,
+        None => {
+            tracing::error!("host: failed to bind UDP socket");
+            return;
+        }
+    };
     let mut api = rtc.sdp_api();
     api.add_channel("video".to_string());
     api.add_channel("ctl".to_string());
@@ -164,6 +221,7 @@ pub fn begin_host(engine: &Engine, peer: String, permission: Permission) {
         video_tx: None, // host does not render video
         inject: Some(control.clone()),
         cursor_rx: Some(cursor_rx),
+        socket,
         stop: stop.clone(),
     };
     let t = std::thread::spawn(move || transport_driver(driver));
@@ -220,6 +278,15 @@ fn start_viewer_transport(engine: &Engine, peer: String, offer_sdp: String) {
     let (video_tx, video_rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
     let mut rtc = str0m::Rtc::new(std::time::Instant::now());
+    // Bind + register our host candidates before accepting the offer, so the
+    // answer str0m generates carries them back to the host (§6 LAN direct path).
+    let socket = match bind_and_gather(&mut rtc) {
+        Some(s) => s,
+        None => {
+            tracing::error!("viewer: failed to bind UDP socket");
+            return;
+        }
+    };
     if let Ok(offer) = str0m::change::SdpOffer::from_sdp_string(&offer_sdp) {
         match rtc.sdp_api().accept_offer(offer) {
             Ok(answer) => {
@@ -267,6 +334,7 @@ fn start_viewer_transport(engine: &Engine, peer: String, offer_sdp: String) {
         video_tx: Some(video_tx),
         inject: None, // viewer never injects
         cursor_rx: None,
+        socket,
         stop: stop.clone(),
     };
     let t = std::thread::spawn(move || transport_driver(driver));
@@ -400,9 +468,9 @@ fn transport_driver(d: Driver) {
         video_tx,
         inject,
         cursor_rx,
+        socket,
         stop,
     } = d;
-    use std::net::UdpSocket;
     use transport::{Inbound, Transport};
 
     // Host side: injector for remote input, gated by the live control permission.
@@ -414,22 +482,9 @@ fn transport_driver(d: Driver) {
         .as_ref()
         .map(|_| elevation::InputDesktopFollower::new());
 
-    let socket = match UdpSocket::bind("0.0.0.0:0") {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("udp bind failed: {e}");
-            return;
-        }
-    };
-    let _ = socket.set_nonblocking(true);
-
+    // The socket was bound and its host candidates registered before the SDP was
+    // generated (see `bind_and_gather`), so the peer already has our candidates.
     let mut tp = Transport::new(rtc);
-    // Advertise our host candidate (LAN direct path; STUN/TURN is the §6 fallback).
-    if let Ok(local) = socket.local_addr() {
-        if let Ok(cand) = str0m::Candidate::host(local, "udp") {
-            let _ = tp.rtc_mut().add_local_candidate(cand);
-        }
-    }
     // Host creates the three channels here (direct write side).
     if frame_rx.is_some() {
         tp.create_channels();

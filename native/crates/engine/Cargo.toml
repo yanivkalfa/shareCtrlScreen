@@ -23,6 +23,7 @@ sha2.workspace = true
 hex.workspace = true
 
 str0m.workspace = true
+if-addrs = "0.15.0"
 
 [target.'cfg(windows)'.dependencies]
 capture = { path = "../capture" }

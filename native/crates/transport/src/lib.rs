@@ -112,18 +112,14 @@ impl Transport {
         }
     }
 
-    /// Host side: create the three §6 channels up front (direct API — no SDP
-    /// round-trip needed for the channel set itself).
-    pub fn create_channels(&mut self) -> Channels {
-        let [v, c, cur] = channel_configs();
-        let mut api = self.rtc.direct_api();
-        let video = api.create_data_channel(v);
-        let ctl = api.create_data_channel(c);
-        let cursor = api.create_data_channel(cur);
-        self.video = Some(video);
-        self.ctl = Some(ctl);
-        self.cursor = Some(cursor);
-        Channels { video, ctl, cursor }
+    /// Host side: adopt the three §6 channel ids created on the `Rtc` before it
+    /// was handed to this transport (they must be created exactly once — creating
+    /// a second set under the same labels makes the viewer's label→id mapping
+    /// ambiguous and doubles every ChannelOpen).
+    pub fn set_channels(&mut self, ch: Channels) {
+        self.video = Some(ch.video);
+        self.ctl = Some(ch.ctl);
+        self.cursor = Some(ch.cursor);
     }
 
     pub fn rtc_mut(&mut self) -> &mut Rtc {

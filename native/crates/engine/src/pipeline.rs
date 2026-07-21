@@ -73,6 +73,12 @@ struct Driver {
     inject: Option<Arc<AtomicBool>>,
     /// Host: serialized cursor updates to send on the cursor channel.
     cursor_rx: Option<Receiver<Vec<u8>>>,
+    /// Host: the §6 channel ids created on the Rtc in `begin_host` (exactly once).
+    channels: Option<transport::Channels>,
+    /// Host: set to make the encoder emit an IDR (on video-channel open, and on a
+    /// viewer `KeyframeRequest`). Frames sent before the channel opened are lost
+    /// on the wire, so the first *deliverable* frame must restart the decoder.
+    force_key: Option<Arc<AtomicBool>>,
     /// The bound UDP socket (candidates were gathered from it before the SDP was
     /// generated, so the peer receives them embedded in the offer/answer).
     socket: std::net::UdpSocket,
@@ -424,10 +430,25 @@ pub fn begin_host(engine: &Engine, peer: String, permission: Permission) {
             return;
         }
     };
+    // Create the three §6 channels exactly once, with their reliability configs
+    // (video/cursor unreliable, ctl reliable) via the direct API. Previously the
+    // SDP api ALSO added a "video"/"ctl"/"cursor" set (default reliable/ordered),
+    // so six channels opened, the viewer's label→id map was ambiguous, and video
+    // could bind to the wrong twin.
+    let channels = {
+        let [v, c, cur] = transport::channel_configs();
+        let mut dapi = rtc.direct_api();
+        let video = dapi.create_data_channel(v);
+        let ctl = dapi.create_data_channel(c);
+        let cursor = dapi.create_data_channel(cur);
+        transport::Channels { video, ctl, cursor }
+    };
+
     let mut api = rtc.sdp_api();
-    api.add_channel("video".to_string());
-    api.add_channel("ctl".to_string());
-    api.add_channel("cursor".to_string());
+    // One throwaway SDP-negotiated channel forces the m=application section into
+    // the offer (the SCTP association the direct channels ride on). Its label is
+    // never used for media.
+    api.add_channel("init".to_string());
     let pending = match api.apply() {
         Some((offer, pending)) => {
             let _ = engine.signaling().send(protocol::SignalMsg::Signal {
@@ -444,6 +465,7 @@ pub fn begin_host(engine: &Engine, peer: String, permission: Permission) {
 
     let control = Arc::new(AtomicBool::new(permission == Permission::Control));
     let bitrate = Arc::new(std::sync::atomic::AtomicU32::new(DEFAULT_BITRATE));
+    let force_key = Arc::new(AtomicBool::new(false));
 
     // Transport driver thread (owns the Rtc + UDP socket).
     let driver = Driver {
@@ -455,6 +477,8 @@ pub fn begin_host(engine: &Engine, peer: String, permission: Permission) {
         video_tx: None, // host does not render video
         inject: Some(control.clone()),
         cursor_rx: Some(cursor_rx),
+        channels: Some(channels),
+        force_key: Some(force_key.clone()),
         socket,
         stop: stop.clone(),
     };
@@ -464,7 +488,7 @@ pub fn begin_host(engine: &Engine, peer: String, permission: Permission) {
     let stop_m = stop.clone();
     let bitrate_m = bitrate.clone();
     let m = std::thread::spawn(move || {
-        if let Err(e) = host_media_loop(frame_tx, cursor_tx, bitrate_m, stop_m) {
+        if let Err(e) = host_media_loop(frame_tx, cursor_tx, bitrate_m, force_key, stop_m) {
             tracing::warn!("host media loop ended: {e}");
         }
     });
@@ -569,15 +593,19 @@ fn start_viewer_transport(engine: &Engine, peer: String, offer_sdp: String) {
         video_tx: Some(video_tx),
         inject: None, // viewer never injects
         cursor_rx: None,
+        channels: None, // learned from ChannelOpen by label
+        force_key: None,
         socket,
         stop: stop.clone(),
     };
     let t = std::thread::spawn(move || transport_driver(driver));
 
-    // Viewer decode→render thread.
+    // Viewer decode→render thread. It holds a ctl sender so it can ask the host
+    // for a fresh keyframe when frames arrive but none decode (lost keyframe).
     let stop_r = stop.clone();
+    let ctl_for_kf = ctl_tx.clone();
     let r = std::thread::spawn(move || {
-        if let Err(e) = viewer_media_loop(video_rx, stop_r) {
+        if let Err(e) = viewer_media_loop(video_rx, ctl_for_kf, stop_r) {
             tracing::warn!("viewer media loop ended: {e}");
         }
     });
@@ -703,6 +731,8 @@ fn transport_driver(d: Driver) {
         video_tx,
         inject,
         cursor_rx,
+        channels,
+        force_key,
         socket,
         stop,
     } = d;
@@ -720,10 +750,21 @@ fn transport_driver(d: Driver) {
     // The socket was bound and its host candidates registered before the SDP was
     // generated (see `bind_and_gather`), so the peer already has our candidates.
     let mut tp = Transport::new(rtc);
-    // Host creates the three channels here (direct write side).
-    if frame_rx.is_some() {
-        tp.create_channels();
+    // Host: adopt the channel ids created (exactly once) in `begin_host`.
+    if let Some(ch) = channels {
+        tp.set_channels(ch);
     }
+
+    // Nothing written before a channel opens survives — str0m silently drops it.
+    // So: video frames are DISCARDED until the video channel opens (they'd be
+    // stale anyway; a keyframe is forced at open so the viewer can start), and
+    // ctl messages are BUFFERED until the ctl channel opens (they're control
+    // state like the initial Perm — losing them desyncs the session).
+    let host_side = frame_rx.is_some();
+    let mut video_open = false;
+    let mut ctl_open = false;
+    let mut cursor_open = false;
+    let mut ctl_backlog: Vec<Vec<u8>> = Vec::new();
 
     let mut buf = [0u8; 2048];
     let mut video_count: u64 = 0;
@@ -760,17 +801,28 @@ fn transport_driver(d: Driver) {
 
         // 2) Outbound control + encoded video from the media threads.
         while let Ok(bytes) = ctl_rx.try_recv() {
-            let _ = tp.send_ctl(&bytes);
+            if ctl_open {
+                let _ = tp.send_ctl(&bytes);
+            } else {
+                ctl_backlog.push(bytes);
+            }
         }
         if let Some(frame_rx) = &frame_rx {
             while let Ok((au, keyframe)) = frame_rx.try_recv() {
-                let _ = tp.send_video(&au, keyframe);
+                if video_open {
+                    let _ = tp.send_video(&au, keyframe);
+                }
+                // else: dropped — a pre-open frame can never reach the peer, and
+                // a keyframe is forced the moment the channel opens.
             }
         }
-        // Host: cursor position updates on the cursor channel (§5a/§7).
+        // Host: cursor position updates on the cursor channel (§5a/§7). Stale
+        // pre-open positions are worthless — drop, don't buffer.
         if let Some(cursor_rx) = &cursor_rx {
             while let Ok(bytes) = cursor_rx.try_recv() {
-                let _ = tp.send_cursor(&bytes);
+                if cursor_open {
+                    let _ = tp.send_cursor(&bytes);
+                }
             }
         }
 
@@ -815,6 +867,25 @@ fn transport_driver(d: Driver) {
                         }
                         Inbound::ChannelOpen(_, label) => {
                             tracing::info!("data channel open: {label}");
+                            match label.as_str() {
+                                "video" => {
+                                    video_open = true;
+                                    // Everything encoded before this instant was
+                                    // dropped, so the viewer's decoder has no
+                                    // reference — restart it with a fresh IDR.
+                                    if let Some(fk) = &force_key {
+                                        fk.store(true, Ordering::SeqCst);
+                                    }
+                                }
+                                "ctl" => {
+                                    ctl_open = true;
+                                    for bytes in ctl_backlog.drain(..) {
+                                        let _ = tp.send_ctl(&bytes);
+                                    }
+                                }
+                                "cursor" => cursor_open = true,
+                                _ => {} // "init" — SDP bootstrap channel, unused
+                            }
                         }
                         Inbound::Video(frame) => {
                             video_count += 1;
@@ -829,6 +900,21 @@ fn transport_driver(d: Driver) {
                             }
                         }
                         Inbound::Ctl(bytes) => {
+                            // Host: a viewer keyframe request restarts the stream
+                            // (decoder never started / lost the keyframe). NOT
+                            // gated on control — view-only viewers need it too.
+                            if host_side
+                                && matches!(
+                                    serde_json::from_slice::<protocol::ControlMsg>(&bytes),
+                                    Ok(protocol::ControlMsg::KeyframeRequest)
+                                )
+                            {
+                                tracing::info!("viewer requested keyframe");
+                                if let Some(fk) = &force_key {
+                                    fk.store(true, Ordering::SeqCst);
+                                }
+                                continue;
+                            }
                             // Host: inbound ctl is remote input — inject it,
                             // gated on the current control permission (§4.1).
                             if let (Some(inj), Some(gate)) = (injector.as_mut(), inject.as_ref()) {
@@ -884,6 +970,7 @@ fn host_media_loop(
     frame_tx: Sender<(Vec<u8>, bool)>,
     cursor_tx: Sender<Vec<u8>>,
     bitrate: Arc<std::sync::atomic::AtomicU32>,
+    force_key: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use codec::{Encoder, EncoderConfig};
@@ -935,12 +1022,19 @@ fn host_media_loop(
 
                 // §5a adaptive frame rate: a pointer-only update or a frame with
                 // no changed region costs ~0 — send nothing, don't wake the
-                // encoder into an idle stream.
+                // encoder into an idle stream. EXCEPT when a keyframe is owed
+                // (channel just opened / viewer requested): the viewer is blind
+                // until an IDR arrives, so encode this frame even if unchanged.
+                let want_key = force_key.load(Ordering::SeqCst);
                 let has_change = !frame.pointer_only
                     && (!frame.dirty_rects.is_empty() || !frame.move_rects.is_empty());
-                if !has_change {
+                if !has_change && !want_key {
                     dup.release();
                     continue;
+                }
+                if want_key {
+                    encoder.force_keyframe();
+                    force_key.store(false, Ordering::SeqCst);
                 }
                 // BGRA→NV12 + encode happen inside the encoder path (§5b).
                 match encoder.encode(&frame.texture) {
@@ -979,6 +1073,7 @@ fn host_media_loop(
 
 fn viewer_media_loop(
     video_rx: Receiver<Vec<u8>>,
+    ctl_tx: Sender<Vec<u8>>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use codec::Decoder;
@@ -1004,12 +1099,18 @@ fn viewer_media_loop(
 
     let mut ts = 0i64;
     let mut rendered: u64 = 0;
+    // Keyframe watchdog: if AUs arrive but the decoder produces nothing, the
+    // keyframe was lost (unreliable channel) — ask the host for a fresh one,
+    // rate-limited to ~1/s so a slow link isn't flooded.
+    let mut undecoded_streak: u32 = 0;
+    let mut last_kf_req = std::time::Instant::now();
     while !stop.load(Ordering::SeqCst) {
         match video_rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(au) => {
                 ts += 1;
                 match decoder.decode(&au, ts) {
                     Ok(Some(frame)) => {
+                        undecoded_streak = 0;
                         rendered += 1;
                         if rendered == 1 || rendered % 120 == 0 {
                             tracing::info!("viewer: rendered frame #{rendered}");
@@ -1021,7 +1122,17 @@ fn viewer_media_loop(
                         };
                         let _ = renderer.render_frame(&frame.texture, frame.array_index, cursor);
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        undecoded_streak += 1;
+                        if undecoded_streak >= 5
+                            && last_kf_req.elapsed() >= std::time::Duration::from_secs(1)
+                        {
+                            tracing::info!("viewer: no decodable frames — requesting keyframe");
+                            let _ = ctl_tx
+                                .send(serialize(&protocol::ControlMsg::KeyframeRequest));
+                            last_kf_req = std::time::Instant::now();
+                        }
+                    }
                     Err(e) => tracing::warn!("decode error: {e}"),
                 }
             }

@@ -1,28 +1,23 @@
-name: Dev Build
+name: Build Test EXE
 
-# Fast, throwaway test builds of the app exe — NOT the full installer release.
+# Manual, fast test build of the app exe — press the button, wait ~1-2 min,
+# download from the Releases page. NOT the full installer release.
 #
-# Every push to main that touches native/ (and manual "Run workflow") does just
-# `cargo build -p app --release` (~1 min with cache), then publishes the single
-# standalone sharectrl.exe to a rolling pre-release tagged "dev". The download URL
-# is stable, so "grab the latest test build" is always:
-#
-#   https://github.com/<owner>/<repo>/releases/download/dev/sharectrl.exe
+# Actions -> "Build Test EXE" -> Run workflow. It does just
+# `cargo build -p app --release` (~1 min with cache) and publishes the single
+# standalone sharectrl.exe as a pre-release named "Test build <sha>". It shows up
+# at the top of the Releases page like any release — download it there on the
+# other machine, no special link to remember.
 #
 # This skips everything the real Release does (NSIS installer, SYSTEM service,
 # cargo-deny gate, tauri-cli). Use the Release workflow for a distributable,
 # versioned build; use this to test a change across the two machines quickly.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "native/**"
-      - ".github/workflows/dev-build.yml"
   workflow_dispatch:
 
-# A newer push supersedes an in-flight dev build — no point finishing a stale one.
+# A second run supersedes an in-flight one.
 concurrency:
-  group: dev-build
+  group: build-test-exe
   cancel-in-progress: true
 
 permissions:
@@ -52,10 +47,10 @@ jobs:
         shell: bash
         run: echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
-      # Refresh the rolling "dev" pre-release: move its tag to this commit and
-      # replace the attached exe. Deleting + recreating keeps the tag, release
-      # body and asset all pointing at the newest build.
-      - name: Publish to rolling dev pre-release
+      # Refresh the rolling "test" pre-release: move its tag to this commit and
+      # replace the attached exe, so the Releases page always shows exactly one
+      # current test build at the top.
+      - name: Publish test build to Releases
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -65,21 +60,22 @@ jobs:
             echo "::error::$exe not found — build produced no app binary."
             exit 1
           fi
+          # Remove the old auto-build "dev" release (superseded by this manual flow).
           gh release delete dev --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
-          gh release create dev "$exe" \
+          gh release delete test-build --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create test-build "$exe" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --prerelease \
-            --title "Dev build ${{ steps.sha.outputs.short }}" \
-            --notes "Fast test build of \`sharectrl.exe\` from commit ${{ steps.sha.outputs.short }} on main. App only — no installer, no SYSTEM service. Unsigned: SmartScreen warns (More info -> Run anyway). Copy to both test machines and overwrite the old exe."
+            --title "Test build ${{ steps.sha.outputs.short }}" \
+            --notes "Fast test build of \`sharectrl.exe\` from commit ${{ steps.sha.outputs.short }}. App only — no installer, no SYSTEM service. Unsigned: SmartScreen warns (More info -> Run anyway). Download here and overwrite the old exe on both machines."
 
-      # Also expose it as a workflow artifact (survives even if the release step
-      # is ever restricted).
+      # Also expose it as a workflow artifact (belt and braces).
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: sharectrl-dev-${{ steps.sha.outputs.short }}
+          name: sharectrl-${{ steps.sha.outputs.short }}
           path: native/target/release/sharectrl.exe
           if-no-files-found: warn
           retention-days: 14

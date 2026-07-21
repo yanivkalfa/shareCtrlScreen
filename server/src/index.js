@@ -104,10 +104,22 @@ export class SignalingRoom extends DurableObject {
       ws.close(4000, "invalid-uuid");
       return;
     }
-    if (findSocket(this.ctx, msg.uuid)) {
-      send(ws, { type: "register-error", reason: "duplicate" });
-      ws.close(4001, "duplicate");
-      return;
+    // Take-over, not lock-out. The same UUID re-registering is almost always the
+    // same user reconnecting — most importantly after a network change or a
+    // sleep/wake that left the previous TCP connection half-open. Cloudflare keeps
+    // that ghost socket marked OPEN for minutes, so rejecting the newcomer as
+    // "duplicate" would strand the real client (retrying every 30 s) and make its
+    // ID unreachable. Displace the stale socket and let the newcomer own the UUID.
+    // Security rests on the per-session approval/password handshake, never on
+    // registration exclusivity, so this cannot be used to hijack a live session.
+    const existing = findSocket(this.ctx, msg.uuid);
+    if (existing) {
+      send(existing, { type: "register-error", reason: "displaced" });
+      try {
+        existing.close(4001, "displaced");
+      } catch {
+        // Already gone — nothing to close.
+      }
     }
 
     ws.serializeAttachment({ uuid: msg.uuid });

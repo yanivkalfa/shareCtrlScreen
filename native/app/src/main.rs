@@ -89,6 +89,18 @@ fn clear_recents(state: tauri::State<'_, AppState>) -> Vec<String> {
     state.engine.clear_recents()
 }
 
+/// Current signaling status, queried by the UI on boot. The one-shot
+/// `server-status` event can fire before the WebView subscribes, so the boot
+/// path pulls the live value instead of relying solely on that event.
+#[tauri::command]
+fn get_server_status(state: tauri::State<'_, AppState>) -> String {
+    if state.engine.server_connected() {
+        "connected".into()
+    } else {
+        "disconnected".into()
+    }
+}
+
 #[tauri::command]
 fn get_role(state: tauri::State<'_, AppState>) -> String {
     match state.engine.role() {
@@ -240,6 +252,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_config,
             clear_recents,
+            get_server_status,
             get_role,
             connect_to,
             submit_password,

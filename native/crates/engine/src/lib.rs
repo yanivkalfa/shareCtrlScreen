@@ -13,6 +13,7 @@ pub mod handshake;
 pub mod pipeline;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 use protocol::{Config, ControlMsg, Mode, Permission, SignalData, SignalMsg};
@@ -63,6 +64,10 @@ pub struct Engine {
     config: Arc<Mutex<Config>>,
     signaling: SignalingClient,
     role: Arc<Mutex<Role>>,
+    /// Whether the signaling socket is currently registered with the server. The
+    /// UI queries this on boot because the one-shot `ServerStatus` event can fire
+    /// before the WebView subscribes (startup race — the dot would stay stuck).
+    connected: Arc<AtomicBool>,
     decider: Arc<dyn Decider>,
     ui: tokio::sync::mpsc::UnboundedSender<UiEvent>,
     /// Pending host password nonces per requesting peer (approve/challenge).
@@ -92,6 +97,7 @@ impl Engine {
             config: Arc::new(Mutex::new(config)),
             signaling,
             role: Arc::new(Mutex::new(Role::Idle)),
+            connected: Arc::new(AtomicBool::new(false)),
             decider,
             ui: ui_tx,
             pending_nonce: Arc::new(Mutex::new(Default::default())),
@@ -108,6 +114,12 @@ impl Engine {
         self.role.lock().clone()
     }
 
+    /// Whether signaling is currently registered with the server. Queried by the
+    /// UI on boot to back-fill the status dot past the startup event race.
+    pub fn server_connected(&self) -> bool {
+        self.connected.load(Ordering::Relaxed)
+    }
+
     /// Persist a config mutation (settings changes from the UI).
     pub fn update_config(&self, f: impl FnOnce(&mut Config)) {
         let mut cfg = self.config.lock();
@@ -120,6 +132,7 @@ impl Engine {
         match event {
             SigEvent::Registered => {
                 tracing::info!("signaling: registered with server");
+                self.connected.store(true, Ordering::Relaxed);
                 let _ = self.ui.send(UiEvent::ServerStatus("connected"));
             }
             SigEvent::RegisterError(reason) => {
@@ -128,6 +141,7 @@ impl Engine {
                     .send(UiEvent::Toast(format!("server rejected: {reason}")));
             }
             SigEvent::Disconnected => {
+                self.connected.store(false, Ordering::Relaxed);
                 let _ = self.ui.send(UiEvent::ServerStatus("reconnecting"));
             }
             SigEvent::Message(msg) => self.route(msg).await,

@@ -347,4 +347,18 @@ listen('toast', (e) => toast(e.payload.message || '', 'error'));
 (async () => {
   await reloadConfig();
   render();
+  // Back-fill the server status: the engine registers ~0.5 s after launch and
+  // emits a one-shot 'server-status' event that can fire before this WebView
+  // subscribed above. Without this pull the dot would stay stuck on OFFLINE and
+  // the Connect button (gated on state === 'READY') would never enable.
+  try {
+    const s = await invoke('get_server_status');
+    if (s === 'connected') {
+      setStatus('green', 'server: connected');
+      setBanner('');
+      if (state === 'OFFLINE') setState('READY');
+    }
+  } catch (_) {
+    /* command unavailable (older engine) — the event path still covers it */
+  }
 })();

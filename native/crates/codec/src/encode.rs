@@ -94,13 +94,18 @@ impl Encoder {
         let (input_id, output_id) = stream_ids(&transform);
 
         // §5b: set OUTPUT type first (encoders want the compressed type set
-        // before the raw input type), then the NV12 input type.
+        // before the raw input type), then the NV12 input type. Traced per step
+        // so a codec-specific rejection is pinpointed in the log rather than
+        // surfacing as an opaque HRESULT from `Encoder::new`.
+        tracing::debug!("encoder: setting output type ({:?})", cfg.codec);
         set_output_type(&transform, output_id, &cfg, subtype)?;
+        tracing::debug!("encoder: setting NV12 input type");
         set_input_type(&transform, input_id, &cfg)?;
 
         let codec_api: Option<ICodecAPI> = transform.cast().ok();
         if let Some(api) = &codec_api {
-            apply_low_latency_recipe(api, &cfg)?;
+            tracing::debug!("encoder: applying low-latency recipe");
+            apply_low_latency_recipe(api, &cfg);
         } else {
             tracing::warn!(
                 "encoder exposes no ICodecAPI; low-latency recipe reduced to attributes"
@@ -389,6 +394,13 @@ fn set_output_type(
         mt.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
         set_frame_size(&mt, cfg.width, cfg.height)?;
         set_frame_rate(&mt, cfg.fps_num, cfg.fps_den)?;
+        // Some H.264 HW MFTs require an explicit profile in the output type or
+        // fail SetOutputType with E_UNEXPECTED. Main profile is universally
+        // decodable (including the software fallback decoder). Best-effort: if the
+        // MFT infers its own profile, ignore the rejection.
+        if subtype == MFVideoFormat_H264 {
+            let _ = mt.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main.0 as u32);
+        }
         transform.SetOutputType(output_id, &mt, 0)?;
     }
     Ok(())
@@ -414,24 +426,52 @@ fn set_input_type(
     Ok(())
 }
 
-/// The exact §5b low-latency recipe via `ICodecAPI::SetValue` — mirror Sunshine.
-fn apply_low_latency_recipe(api: &ICodecAPI, cfg: &EncoderConfig) -> Result<(), Error> {
-    // SAFETY: valid ICodecAPI; each VARIANT is owned for its call.
-    unsafe {
-        // Single-picture slice, no multi-frame lookahead.
-        api.SetValue(&CODECAPI_AVLowLatencyMode, &boolv(true))?;
-        // CBR rate control fed by BWE.
-        api.SetValue(
-            &CODECAPI_AVEncCommonRateControlMode,
-            &u32v(eAVEncCommonRateControlMode_CBR.0 as u32),
-        )?;
-        api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &u32v(cfg.bitrate_bps))?;
-        // Zero B-frames — mandatory (reorder delay would blow the budget).
-        api.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &u32v(0))?;
-        // Effectively-infinite GOP: no periodic IDR (LTR recovery instead).
-        api.SetValue(&CODECAPI_AVEncMPVGOPSize, &u32v(u32::MAX))?;
+/// The §5b low-latency recipe via `ICodecAPI::SetValue` — mirror Sunshine.
+///
+/// **Best-effort per property.** Different HW MFTs validate these knobs
+/// differently: some H.264 encoders reject e.g. an effectively-infinite GOP or a
+/// specific rate-control value with `E_UNEXPECTED`. A single rejected knob must
+/// not abort encoder creation (that black-screens the whole session) — log it and
+/// keep the encoder's default for that property.
+fn apply_low_latency_recipe(api: &ICodecAPI, cfg: &EncoderConfig) {
+    // Single-picture slice, no multi-frame lookahead.
+    set_codec_value(api, &CODECAPI_AVLowLatencyMode, &boolv(true), "AVLowLatencyMode");
+    // CBR rate control fed by BWE.
+    set_codec_value(
+        api,
+        &CODECAPI_AVEncCommonRateControlMode,
+        &u32v(eAVEncCommonRateControlMode_CBR.0 as u32),
+        "RateControlMode=CBR",
+    );
+    set_codec_value(
+        api,
+        &CODECAPI_AVEncCommonMeanBitRate,
+        &u32v(cfg.bitrate_bps),
+        "MeanBitRate",
+    );
+    // Zero B-frames — mandatory (reorder delay would blow the budget).
+    set_codec_value(
+        api,
+        &CODECAPI_AVEncMPVDefaultBPictureCount,
+        &u32v(0),
+        "BPictureCount=0",
+    );
+    // Long GOP: no frequent periodic IDR (LTR recovery instead). Some H.264 MFTs
+    // reject u32::MAX, so use a large finite value they accept.
+    set_codec_value(api, &CODECAPI_AVEncMPVGOPSize, &u32v(600), "GOPSize");
+}
+
+/// Set one `ICodecAPI` value, logging (not failing) if the MFT rejects it.
+fn set_codec_value(
+    api: &ICodecAPI,
+    name: *const windows::core::GUID,
+    var: &windows::Win32::System::Variant::VARIANT,
+    label: &str,
+) {
+    // SAFETY: valid ICodecAPI; `var` is a well-formed VARIANT owned by the caller.
+    if let Err(e) = unsafe { api.SetValue(name, var) } {
+        tracing::warn!("encoder: ICodecAPI {label} rejected ({e}) — keeping default");
     }
-    Ok(())
 }
 
 // --- small MF helpers ---------------------------------------------------------

@@ -367,55 +367,50 @@ pub fn can_decode(codec: Codec) -> bool {
         guidMajorType: MFMediaType_Video,
         guidSubtype: input_subtype(codec),
     };
-    // Count hardware MFTs first, then software (the Microsoft H.264 decoder is a
-    // sync software MFT). Either kind means we can decode this codec.
-    for flags in [
-        MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
-        MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
-    ] {
-        let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
-        let mut count: u32 = 0;
-        // SAFETY: out-array/count pair per MFTEnumEx; we free the array below.
-        unsafe {
-            if MFTEnumEx(
-                MFT_CATEGORY_VIDEO_DECODER,
-                flags,
-                Some(&input_info),
-                None,
-                &mut activates,
-                &mut count,
-            )
-            .is_ok()
-            {
-                if !activates.is_null() {
-                    let slice = std::slice::from_raw_parts_mut(activates, count as usize);
-                    for a in slice.iter_mut() {
-                        let _ = a.take();
-                    }
-                    windows::Win32::System::Com::CoTaskMemFree(Some(activates as *const _));
-                }
-                if count > 0 {
-                    return true;
-                }
+    let flags = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER;
+    let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
+    let mut count: u32 = 0;
+    // SAFETY: out-array/count pair per MFTEnumEx; we free the array below.
+    unsafe {
+        if MFTEnumEx(
+            MFT_CATEGORY_VIDEO_DECODER,
+            flags,
+            Some(&input_info),
+            None,
+            &mut activates,
+            &mut count,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        if !activates.is_null() {
+            let slice = std::slice::from_raw_parts_mut(activates, count as usize);
+            for a in slice.iter_mut() {
+                let _ = a.take();
             }
+            windows::Win32::System::Com::CoTaskMemFree(Some(activates as *const _));
         }
     }
-    false
+    count > 0
 }
 
-/// The codecs this viewer can hardware-decode, in the plan's preference order
-/// (§3). H.264 is always included as the guaranteed baseline so negotiation
-/// against any host still resolves (the host defaults to H.264 regardless).
+/// The codecs this viewer advertises for negotiation (§3), preference order.
+///
+/// AV1/HEVC are advertised **only when hardware-accelerated** — software AV1/HEVC
+/// decode is far too heavy for real-time at 1080p. H.264 is always advertised: it
+/// decodes in hardware where available, and where not, its software fallback (the
+/// Microsoft H.264 decoder MFT) is light enough to keep up. So a viewer with no
+/// hardware decoder at all still gets a smooth H.264 stream rather than a stuttery
+/// software AV1 one.
 pub fn viewer_decodable() -> Vec<Codec> {
     let mut v = Vec::new();
-    for c in [Codec::Av1, Codec::Hevc, Codec::H264] {
+    for c in [Codec::Av1, Codec::Hevc] {
         if can_decode(c) {
             v.push(c);
         }
     }
-    if !v.contains(&Codec::H264) {
-        v.push(Codec::H264);
-    }
+    v.push(Codec::H264);
     v
 }
 

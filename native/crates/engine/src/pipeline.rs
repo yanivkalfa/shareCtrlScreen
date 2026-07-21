@@ -115,10 +115,24 @@ fn local_host_candidates(port: u16) -> Vec<std::net::SocketAddr> {
 /// Symmetric/strict NATs still need TURN (not yet wired). `stun_urls` come from
 /// the config's `iceServers`.
 fn bind_and_gather(rtc: &mut str0m::Rtc, stun_urls: &[String]) -> Option<std::net::UdpSocket> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    let port = socket.local_addr().ok()?.port();
+    // Bind to the *primary local IP*, not 0.0.0.0. str0m correlates a received
+    // packet to a local ICE candidate by the destination address we report on
+    // `Input::Receive` — which is `socket.local_addr()`. A wildcard bind makes
+    // that `0.0.0.0:port`, matching none of our real-IP host candidates, so
+    // connectivity checks never validate and ICE hangs at "Checking" (even on the
+    // same LAN). Binding to the real IP makes `local_addr()` a routable address.
+    let socket = bind_primary_socket()?;
+    let bound = socket.local_addr().ok()?;
+    let port = bound.port();
+    tracing::info!("bound UDP socket at {bound} (local ICE base)");
 
-    let host = local_host_candidates(port);
+    // Host candidate = the actual bound address (real IP). Fall back to
+    // enumerating interfaces only if we somehow ended up on the wildcard.
+    let host: Vec<std::net::SocketAddr> = if bound.ip().is_unspecified() {
+        local_host_candidates(port)
+    } else {
+        vec![bound]
+    };
     for addr in &host {
         if let Ok(cand) = str0m::Candidate::host(*addr, "udp") {
             rtc.add_local_candidate(cand);
@@ -130,7 +144,7 @@ fn bind_and_gather(rtc: &mut str0m::Rtc, stun_urls: &[String]) -> Option<std::ne
     // transport loop.
     if let Some(srflx) = gather_srflx(&socket, stun_urls, &host) {
         tracing::info!("STUN srflx candidate: {srflx}");
-        // Base = a local IPv4 host candidate matching the srflx family.
+        // Base = a local host candidate matching the srflx family.
         if let Some(base) = host.iter().find(|a| a.is_ipv4() == srflx.is_ipv4()) {
             match str0m::Candidate::server_reflexive(srflx, *base, "udp") {
                 Ok(cand) => {
@@ -145,6 +159,33 @@ fn bind_and_gather(rtc: &mut str0m::Rtc, stun_urls: &[String]) -> Option<std::ne
 
     let _ = socket.set_nonblocking(true);
     Some(socket)
+}
+
+/// Bind a UDP socket to the primary local IP (the source address the OS would use
+/// to reach the internet), so `local_addr()` is a routable IP that matches our
+/// advertised host candidate. Falls back to a wildcard bind if that can't be
+/// determined (rare; multi-homed correlation may then suffer).
+fn bind_primary_socket() -> Option<std::net::UdpSocket> {
+    if let Some(ip) = primary_local_ip() {
+        if let Ok(s) = std::net::UdpSocket::bind(std::net::SocketAddr::new(ip, 0)) {
+            return Some(s);
+        }
+    }
+    std::net::UdpSocket::bind("0.0.0.0:0").ok()
+}
+
+/// The primary outbound local IPv4: connect a throwaway UDP socket to a public
+/// address (this sends **no** packets — it only makes the OS pick the source IP
+/// of the default route) and read back its local address.
+fn primary_local_ip() -> Option<std::net::IpAddr> {
+    let probe = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    probe.connect("8.8.8.8:80").ok()?;
+    let ip = probe.local_addr().ok()?.ip();
+    if ip.is_unspecified() {
+        None
+    } else {
+        Some(ip)
+    }
 }
 
 /// Query the configured STUN servers for this socket's public `ip:port`.

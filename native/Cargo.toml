@@ -70,3 +70,14 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+
+# Fast-compiling profile for throwaway CI test exes (the "Build Test EXE"
+# workflow). Trades the release profile's slow compile knobs (LTO + single
+# codegen unit) for far shorter build times, while keeping enough optimization
+# (opt-level 1) that the media pipeline runs in real time for testing. NOT for
+# distribution — the versioned Release still uses [profile.release].
+[profile.test-build]
+inherits = "release"
+opt-level = 1
+lto = false
+codegen-units = 256

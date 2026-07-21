@@ -38,9 +38,10 @@ jobs:
         with:
           workspaces: native
 
-      # Just the app binary — the Tauri build embeds the UI; no bundling needed.
-      - name: Build app (release)
-        run: cargo build -p app --release
+      # Just the app binary, with the fast-compiling test-build profile (no LTO,
+      # parallel codegen). The Tauri build embeds the UI; no bundling needed.
+      - name: Build app (test-build profile)
+        run: cargo build -p app --profile test-build
 
       - name: Short SHA
         id: sha
@@ -55,7 +56,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          exe=target/release/sharectrl.exe
+          exe=target/test-build/sharectrl.exe
           if [ ! -f "$exe" ]; then
             echo "::error::$exe not found — build produced no app binary."
             exit 1
@@ -76,6 +77,6 @@ jobs:
         if: always()
         with:
           name: sharectrl-${{ steps.sha.outputs.short }}
-          path: native/target/release/sharectrl.exe
+          path: native/target/test-build/sharectrl.exe
           if-no-files-found: warn
           retention-days: 14

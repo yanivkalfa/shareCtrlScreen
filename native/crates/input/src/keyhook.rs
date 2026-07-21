@@ -156,3 +156,24 @@ pub fn uninstall() {
 pub fn is_installed() -> bool {
     STATE.lock().map(|s| s.hook != 0).unwrap_or(false)
 }
+
+/// Run a message pump on the current thread until `stop` is set. A low-level
+/// keyboard hook only delivers events to a thread that pumps messages, so the
+/// thread that called [`install`] must call this. Returns when `stop` is true.
+pub fn message_pump(stop: &std::sync::atomic::AtomicBool) {
+    use std::sync::atomic::Ordering;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+    };
+    let mut msg = MSG::default();
+    while !stop.load(Ordering::SeqCst) {
+        // SAFETY: standard non-blocking message drain.
+        unsafe {
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}

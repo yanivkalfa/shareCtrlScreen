@@ -137,9 +137,144 @@ pub fn lookup(code: &str) -> Option<ScanCode> {
     }
 }
 
+/// Reverse map: Set-1 scan code → DOM `KeyboardEvent.code`. Used by the viewer's
+/// input capture (Plan 04 §7) to turn a captured Win32 scancode back into the
+/// layout-independent code the host re-injects. The inverse of [`lookup`].
+pub fn code_for(sc: u16, ext: bool) -> Option<&'static str> {
+    // Delegate to a small table built from the same data as `lookup`, keeping a
+    // single source of truth: try every code and match the scan code.
+    for &code in ALL_CODES {
+        if let Some(hit) = lookup(code) {
+            if hit.sc == sc && hit.ext == ext {
+                return Some(code);
+            }
+        }
+    }
+    None
+}
+
+/// Every DOM code we support, for the reverse lookup.
+const ALL_CODES: &[&str] = &[
+    "Escape",
+    "Digit1",
+    "Digit2",
+    "Digit3",
+    "Digit4",
+    "Digit5",
+    "Digit6",
+    "Digit7",
+    "Digit8",
+    "Digit9",
+    "Digit0",
+    "Minus",
+    "Equal",
+    "Backspace",
+    "Tab",
+    "KeyQ",
+    "KeyW",
+    "KeyE",
+    "KeyR",
+    "KeyT",
+    "KeyY",
+    "KeyU",
+    "KeyI",
+    "KeyO",
+    "KeyP",
+    "BracketLeft",
+    "BracketRight",
+    "Enter",
+    "ControlLeft",
+    "KeyA",
+    "KeyS",
+    "KeyD",
+    "KeyF",
+    "KeyG",
+    "KeyH",
+    "KeyJ",
+    "KeyK",
+    "KeyL",
+    "Semicolon",
+    "Quote",
+    "Backquote",
+    "ShiftLeft",
+    "Backslash",
+    "KeyZ",
+    "KeyX",
+    "KeyC",
+    "KeyV",
+    "KeyB",
+    "KeyN",
+    "KeyM",
+    "Comma",
+    "Period",
+    "Slash",
+    "ShiftRight",
+    "NumpadMultiply",
+    "AltLeft",
+    "Space",
+    "CapsLock",
+    "F1",
+    "F2",
+    "F3",
+    "F4",
+    "F5",
+    "F6",
+    "F7",
+    "F8",
+    "F9",
+    "F10",
+    "NumLock",
+    "ScrollLock",
+    "Numpad7",
+    "Numpad8",
+    "Numpad9",
+    "NumpadSubtract",
+    "Numpad4",
+    "Numpad5",
+    "Numpad6",
+    "NumpadAdd",
+    "Numpad1",
+    "Numpad2",
+    "Numpad3",
+    "Numpad0",
+    "NumpadDecimal",
+    "IntlBackslash",
+    "F11",
+    "F12",
+    "NumpadEnter",
+    "ControlRight",
+    "NumpadDivide",
+    "AltRight",
+    "Home",
+    "ArrowUp",
+    "PageUp",
+    "ArrowLeft",
+    "ArrowRight",
+    "End",
+    "ArrowDown",
+    "PageDown",
+    "Insert",
+    "Delete",
+    "MetaLeft",
+    "MetaRight",
+    "ContextMenu",
+    "PrintScreen",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reverse_lookup_roundtrips() {
+        for code in ["KeyA", "Enter", "ArrowUp", "ControlRight", "F5", "Space"] {
+            let sc = lookup(code).unwrap();
+            assert_eq!(code_for(sc.sc, sc.ext), Some(code));
+        }
+        // Non-extended 0x1c is Enter; extended 0x1c is NumpadEnter.
+        assert_eq!(code_for(0x1c, false), Some("Enter"));
+        assert_eq!(code_for(0x1c, true), Some("NumpadEnter"));
+    }
 
     #[test]
     fn known_non_extended() {

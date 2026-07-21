@@ -268,11 +268,12 @@ fn main() {
                 }
             });
 
-            // Hand the native video child-HWND to the pipeline (Option A, §7).
+            // Create the native D3D11 video child window under the Tauri window
+            // (Option A, §7). Must run on the UI thread — it is, inside setup.
             #[cfg(windows)]
             if let Some(win) = app.get_webview_window("main") {
                 if let Ok(hwnd) = win.hwnd() {
-                    engine::pipeline::set_render_target(hwnd.0 as isize);
+                    engine::pipeline::create_video_window(hwnd.0 as isize);
                 }
             }
             Ok(())

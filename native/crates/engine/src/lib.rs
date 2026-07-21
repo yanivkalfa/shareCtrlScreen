@@ -67,6 +67,8 @@ pub struct Engine {
     ui: tokio::sync::mpsc::UnboundedSender<UiEvent>,
     /// Pending host password nonces per requesting peer (approve/challenge).
     pending_nonce: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    /// Viewer decode capabilities per requesting peer, for codec negotiation (§3).
+    pending_caps: Arc<Mutex<std::collections::HashMap<String, Vec<String>>>>,
 }
 
 impl Engine {
@@ -93,6 +95,7 @@ impl Engine {
             decider,
             ui: ui_tx,
             pending_nonce: Arc::new(Mutex::new(Default::default())),
+            pending_caps: Arc::new(Mutex::new(Default::default())),
         });
         (engine, ui_rx, sig_rx)
     }
@@ -136,18 +139,21 @@ impl Engine {
             SignalMsg::ConnectRequest {
                 from: Some(from),
                 password,
+                caps,
                 ..
             } => {
-                self.on_connect_request(from, password).await;
+                let decode = caps.map(|c| c.decode).unwrap_or_default();
+                self.on_connect_request(from, password, decode).await;
             }
             SignalMsg::ConnectResponse {
                 from: Some(from),
                 accepted,
                 permission,
                 reason,
+                codec,
                 ..
             } => {
-                self.on_connect_response(from, accepted, permission, reason)
+                self.on_connect_response(from, accepted, permission, reason, codec)
                     .await;
             }
             SignalMsg::PasswordRequired {
@@ -180,7 +186,12 @@ impl Engine {
 
     // ---- Host side (contract §3.2 step 2) --------------------------------
 
-    async fn on_connect_request(&self, from: String, password: Option<String>) {
+    async fn on_connect_request(
+        &self,
+        from: String,
+        password: Option<String>,
+        decode_caps: Vec<String>,
+    ) {
         // Busy: one session at a time.
         if !matches!(*self.role.lock(), Role::Idle) {
             let _ = self.signaling.send(SignalMsg::ConnectResponse {
@@ -189,8 +200,16 @@ impl Engine {
                 accepted: false,
                 permission: None,
                 reason: Some("busy".into()),
+                codec: None,
             });
             return;
+        }
+
+        // Remember the viewer's decode caps for codec negotiation at accept time.
+        // Only the first attempt carries caps; a password retry sends none, so
+        // don't clobber the stored list with an empty one.
+        if !decode_caps.is_empty() {
+            self.pending_caps.lock().insert(from.clone(), decode_caps);
         }
 
         let cfg = self.config.lock().clone();
@@ -227,6 +246,7 @@ impl Engine {
                         accepted: false,
                         permission: None,
                         reason: Some("bad-password".into()),
+                        codec: None,
                     });
                 }
             }
@@ -245,6 +265,7 @@ impl Engine {
                     accepted: false,
                     permission: None,
                     reason: Some("denied".into()),
+                    codec: None,
                 });
             }
             ApprovalDecision::Allow(permission) => self.accept(from, permission).await,
@@ -254,12 +275,24 @@ impl Engine {
     /// Accept a viewer with `permission`, become Host, and begin negotiation as
     /// the offerer (the host owns the media, contract §3.2 step 4).
     async fn accept(&self, peer: String, permission: Permission) {
+        // Codec negotiation from the viewer's advertised caps (§3) — done before
+        // the response so the viewer is told which codec to decode with.
+        let decode = self.pending_caps.lock().remove(&peer).unwrap_or_default();
+        #[cfg(windows)]
+        let codec = pipeline::set_negotiated_codec_from_caps(&decode);
+        #[cfg(not(windows))]
+        let codec = {
+            let _ = &decode;
+            "H264".to_string()
+        };
+
         let _ = self.signaling.send(SignalMsg::ConnectResponse {
             to: Some(peer.clone()),
             from: None,
             accepted: true,
             permission: Some(permission.as_str().into()),
             reason: None,
+            codec: Some(codec),
         });
         *self.role.lock() = Role::Host {
             peer: peer.clone(),
@@ -268,7 +301,6 @@ impl Engine {
         let _ = self.ui.send(UiEvent::RoleChanged(self.role.lock().clone()));
         // Persist, not just mutate in memory, so recents survive a restart.
         self.update_config(|c| c.add_recent(&peer));
-        // Media/transport negotiation begins in `pipeline` (Windows).
         #[cfg(windows)]
         pipeline::begin_host(self, peer, permission);
     }
@@ -320,12 +352,18 @@ impl Engine {
         accepted: bool,
         permission: Option<String>,
         reason: Option<String>,
+        codec: Option<String>,
     ) {
         if !accepted {
             let r = reason.unwrap_or_else(|| "denied".into());
             let _ = self.ui.send(UiEvent::Toast(format!("connection {r}")));
             return;
         }
+        // The host told us which codec it will stream; decode with the same (§3).
+        #[cfg(windows)]
+        pipeline::set_codec_from_str(codec.as_deref().unwrap_or("H264"));
+        #[cfg(not(windows))]
+        let _ = &codec;
         let perm = permission
             .as_deref()
             .map(|p| match p {
@@ -362,7 +400,11 @@ impl Engine {
             *role = Role::Host { peer, permission };
             drop(role);
             #[cfg(windows)]
-            pipeline::send_ctl(self, &ControlMsg::Perm { value: permission });
+            {
+                // Update the host injection gate, then notify the viewer (§4.2).
+                pipeline::set_control(permission == Permission::Control);
+                pipeline::send_ctl(self, &ControlMsg::Perm { value: permission });
+            }
         }
     }
 

@@ -248,8 +248,10 @@ mod tests {
 
     #[test]
     fn password_mode_without_hash_is_fail_safe_approve() {
-        let mut cfg = Config::default();
-        cfg.mode = Mode::Password;
+        let mut cfg = Config {
+            mode: Mode::Password,
+            ..Default::default()
+        };
         assert_eq!(cfg.effective_mode(), Mode::Approve);
         cfg.set_password(Some("x"));
         assert_eq!(cfg.effective_mode(), Mode::Password);

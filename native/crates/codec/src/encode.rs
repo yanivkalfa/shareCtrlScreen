@@ -59,6 +59,8 @@ pub struct Encoder {
     cfg: EncoderConfig,
     _dxgi_mgr: IMFDXGIDeviceManager,
     frame_index: i64,
+    /// GPU BGRA→NV12 converter (§5b — DDA gives BGRA, the encoder wants NV12).
+    converter: crate::convert::Converter,
 }
 
 impl Encoder {
@@ -113,6 +115,7 @@ impl Encoder {
         }
 
         let events: IMFMediaEventGenerator = transform.cast()?;
+        let converter = crate::convert::Converter::new(device, cfg.width, cfg.height)?;
 
         Ok(Self {
             transform,
@@ -123,6 +126,7 @@ impl Encoder {
             cfg,
             _dxgi_mgr: dxgi_mgr,
             frame_index: 0,
+            converter,
         })
     }
 
@@ -146,16 +150,18 @@ impl Encoder {
         }
     }
 
-    /// Encode one captured texture. Wraps it as a GPU sample, drives the async
-    /// MFT event loop (`METransformNeedInput` → `ProcessInput`,
-    /// `METransformHaveOutput` → `ProcessOutput`), and returns any compressed
-    /// access units produced (§5b async event loop).
+    /// Encode one captured BGRA texture. Converts to NV12 on the GPU (§5b),
+    /// wraps the NV12 surface as a zero-copy sample, drives the async MFT event
+    /// loop (`METransformNeedInput` → `ProcessInput`, `METransformHaveOutput` →
+    /// `ProcessOutput`), and returns any compressed access units produced.
     pub fn encode(&mut self, texture: &ID3D11Texture2D) -> Result<Vec<EncodedFrame>, Error> {
         let duration = 10_000_000i64 * self.cfg.fps_den as i64 / self.cfg.fps_num.max(1) as i64;
         let sample_time = self.frame_index * duration;
         self.frame_index += 1;
 
-        let sample = wrap_texture_sample(texture, sample_time, duration)?;
+        // BGRA (DDA) → NV12 (encoder input) on the GPU.
+        let nv12 = self.converter.convert_to_nv12(texture)?;
+        let sample = wrap_texture_sample(nv12, sample_time, duration)?;
 
         let mut out = Vec::new();
         let mut fed = false;
@@ -239,6 +245,58 @@ impl Encoder {
             timestamp,
         }))
     }
+}
+
+/// Cheap probe: is there a hardware encoder for `codec` on this machine? Counts
+/// `MFTEnumEx` results without activating them (Plan 04 §3 negotiation).
+pub fn can_encode(codec: Codec) -> bool {
+    ensure_mf_startup();
+    let output_info = MFT_REGISTER_TYPE_INFO {
+        guidMajorType: MFMediaType_Video,
+        guidSubtype: output_subtype(codec),
+    };
+    let flags = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER;
+    let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
+    let mut count: u32 = 0;
+    // SAFETY: out-array/count pair per MFTEnumEx; we free the array below.
+    unsafe {
+        if MFTEnumEx(
+            MFT_CATEGORY_VIDEO_ENCODER,
+            flags,
+            None,
+            Some(&output_info),
+            &mut activates,
+            &mut count,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        if !activates.is_null() {
+            // Release each activate ref, then the array.
+            let slice = std::slice::from_raw_parts_mut(activates, count as usize);
+            for a in slice.iter_mut() {
+                let _ = a.take();
+            }
+            windows::Win32::System::Com::CoTaskMemFree(Some(activates as *const _));
+        }
+    }
+    count > 0
+}
+
+/// The codecs this host can hardware-encode, in the plan's preference order
+/// (§3). H.264 is the guaranteed baseline.
+pub fn host_encodable() -> Vec<Codec> {
+    let mut v = Vec::new();
+    for c in [Codec::Av1, Codec::Hevc, Codec::H264] {
+        if can_encode(c) {
+            v.push(c);
+        }
+    }
+    if v.is_empty() {
+        v.push(Codec::H264); // assume the universal baseline
+    }
+    v
 }
 
 /// The MF output subtype GUID for a codec (§5b).

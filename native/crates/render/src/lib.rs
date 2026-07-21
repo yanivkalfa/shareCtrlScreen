@@ -11,6 +11,9 @@
 
 #![cfg(windows)]
 
+pub mod window;
+pub use window::VideoWindow;
+
 use windows::core::{Interface, PCSTR};
 use windows::Win32::Foundation::{HANDLE, HWND};
 use windows::Win32::Graphics::Direct3D::Fxc::{D3DCompile, D3DCOMPILE_OPTIMIZATION_LEVEL3};
@@ -18,7 +21,7 @@ use windows::Win32::Graphics::Direct3D::{
     ID3DBlob, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_SRV_DIMENSION_TEXTURE2DARRAY,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader, ID3D11RenderTargetView,
+    ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader, ID3D11RenderTargetView,
     ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
     D3D11_COMPARISON_NEVER, D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_SAMPLER_DESC,
     D3D11_SHADER_RESOURCE_VIEW_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC_0, D3D11_TEX2D_ARRAY_SRV,
@@ -70,6 +73,35 @@ float4 ps_main(VSOut i) : SV_Target {
     float b = y + 1.8556 * uv.x;
     return float4(saturate(float3(r, g, b)), 1.0);
 }
+
+// Cursor sprite (§5a/§7): DDA delivers the desktop WITHOUT the mouse cursor, so
+// the viewer draws it client-side at the out-of-band PointerPosition — it feels
+// instant and never lags the stream. A simple arrow-ish quad; center + halfsize
+// come in NDC via a constant buffer.
+cbuffer Cursor : register(b0) { float2 center; float2 halfsize; float2 pad; }
+
+struct CurOut { float4 pos : SV_Position; float2 luv : TEXCOORD0; };
+
+CurOut cur_vs(uint id : SV_VertexID) {
+    float2 corner[6] = {
+        float2(0,0), float2(1,0), float2(0,1),
+        float2(0,1), float2(1,0), float2(1,1)
+    };
+    float2 c = corner[id];
+    CurOut o;
+    o.luv = c;
+    // Quad from center to center + 2*halfsize (top-left anchored, like a pointer).
+    float2 p = center + c * halfsize * 2.0;
+    o.pos = float4(p, 0, 1);
+    return o;
+}
+
+float4 cur_ps(CurOut i) : SV_Target {
+    // A white arrow with a dark edge: filled lower-left triangle of the quad.
+    if (i.luv.x + i.luv.y > 1.0) discard;
+    float edge = (i.luv.x < 0.12 || i.luv.y < 0.12 || (i.luv.x + i.luv.y) > 0.88) ? 0.0 : 1.0;
+    return float4(edge, edge, edge, 1.0);
+}
 "#;
 
 /// A flip-model swapchain bound to the shared D3D11 device, rendering NV12
@@ -83,6 +115,9 @@ pub struct Renderer {
     vs: ID3D11VertexShader,
     ps: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
+    cursor_vs: ID3D11VertexShader,
+    cursor_ps: ID3D11PixelShader,
+    cursor_cb: ID3D11Buffer,
     allow_tearing: bool,
     width: u32,
     height: u32,
@@ -134,6 +169,8 @@ impl Renderer {
 
         let rtv = Some(create_rtv(device, &swapchain)?);
         let (vs, ps) = compile_shaders(device)?;
+        let (cursor_vs, cursor_ps) = compile_cursor_shaders(device)?;
+        let cursor_cb = create_cursor_cb(device)?;
         let sampler = create_sampler(device)?;
 
         Ok(Self {
@@ -145,6 +182,9 @@ impl Renderer {
             vs,
             ps,
             sampler,
+            cursor_vs,
+            cursor_ps,
+            cursor_cb,
             allow_tearing,
             width,
             height,
@@ -152,8 +192,15 @@ impl Renderer {
     }
 
     /// Present one decoded NV12 frame. `array_index` selects the decoder texture-
-    /// array slice (§5c). Wait-first-then-render for minimum queued latency (§7).
-    pub fn render_frame(&mut self, nv12: &ID3D11Texture2D, array_index: u32) -> Result<(), Error> {
+    /// array slice (§5c). `cursor` is the out-of-band pointer position normalized
+    /// `[0,1]` (`None` ⇒ don't draw). Wait-first-then-render for minimum queued
+    /// latency (§7).
+    pub fn render_frame(
+        &mut self,
+        nv12: &ID3D11Texture2D,
+        array_index: u32,
+        cursor: Option<(f64, f64)>,
+    ) -> Result<(), Error> {
         // Block until the swapchain can accept a new frame (1-deep).
         // SAFETY: waitable handle from the swapchain.
         unsafe { WaitForSingleObjectEx(self.waitable, 1000, false) };
@@ -184,12 +231,50 @@ impl Renderer {
                 .IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             self.context.Draw(3, 0);
 
+            // Cursor sprite on top (§5a/§7).
+            if let Some((nx, ny)) = cursor {
+                self.draw_cursor(nx, ny)?;
+            }
+
             let present_flags = if self.allow_tearing {
                 DXGI_PRESENT_ALLOW_TEARING
             } else {
                 windows::Win32::Graphics::Dxgi::DXGI_PRESENT(0)
             };
             self.swapchain.Present(0, present_flags).ok()?;
+        }
+        Ok(())
+    }
+
+    /// Draw the client-side cursor sprite at normalized position (§5a/§7).
+    fn draw_cursor(&mut self, nx: f64, ny: f64) -> Result<(), Error> {
+        // Normalized [0,1] → NDC (top-left origin; y flips).
+        let cx = (nx as f32) * 2.0 - 1.0;
+        let cy = 1.0 - (ny as f32) * 2.0;
+        // Fixed pixel-ish size in NDC (~18×26 px on 1080p).
+        let hx = 18.0 / self.width as f32;
+        let hy = 26.0 / self.height as f32;
+        let cb = [cx, cy, hx, hy, 0.0, 0.0, 0.0, 0.0];
+
+        // SAFETY: dynamic constant buffer written via a discard map.
+        unsafe {
+            let mut mapped =
+                windows::Win32::Graphics::Direct3D11::D3D11_MAPPED_SUBRESOURCE::default();
+            self.context.Map(
+                &self.cursor_cb,
+                0,
+                windows::Win32::Graphics::Direct3D11::D3D11_MAP_WRITE_DISCARD,
+                0,
+                Some(&mut mapped),
+            )?;
+            std::ptr::copy_nonoverlapping(cb.as_ptr(), mapped.pData as *mut f32, cb.len());
+            self.context.Unmap(&self.cursor_cb, 0);
+
+            self.context.VSSetShader(&self.cursor_vs, None);
+            self.context.PSSetShader(&self.cursor_ps, None);
+            self.context
+                .VSSetConstantBuffers(0, Some(&[Some(self.cursor_cb.clone())]));
+            self.context.Draw(6, 0);
         }
         Ok(())
     }
@@ -295,6 +380,43 @@ fn compile_shaders(
             ps.ok_or_else(|| Error::Shader("null PS".into()))?,
         ))
     }
+}
+
+fn compile_cursor_shaders(
+    device: &ID3D11Device,
+) -> Result<(ID3D11VertexShader, ID3D11PixelShader), Error> {
+    let vs_blob = compile(SHADER_HLSL, "cur_vs", "vs_5_0")?;
+    let ps_blob = compile(SHADER_HLSL, "cur_ps", "ps_5_0")?;
+    // SAFETY: valid bytecode blobs.
+    unsafe {
+        let mut vs = None;
+        device.CreateVertexShader(blob_slice(&vs_blob), None, Some(&mut vs))?;
+        let mut ps = None;
+        device.CreatePixelShader(blob_slice(&ps_blob), None, Some(&mut ps))?;
+        Ok((
+            vs.ok_or_else(|| Error::Shader("null cursor VS".into()))?,
+            ps.ok_or_else(|| Error::Shader("null cursor PS".into()))?,
+        ))
+    }
+}
+
+/// A 32-byte dynamic constant buffer for the cursor sprite (center + halfsize).
+fn create_cursor_cb(device: &ID3D11Device) -> Result<ID3D11Buffer, Error> {
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_BIND_CONSTANT_BUFFER, D3D11_BUFFER_DESC, D3D11_CPU_ACCESS_WRITE, D3D11_USAGE_DYNAMIC,
+    };
+    let desc = D3D11_BUFFER_DESC {
+        ByteWidth: 32, // 8 floats, 16-byte aligned
+        Usage: D3D11_USAGE_DYNAMIC,
+        BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+        CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+        MiscFlags: 0,
+        StructureByteStride: 0,
+    };
+    let mut cb = None;
+    // SAFETY: valid desc; no initial data.
+    unsafe { device.CreateBuffer(&desc, None, Some(&mut cb))? };
+    cb.ok_or_else(|| Error::Shader("null cursor cbuffer".into()))
 }
 
 fn blob_slice(blob: &ID3DBlob) -> &[u8] {

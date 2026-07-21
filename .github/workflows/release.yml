@@ -1,15 +1,18 @@
 name: Release
 
-# Idempotent, version-driven release.
+# Idempotent, version-driven release of the NATIVE Rust app (Plan 04 §10).
 #
-# The single source of truth is the "version" field in app/package.json.
-# Clicking "Run workflow" (Actions -> Release -> Run workflow):
-#   1. reads that version, e.g. 1.0.0 -> tag "v1.0.0"
+# The single source of truth is `version` under [workspace.package] in
+# native/Cargo.toml. Clicking "Run workflow" (Actions -> Release -> Run workflow):
+#   1. reads that version, e.g. 2.0.0 -> tag "v2.0.0"
 #   2. if a GitHub Release with that tag already exists  -> skips (no-op)
-#   3. otherwise builds the Windows app and publishes the installer + portable
-#      exe to a new GitHub Release tagged v<version>.
+#   3. otherwise builds the Tauri app (NSIS installer) + the SYSTEM service and
+#      publishes both to a new GitHub Release tagged v<version>.
 #
-# To cut a new release: bump "version" in app/package.json, commit, push, run.
+# Unsigned build (§8b/§11.4): SmartScreen warns on first install (More info ->
+# Run anyway). No certificate, no codec licence, no cloud bill.
+#
+# To cut a release: bump `version` in native/Cargo.toml, commit, push, run.
 on:
   workflow_dispatch:
 
@@ -26,10 +29,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Read version from app/package.json
+      - name: Read version from native/Cargo.toml
         id: v
         shell: bash
-        run: echo "version=$(node -p "require('./app/package.json').version")" >> "$GITHUB_OUTPUT"
+        run: |
+          version=$(grep -m1 '^version' native/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "::notice::native version = $version"
 
       - name: Check whether release v<version> already exists
         id: exists
@@ -50,32 +56,39 @@ jobs:
   build-release:
     needs: check
     if: needs.check.outputs.exists == 'false'
-    # MUST be Windows: Windows-only app, native koffi module, NSIS installer.
+    # MUST be Windows: DXGI/Media Foundation/WebView2 app + NSIS installer.
     runs-on: windows-latest
     defaults:
       run:
-        working-directory: app
+        working-directory: native
 
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: app/package-lock.json
+          workspaces: native
 
-      - name: Install dependencies
-        run: npm ci
+      # cargo-deny is a release gate too (§11): never ship a copyleft/banned dep.
+      - name: License gate (cargo-deny)
+        run: |
+          cargo install cargo-deny --locked
+          cargo deny check
 
-      # Build only. --publish never is required: electron-builder auto-publishes
-      # when it detects CI + a publish config, which would demand GH_TOKEN here
-      # and race on multi-target. We publish separately via gh below.
-      - name: Build Windows app
-        run: npx electron-builder --win --publish never
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.0" --locked
 
-      # gh creates the tag v<version>, the published release, and uploads both
-      # exes in one shot — atomic, no race, no draft.
+      # Build the SYSTEM service binary (sharectrl-service.exe).
+      - name: Build service
+        run: cargo build -p service --release
+
+      # Build the Tauri app + NSIS installer (config lives in native/app).
+      - name: Build app + installer
+        working-directory: native/app
+        run: cargo tauri build --bundles nsis
+
+      # gh creates the tag v<version>, the release, and uploads the installer +
+      # the service exe in one shot — atomic, no race, no draft.
       - name: Publish GitHub release with assets
         shell: bash
         env:
@@ -83,16 +96,18 @@ jobs:
         run: |
           tag="v${{ needs.check.outputs.version }}"
           shopt -s nullglob
-          files=(dist/*.exe)
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "No .exe files found in app/dist — build produced nothing to release."
+          installers=(target/release/bundle/nsis/*-setup.exe)
+          service=(target/release/sharectrl-service.exe)
+          files=("${installers[@]}" "${service[@]}")
+          if [ ${#installers[@]} -eq 0 ]; then
+            echo "No NSIS installer produced in native/target/release/bundle/nsis."
             exit 1
           fi
           echo "Releasing $tag with: ${files[*]}"
           gh release create "$tag" "${files[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --title "ShareCtrlScreen v${{ needs.check.outputs.version }}" \
-            --notes "Windows installer + portable build. Unsigned — SmartScreen will warn (More info → Run anyway)." \
+            --notes "Native Rust build: Tauri app installer + SYSTEM service. Unsigned — SmartScreen will warn (More info -> Run anyway). Install the service (admin, once) for UAC/lock/secure-desktop control: \`sharectrl-service.exe --install-service\`." \
             --latest
 
       - name: Upload build artifacts (fallback download)
@@ -101,5 +116,6 @@ jobs:
         with:
           name: ShareCtrlScreen-v${{ needs.check.outputs.version }}
           path: |
-            app/dist/*.exe
+            native/target/release/bundle/nsis/*-setup.exe
+            native/target/release/sharectrl-service.exe
           if-no-files-found: warn

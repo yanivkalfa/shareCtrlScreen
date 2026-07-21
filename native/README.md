@@ -74,11 +74,27 @@ license, no cloud bill: `$0` to build and ship (§11.4).
 
 ## Status / what needs on-hardware validation
 
-The control plane (handshake, config, challenge-response, session state, FEC,
-packetization, signaling watchdog) is unit-tested and portable. The Windows media paths
-(DXGI duplication, MF encode/decode event pump, D3D11 present, str0m↔UDP driver, service
-injection/desktop-follow) compile against the real `windows` 0.62 / `str0m` 0.21 APIs and
-encode the exact sequences from §5–§8, but their fine timing and vendor-MFT quirks are
-validated on target hardware via the smoke-test above — as the plan intends (§5b "verify
-at runtime against target hardware"; §12 "this is the one place I'd de-risk").
+**Fully wired end-to-end** (no stubbed integration points): the host pipeline
+(capture → GPU BGRA→NV12 → HW encode → FEC-fragmented transport), the viewer
+pipeline (transport → HW decode → D3D11 present with a client-side cursor
+sprite), input (viewer captures over the native video window → host injects,
+permission-gated, with input-desktop follow), codec negotiation from the
+viewer's caps, dirty-rect adaptive frame rate, and the optional `WH_KEYBOARD_LL`
+shortcut hook. Control plane (handshake, challenge-response, config, session
+state, FEC, packetization, signaling watchdog) is unit-tested and portable.
+
+What still needs a real GPU + two machines to validate (not stubs — timing and
+vendor quirks):
+- **Glass-to-glass latency** against the §2 budget — run the smoke-test above.
+- **Vendor-MFT quirks**: some encoders silently no-op low-latency props (§5b);
+  the async event pump and D3D11VA decode want per-GPU checking.
+- **NAT traversal**: the transport advertises a host candidate for the LAN direct
+  path; STUN/TURN for restrictive NATs is the documented §6 fallback, not yet
+  wired into the ICE gathering.
+- **BWE**: data-channel transport has no TWCC, so the adaptive-bitrate loop is
+  plumbed (encoder reads a shared target each frame) but the estimate is static
+  until a loss/RTT signal is added — a known consequence of the §6 data-channel
+  choice.
+- **Secure-desktop injection** requires running the engine via the installed
+  SYSTEM service (§8b); portable mode reaches normal windows only.
 ```

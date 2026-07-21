@@ -15,6 +15,7 @@
 
 #![cfg(windows)]
 
+mod convert;
 pub mod decode;
 pub mod encode;
 mod variant;

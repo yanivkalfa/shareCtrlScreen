@@ -65,6 +65,11 @@ pub enum SignalMsg {
         /// Present only when rejected — "denied"|"busy"|"bad-password"|"timeout".
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        /// Negotiated codec the host will stream (§3), e.g. "H264"/"HEVC"/"AV1".
+        /// The viewer decodes with this. Absent ⇒ H.264 default. The server
+        /// relays it opaquely (no server change).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        codec: Option<String>,
     },
 
     /// WebRTC negotiation (contract §3.2 step 4). `data` is opaque to the server.

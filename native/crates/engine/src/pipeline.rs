@@ -389,13 +389,15 @@ struct IceConfig {
     turn_servers: Vec<TurnServer>,
 }
 
-/// Parse the config's `iceServers` (contract §5). STUN gets public fallbacks
-/// appended; TURN entries need credentials (`username`/`credential`). A free
-/// public relay (Open Relay / metered.ca) is appended as the TURN fallback so
-/// cross-network works out of the box — swap in your own relay via config for
-/// production traffic.
+/// Parse ICE servers from (a) the config's `iceServers` (contract §5) and (b) the
+/// TURN relay credentials the signaling server minted (Cloudflare TURN, cached on
+/// the engine). STUN gets public fallbacks appended; TURN entries carry
+/// `username`/`credential`. No dead free-relay default — cross-network relay comes
+/// from the account's own Cloudflare TURN key via the server.
 fn ice_config_from(engine: &Engine) -> IceConfig {
-    let servers = engine.config().ice_servers;
+    let mut servers = engine.config().ice_servers;
+    // Relay credentials fetched over signaling (turn:/turns: with creds).
+    servers.extend(engine.turn_servers());
     let mut stun_urls: Vec<String> = Vec::new();
     let mut turn_servers: Vec<TurnServer> = Vec::new();
 
@@ -433,15 +435,12 @@ fn ice_config_from(engine: &Engine) -> IceConfig {
         }
     }
 
-    // TURN fallback: Open Relay (free public TURN, openrelayproject creds).
     if turn_servers.is_empty() {
-        for hostport in ["openrelay.metered.ca:80", "openrelay.metered.ca:443"] {
-            turn_servers.push(TurnServer {
-                hostport: hostport.to_string(),
-                username: "openrelayproject".to_string(),
-                credential: "openrelayproject".to_string(),
-            });
-        }
+        tracing::info!(
+            "no TURN relay configured — direct paths only (set up a TURN key for cross-network)"
+        );
+    } else {
+        tracing::info!("{} TURN relay endpoint(s) available", turn_servers.len());
     }
 
     IceConfig {

@@ -14,10 +14,10 @@ pub mod control;
 pub mod input;
 pub mod signaling;
 
-pub use config::{Config, Mode, Permission};
+pub use config::{Config, IceServer, Mode, Permission};
 pub use control::ControlMsg;
 pub use input::{Button, InputMsg};
-pub use signaling::{IceCandidate, SignalData, SignalMsg};
+pub use signaling::{IceCandidate, IceServers, SignalData, SignalMsg};
 
 /// Protocol version carried in the `register` message (`v`), always `1`.
 pub const PROTOCOL_VERSION: u32 = 1;

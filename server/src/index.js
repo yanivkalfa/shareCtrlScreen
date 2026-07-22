@@ -87,8 +87,44 @@ export class SignalingRoom extends DurableObject {
     if (typeof msg.type !== "string") return;
 
     if (msg.type === "register") return this.handleRegister(ws, msg);
+    if (msg.type === "turn") return this.handleTurn(ws);
     if (RELAY_TYPES.has(msg.type)) return this.handleRelay(ws, msg, message.length);
     // Anything else is ignored for forward compatibility.
+  }
+
+  // Mint short-lived Cloudflare TURN credentials on demand and hand them back
+  // over the same socket. Requires the Worker secrets TURN_KEY_ID + TURN_TOKEN
+  // (Realtime → TURN key). Absent/misconfigured → an error reply the client
+  // treats as "no relay" (direct-only). The credentials are per-request and
+  // short-lived, so relaying them over the authenticated socket is safe.
+  async handleTurn(ws) {
+    const keyId = this.env.TURN_KEY_ID;
+    const token = this.env.TURN_TOKEN;
+    if (!keyId || !token) {
+      send(ws, { type: "turn-credentials", error: "not-configured" });
+      return;
+    }
+    try {
+      const resp = await fetch(
+        `https://rtc.live.cloudflare.com/v1/turn/keys/${keyId}/credentials/generate`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ ttl: 86400 }),
+        }
+      );
+      if (!resp.ok) {
+        send(ws, { type: "turn-credentials", error: `generate-${resp.status}` });
+        return;
+      }
+      const data = await resp.json();
+      send(ws, { type: "turn-credentials", iceServers: data.iceServers });
+    } catch (e) {
+      send(ws, { type: "turn-credentials", error: "fetch-failed" });
+    }
   }
 
   handleRegister(ws, msg) {

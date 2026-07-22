@@ -75,6 +75,10 @@ pub struct Engine {
     pending_nonce: Arc<Mutex<std::collections::HashMap<String, String>>>,
     /// Viewer decode capabilities per requesting peer, for codec negotiation (§3).
     pending_caps: Arc<Mutex<std::collections::HashMap<String, Vec<String>>>>,
+    /// TURN relay servers minted by the signaling server (Cloudflare TURN),
+    /// expanded to one `IceServer` per URL. Fetched on register and cached; the
+    /// pipeline reads them when gathering the relayed candidate.
+    turn_servers: Arc<Mutex<Vec<protocol::IceServer>>>,
 }
 
 impl Engine {
@@ -103,6 +107,7 @@ impl Engine {
             ui: ui_tx,
             pending_nonce: Arc::new(Mutex::new(Default::default())),
             pending_caps: Arc::new(Mutex::new(Default::default())),
+            turn_servers: Arc::new(Mutex::new(Vec::new())),
         });
         (engine, ui_rx, sig_rx)
     }
@@ -135,6 +140,9 @@ impl Engine {
                 tracing::info!("signaling: registered with server");
                 self.connected.store(true, Ordering::Relaxed);
                 let _ = self.ui.send(UiEvent::ServerStatus("connected"));
+                // Fetch TURN relay credentials now so they're cached before the
+                // user starts a session (needed for cross-network / strict NAT).
+                let _ = self.signaling.send(SignalMsg::Turn);
             }
             SigEvent::RegisterError(reason) => {
                 let _ = self
@@ -196,8 +204,46 @@ impl Engine {
                 let _ = to;
                 self.end_session_local();
             }
+            SignalMsg::TurnCredentials { ice_servers, error } => {
+                self.on_turn_credentials(ice_servers, error);
+            }
             _ => {} // contract §3: unknown/others ignored
         }
+    }
+
+    /// Cache TURN relay servers minted by the signaling server. Each URL becomes
+    /// one `IceServer` sharing the username/credential; the pipeline gathers a
+    /// relayed candidate from the `turn:` entries.
+    fn on_turn_credentials(
+        &self,
+        ice_servers: Option<protocol::IceServers>,
+        error: Option<String>,
+    ) {
+        if let Some(err) = error {
+            tracing::warn!("TURN credentials unavailable: {err} (cross-network relay disabled)");
+            return;
+        }
+        let Some(servers) = ice_servers else { return };
+        let expanded: Vec<protocol::IceServer> = servers
+            .urls
+            .iter()
+            .map(|url| protocol::IceServer {
+                urls: url.clone(),
+                username: servers.username.clone(),
+                credential: servers.credential.clone(),
+            })
+            .collect();
+        let turn_count = expanded
+            .iter()
+            .filter(|s| s.urls.starts_with("turn"))
+            .count();
+        tracing::info!("TURN credentials received: {turn_count} relay URL(s) cached");
+        *self.turn_servers.lock() = expanded;
+    }
+
+    /// The cached TURN/STUN relay servers (from the signaling server).
+    pub fn turn_servers(&self) -> Vec<protocol::IceServer> {
+        self.turn_servers.lock().clone()
     }
 
     // ---- Host side (contract §3.2 step 2) --------------------------------

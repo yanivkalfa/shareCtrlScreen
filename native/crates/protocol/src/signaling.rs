@@ -96,8 +96,32 @@ pub enum SignalMsg {
         to: Option<String>,
     },
 
+    /// Client → server: mint TURN relay credentials for this session. The server
+    /// generates them from its Cloudflare TURN key (no per-user config).
+    Turn,
+    /// Server → client: the minted relay credentials (or an `error`). Sent over
+    /// the same socket so no extra connection/TLS is needed.
+    TurnCredentials {
+        #[serde(rename = "iceServers", skip_serializing_if = "Option::is_none")]
+        ice_servers: Option<IceServers>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
     Ping,
     Pong,
+}
+
+/// TURN/STUN credentials as returned by Cloudflare's credential endpoint: a set
+/// of `urls` sharing one `username`/`credential`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IceServers {
+    #[serde(default)]
+    pub urls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
 }
 
 /// Codec capability advertisement (contract §3.2 v1.1).

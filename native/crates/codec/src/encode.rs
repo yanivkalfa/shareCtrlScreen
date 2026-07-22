@@ -674,6 +674,15 @@ fn apply_low_latency_recipe(api: &ICodecAPI, cfg: &EncoderConfig) {
     // Long GOP: no frequent periodic IDR (LTR recovery instead). Some H.264 MFTs
     // reject u32::MAX, so use a large finite value they accept.
     set_codec_value(api, &CODECAPI_AVEncMPVGOPSize, &u32v(600), "GOPSize");
+    // Favor SPEED over quality-per-bit (0=fastest, 100=best). Matters most for
+    // the software encoder, where per-frame CPU time IS the latency floor; a
+    // hardware MFT largely ignores it. Best-effort like the rest.
+    set_codec_value(
+        api,
+        &CODECAPI_AVEncCommonQualityVsSpeed,
+        &u32v(25),
+        "QualityVsSpeed=25",
+    );
 }
 
 /// Set one `ICodecAPI` value, logging (not failing) if the MFT rejects it.

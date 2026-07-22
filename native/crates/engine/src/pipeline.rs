@@ -403,10 +403,11 @@ fn parse_stun_mapped_address(buf: &[u8], tid: &[u8; 12]) -> Option<std::net::Soc
 }
 
 /// Default target bitrate. 8 Mbps floods a cellular/relay path and — with a
-/// software encoder that can't sustain it — pushes latency into seconds. 2.5 Mbps
-/// is plenty for desktop content at the capped frame rate and leaves headroom on
-/// constrained links. (A real BWE loop would adapt this; fixed is the safe win.)
-const DEFAULT_BITRATE: u32 = 2_500_000;
+/// software encoder that can't sustain it — pushes latency into seconds; but
+/// 2.5 Mbps at 1080p turns desktop text to mush. 4 Mbps at the 30fps cap is the
+/// sharp-enough middle (same per-frame budget as 8 Mbps at 60fps). A real BWE
+/// loop would adapt this; fixed is the safe interim.
+const DEFAULT_BITRATE: u32 = 4_000_000;
 
 /// Host encode frame-rate cap. 60fps of software H.264 is what makes this pair
 /// crawl; 30fps halves encode CPU on the host, decode CPU on the viewer, and the
@@ -705,11 +706,43 @@ fn start_viewer_transport(engine: &Engine, peer: String, offer_sdp: String) {
     let ctl_for_input = ctl_tx.clone();
     let stop_i = stop.clone();
     let i = std::thread::spawn(move || {
+        use render::window::VideoInput;
+        // Mouse-move coalescing: gaming mice emit up to 1000 moves/s; relayed
+        // over a reliable ordered channel they queue AHEAD of clicks/keys and
+        // make input feel drunk on slow links. Cap moves to ~100/s, always
+        // sending the LATEST position (never a stale one). Clicks/keys/wheel
+        // are never delayed by more than the coalescing drain itself.
+        const MOVE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+        let mut last_move_sent = std::time::Instant::now() - MOVE_INTERVAL;
         while !stop_i.load(Ordering::SeqCst) {
             match input_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                Ok(ev) => {
+                Ok(mut ev) => {
+                    let mut follow: Option<VideoInput> = None;
+                    if matches!(ev, VideoInput::Move { .. }) {
+                        // Pace: wait out the interval, then drain the backlog so
+                        // we forward the newest position, not a stale one.
+                        let since = last_move_sent.elapsed();
+                        if since < MOVE_INTERVAL {
+                            std::thread::sleep(MOVE_INTERVAL - since);
+                        }
+                        while let Ok(next) = input_rx.try_recv() {
+                            if matches!(next, VideoInput::Move { .. }) {
+                                ev = next; // newer position supersedes
+                            } else {
+                                follow = Some(next);
+                                break;
+                            }
+                        }
+                        last_move_sent = std::time::Instant::now();
+                    }
                     if let Some(msg) = translate_input(ev) {
                         let _ = ctl_for_input.send(serde_json::to_vec(&msg).unwrap_or_default());
+                    }
+                    if let Some(f) = follow {
+                        if let Some(msg) = translate_input(f) {
+                            let _ =
+                                ctl_for_input.send(serde_json::to_vec(&msg).unwrap_or_default());
+                        }
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}

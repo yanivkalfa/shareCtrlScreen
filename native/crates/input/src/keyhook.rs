@@ -145,6 +145,24 @@ unsafe extern "system" fn hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARA
         }
     }
 
+    // INVARIANT (stuck-key prevention): once we forwarded a key-DOWN to the
+    // remote, the matching key-UP is forwarded UNCONDITIONALLY — even if the
+    // suppress conditions no longer hold. E.g. quick Alt+Tab releases Alt
+    // *before* Tab: Tab-up then fails the alt_down() test; or focus moved off
+    // mid-Win-press. Without this the host keeps the key held forever.
+    if is_up {
+        if let Some(code) = vk_to_code(info.vkCode) {
+            if hook_held_remove(code) {
+                forward_key(code, false);
+                // Suppress the up locally only where the down was suppressed.
+                if should_suppress(info.vkCode) && session_focused() {
+                    return LRESULT(1);
+                }
+                return fallthrough();
+            }
+        }
+    }
+
     if !should_suppress(info.vkCode) {
         return fallthrough();
     }
@@ -168,6 +186,9 @@ unsafe extern "system" fn hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARA
                 forward_key("AltLeft", true);
             }
         }
+        if is_down {
+            hook_held_insert(code);
+        }
         forward_key(code, is_down);
     }
     LRESULT(1) // non-zero => suppress locally
@@ -176,6 +197,28 @@ unsafe extern "system" fn hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARA
 /// Whether we synthesized an AltLeft-down for the remote that still needs its
 /// matching release when the user lets go of the real Alt.
 static SYNTH_ALT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Keys whose DOWN we forwarded to the remote and whose UP is therefore owed
+/// unconditionally (see the invariant in `hook_proc`).
+static HOOK_HELD: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+fn hook_held_insert(code: &'static str) {
+    if let Ok(mut held) = HOOK_HELD.lock() {
+        if !held.contains(&code) {
+            held.push(code);
+        }
+    }
+}
+
+fn hook_held_remove(code: &str) -> bool {
+    if let Ok(mut held) = HOOK_HELD.lock() {
+        if let Some(i) = held.iter().position(|&c| c == code) {
+            held.remove(i);
+            return true;
+        }
+    }
+    false
+}
 
 fn forward_key(code: &str, down: bool) {
     if let Ok(state) = STATE.lock() {
@@ -221,6 +264,9 @@ pub fn install(forward: Forward) -> bool {
 pub fn uninstall() {
     set_focus_root(0);
     SYNTH_ALT.store(false, std::sync::atomic::Ordering::SeqCst);
+    if let Ok(mut held) = HOOK_HELD.lock() {
+        held.clear(); // host releases everything at session end anyway
+    }
     if let Ok(mut state) = STATE.lock() {
         if state.hook != 0 {
             // SAFETY: valid HHOOK we installed.

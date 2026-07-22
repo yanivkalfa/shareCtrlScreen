@@ -966,6 +966,7 @@ fn transport_driver(d: Driver) {
     // keyframe at link rate) instead of compounding forever.
     const VIDEO_QUEUE_LIMIT: usize = 64 * 1024;
     let mut dropped_frames: u64 = 0;
+    let mut dropped_since_send = false;
 
     let mut buf = [0u8; 2048];
     let mut video_count: u64 = 0;
@@ -1025,13 +1026,10 @@ fn transport_driver(d: Driver) {
                 let buffered = tp.video_buffered();
                 if buffered > VIDEO_QUEUE_LIMIT {
                     // Link behind: drop (deltas AND keyframes — a keyframe into a
-                    // full queue just deepens the lag). Ask the encoder for a
-                    // fresh IDR; it will be retried each frame until the queue
-                    // has drained enough to accept it.
+                    // full queue just deepens the lag). Latency stays bounded at
+                    // ~LIMIT instead of compounding.
                     dropped_frames += 1;
-                    if let Some(fk) = &force_key {
-                        fk.store(true, Ordering::SeqCst);
-                    }
+                    dropped_since_send = true;
                     if dropped_frames <= 5 || dropped_frames % 120 == 0 {
                         tracing::info!(
                             "host: link behind ({buffered} B queued) — dropped frame #{dropped_frames} (latency held flat)"
@@ -1039,6 +1037,17 @@ fn transport_driver(d: Driver) {
                     }
                     continue;
                 }
+                if dropped_since_send && !keyframe {
+                    // Recovered from a drop episode: this delta references a frame
+                    // the viewer lost, so it's undecodable. Skip it and force ONE
+                    // keyframe (emitted next iteration) to resync — no storm.
+                    dropped_since_send = false;
+                    if let Some(fk) = &force_key {
+                        fk.store(true, Ordering::SeqCst);
+                    }
+                    continue;
+                }
+                dropped_since_send = false;
                 let _ = tp.send_video(&au, keyframe);
             }
         }

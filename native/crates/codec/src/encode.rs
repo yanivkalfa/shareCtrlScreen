@@ -651,13 +651,25 @@ fn apply_low_latency_recipe(api: &ICodecAPI, cfg: &EncoderConfig) {
         &boolv(true),
         "AVLowLatencyMode",
     );
-    // CBR rate control fed by BWE.
+    // Constant-QUALITY rate control, NOT CBR. This is the readability fix: CBR
+    // gives every frame the same byte budget, so a full-screen keyframe is
+    // coarsely quantized (blocky text) and only *refines* over the next second
+    // as static P-frames spend their budget on detail — the "barely readable
+    // until it gains pixels" look. Constant quality encodes each frame to a
+    // fixed quality: desktop text is sharp on the FIRST frame, and a static
+    // screen costs almost no bandwidth (bits are spent only where pixels
+    // change). Motion bursts spike bandwidth, but the transport's frame-drop
+    // backpressure bounds that. Best-effort: if the encoder rejects quality
+    // mode it keeps its default and the MeanBitRate hint below applies.
     set_codec_value(
         api,
         &CODECAPI_AVEncCommonRateControlMode,
-        &u32v(eAVEncCommonRateControlMode_CBR.0 as u32),
-        "RateControlMode=CBR",
+        &u32v(eAVEncCommonRateControlMode_Quality.0 as u32),
+        "RateControlMode=Quality",
     );
+    // 0..100, higher = sharper. 78 keeps small UI text crisp.
+    set_codec_value(api, &CODECAPI_AVEncCommonQuality, &u32v(78), "Quality=78");
+    // Bitrate hint (used only if quality mode was rejected → VBR/CBR default).
     set_codec_value(
         api,
         &CODECAPI_AVEncCommonMeanBitRate,
@@ -680,8 +692,8 @@ fn apply_low_latency_recipe(api: &ICodecAPI, cfg: &EncoderConfig) {
     set_codec_value(
         api,
         &CODECAPI_AVEncCommonQualityVsSpeed,
-        &u32v(25),
-        "QualityVsSpeed=25",
+        &u32v(33),
+        "QualityVsSpeed=33",
     );
 }
 

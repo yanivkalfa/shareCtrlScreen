@@ -169,8 +169,16 @@ unsafe extern "system" fn hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARA
     // Focus gate: only act while the session window is foreground. Anywhere
     // else on this machine, Alt+Tab/Win behave completely normally.
     if !session_focused() {
+        tracing::debug!(
+            "keyhook: vk {:#x} matched but session not foreground — passing through",
+            info.vkCode
+        );
         return fallthrough();
     }
+    tracing::debug!(
+        "keyhook: capturing vk {:#x} (down={is_down}) -> forwarding to host",
+        info.vkCode
+    );
 
     if let Some(code) = vk_to_code(info.vkCode) {
         // Alt+Tab / Alt+Esc: the remote only opens its switcher if it has Alt
@@ -257,6 +265,7 @@ pub fn install(forward: Forward) -> bool {
     };
     state.hook = hhook.0 as isize;
     state.forward = Some(forward);
+    tracing::info!("keyhook installed — Alt+Tab / Win capture active for this session");
     true
 }
 

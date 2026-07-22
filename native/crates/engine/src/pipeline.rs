@@ -1288,6 +1288,10 @@ fn host_media_loop(
     let mut applied_bitrate = cfg.bitrate_bps;
     let mut sent: u64 = 0;
     let mut last_frame_at = std::time::Instant::now();
+    // Periodic safety keyframe. With CBR the IDR is bounded in size (the earlier
+    // stall was constant-QUALITY IDRs at ~500KB); 2s keeps any glitch short-lived.
+    const KEYFRAME_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+    let mut last_keyframe_at = std::time::Instant::now();
 
     while !stop.load(Ordering::SeqCst) {
         // Frame-rate cap: never encode faster than MAX_FPS_INTERVAL. The pacing
@@ -1336,15 +1340,29 @@ fn host_media_loop(
                     continue;
                 }
 
-                // §5a adaptive frame rate: a pointer-only update or a frame with
-                // no changed region costs ~0 — send nothing. EXCEPT when a
-                // keyframe is owed (channel just opened / viewer requested). With
-                // reliable delivery no periodic keyframe is needed — nothing is
-                // ever lost, so a scene change is just a (large) delta that
-                // arrives whole. NO more periodic full-screen IDR stalls.
-                let want_key = force_key.load(Ordering::SeqCst);
                 let has_change = !frame.pointer_only
                     && (!frame.dirty_rects.is_empty() || !frame.move_rects.is_empty());
+
+                // SCENE CHANGE → keyframe (this is the fix for "I tabbed and it
+                // stayed wrong"). When a large fraction of the screen changed at
+                // once (switching windows, a new page), encoding it as a delta off
+                // the previous frame is both wasteful and fragile — any prior
+                // imperfection carries forward and never clears. A clean IDR
+                // repaints the whole screen correctly, exactly like AnyDesk.
+                let dirty_area: u64 = frame
+                    .dirty_rects
+                    .iter()
+                    .map(|r| (r.right - r.left).max(0) as u64 * (r.bottom - r.top).max(0) as u64)
+                    .sum();
+                let frame_area = (cfg.width as u64) * (cfg.height as u64);
+                let scene_change = has_change && dirty_area * 100 >= frame_area * 50;
+
+                // Periodic safety keyframe: a clean full frame at least this often
+                // bounds how long ANY artifact can linger. CBR keeps each IDR
+                // small enough not to stall (the old stall was quality-92 IDRs).
+                let periodic = last_keyframe_at.elapsed() >= KEYFRAME_INTERVAL;
+
+                let want_key = force_key.load(Ordering::SeqCst) || scene_change || periodic;
                 if !has_change && !want_key {
                     dup.release();
                     continue;
@@ -1352,6 +1370,7 @@ fn host_media_loop(
                 if want_key {
                     encoder.force_keyframe();
                     force_key.store(false, Ordering::SeqCst);
+                    last_keyframe_at = std::time::Instant::now();
                 }
                 // BGRA→NV12 + encode happen inside the encoder path (§5b).
                 match encoder.encode(&frame.texture) {

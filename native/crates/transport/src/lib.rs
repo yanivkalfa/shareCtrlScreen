@@ -48,9 +48,17 @@ pub fn channel_configs() -> [ChannelConfig; 3] {
     [
         ChannelConfig {
             label: "video".to_string(),
+            // RELIABLE, unordered. Every fragment is retransmitted until it
+            // arrives, so a frame is never partially received — the fix for
+            // "pixels missing" and the never-clearing image on a lossy relay
+            // (a single lost packet used to corrupt every following frame until a
+            // keyframe). Unordered so a lost old fragment doesn't head-of-line
+            // block a newer frame — our reassembler orders by frame id anyway.
+            // Congestion is handled by pacing the SOURCE (the host stops encoding
+            // while the send queue is deep), never by dropping encoded frames,
+            // which is what corrupts the reference chain.
             ordered: false,
-            // Unreliable: never retransmit — a lost delta frame is superseded.
-            reliability: Reliability::MaxRetransmits { retransmits: 0 },
+            reliability: Reliability::Reliable,
             negotiated: None,
             protocol: String::new(),
         },

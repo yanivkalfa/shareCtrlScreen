@@ -11,10 +11,11 @@
     "windows": [
       {
         "title": "ShareCtrlScreen",
-        "width": 980,
-        "height": 680,
+        "width": 1600,
+        "height": 900,
         "minWidth": 720,
         "minHeight": 520,
+        "maximized": true,
         "resizable": true
       }
     ],

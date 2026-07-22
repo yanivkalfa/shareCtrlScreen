@@ -31,6 +31,13 @@ static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 /// drawn by the render loop as a client-side sprite (§5a/§7).
 static CURSOR: Mutex<Option<(f64, f64, bool)>> = Mutex::new(None);
 
+/// Host source-pacing signal: the transport driver sets this when the reliable
+/// video channel's send queue is deep (link behind). The capture/encode loop
+/// then stops PRODUCING frames until it drains — pacing the source instead of
+/// dropping already-encoded frames, which would corrupt the reference chain on a
+/// reliable channel. One session at a time, so a global is fine.
+static VIDEO_CONGESTED: AtomicBool = AtomicBool::new(false);
+
 /// The app calls this once, passing the Tauri main-window HWND. We create a
 /// native D3D11 child window under it (§7 Option A) and remember its handle; the
 /// swapchain is created on the child, never on the WebView2 window itself.
@@ -782,20 +789,18 @@ fn start_viewer_transport(engine: &Engine, peer: String, offer_sdp: String) {
     let mut threads = vec![t, r, i];
 
     // Shortcut capture (§8a): grab OS-reserved combos (Alt+Tab, Win) via
-    // WH_KEYBOARD_LL and forward them to the host, gated on the session window
-    // being foreground. CRITICAL: only install it when this process actually has
-    // UIAccess — Windows silently ignores injected shell shortcuts from a
-    // non-UIAccess app (anti-malware wall, per Microsoft docs), so without it
-    // the hook would suppress Alt+Tab locally and forward keystrokes the host
-    // can't act on, risking stuck modifiers for zero benefit. UIAccess requires
-    // a signed build installed to a trusted location (the NSIS installer path);
-    // the unsigned test exe intentionally leaves Alt+Tab to the local machine.
-    if !elevation::process_has_uiaccess() {
+    // WH_KEYBOARD_LL while the session window is foreground and forward them to
+    // the host. NOTE: whether the host actually ACTS on injected Alt+Tab depends
+    // on the host process being elevated or UIAccess-signed — Windows blocks
+    // shell-shortcut injection from a plain medium-integrity app (documented).
+    // The hook is installed regardless (the stuck-key guards make it safe); it
+    // just becomes effective once the host runs elevated/installed. `has_uiaccess`
+    // is logged so the session log states plainly whether it can work.
+    {
         tracing::info!(
-            "shortcut capture disabled — this build lacks UIAccess, so Alt+Tab/Win \
-             stay local (a signed, installed build is required for remote shell shortcuts)"
+            "shortcut capture on (uiaccess={}); remote Alt+Tab needs the host elevated or signed",
+            elevation::process_has_uiaccess()
         );
-    } else {
         input::keyhook::set_focus_root(RENDER_HWND.load(Ordering::SeqCst));
         let ctl = ctl_tx.clone();
         let stop_k = stop.clone();
@@ -965,25 +970,15 @@ fn transport_driver(d: Driver) {
     let mut cursor_open = false;
     let mut ctl_backlog: Vec<Vec<u8>> = Vec::new();
 
-    // Host-side backpressure (the AnyDesk property: prefer DROPPING to LAGGING).
-    // If SCTP has more than this many bytes still unsent, the link is behind —
-    // queueing another frame would only grow glass-to-glass latency, so delta
-    // frames are dropped and the encoder is told to produce a fresh IDR, which
-    // is sent as soon as the queue drains. Latency stays bounded (~LIMIT + one
-    // keyframe at link rate) instead of compounding forever.
-    const VIDEO_QUEUE_LIMIT: usize = 64 * 1024;
-    let mut dropped_frames: u64 = 0;
-    let mut dropped_since_send = false;
+    // Host source-pacing threshold. The video channel is RELIABLE now, so we
+    // never drop encoded frames (that corrupts the H.264 reference chain). When
+    // the send queue exceeds this, we flag VIDEO_CONGESTED and the encode loop
+    // stops producing until it drains — fewer frames under load, but every one
+    // arrives whole and decodes. ~256KB ≈ 0.5s at 4Mbps: bounded, not compounding.
+    const VIDEO_QUEUE_LIMIT: usize = 256 * 1024;
 
     let mut buf = [0u8; 2048];
     let mut video_count: u64 = 0;
-    // Viewer: frame-id continuity tracking. The video channel is unreliable and
-    // delta frames reference their predecessors, so a LOST frame corrupts every
-    // frame after it (the on-screen "smear") until a keyframe arrives — and with
-    // an effectively-infinite GOP one never does on its own. Detect the gap and
-    // ask the host for a keyframe immediately (rate-limited).
-    let mut last_frame_id: Option<u32> = None;
-    let mut last_gap_req = std::time::Instant::now() - std::time::Duration::from_secs(5);
     while !stop.load(Ordering::SeqCst) {
         // 0) Host: if control was just revoked (view-only), release any input we
         // are holding down so the host is never left with a stuck key/button.
@@ -1030,33 +1025,13 @@ fn transport_driver(d: Driver) {
                     // forced the moment the channel opens.
                     continue;
                 }
-                let buffered = tp.video_buffered();
-                if buffered > VIDEO_QUEUE_LIMIT {
-                    // Link behind: drop (deltas AND keyframes — a keyframe into a
-                    // full queue just deepens the lag). Latency stays bounded at
-                    // ~LIMIT instead of compounding.
-                    dropped_frames += 1;
-                    dropped_since_send = true;
-                    if dropped_frames <= 5 || dropped_frames % 120 == 0 {
-                        tracing::info!(
-                            "host: link behind ({buffered} B queued) — dropped frame #{dropped_frames} (latency held flat)"
-                        );
-                    }
-                    continue;
-                }
-                if dropped_since_send && !keyframe {
-                    // Recovered from a drop episode: this delta references a frame
-                    // the viewer lost, so it's undecodable. Skip it and force ONE
-                    // keyframe (emitted next iteration) to resync — no storm.
-                    dropped_since_send = false;
-                    if let Some(fk) = &force_key {
-                        fk.store(true, Ordering::SeqCst);
-                    }
-                    continue;
-                }
-                dropped_since_send = false;
+                // Reliable channel: SEND every frame the encoder produced (never
+                // drop — that corrupts the reference chain). Congestion is
+                // handled by pacing the SOURCE: publish the queue depth so the
+                // encode loop stops producing while we're behind.
                 let _ = tp.send_video(&au, keyframe);
             }
+            VIDEO_CONGESTED.store(tp.video_buffered() > VIDEO_QUEUE_LIMIT, Ordering::SeqCst);
         }
         // Host: cursor position updates on the cursor channel (§5a/§7). Stale
         // pre-open positions are worthless — drop, don't buffer.
@@ -1173,28 +1148,9 @@ fn transport_driver(d: Driver) {
                                     frame.keyframe
                                 );
                             }
-                            // Continuity check: a skipped frame id means a delta
-                            // was lost → decoder refs are broken → smear. Request
-                            // a keyframe to restart cleanly (§6 recovery).
-                            if let Some(last) = last_frame_id {
-                                let expected = last.wrapping_add(1);
-                                if frame.frame_id != expected
-                                    && !frame.keyframe
-                                    && last_gap_req.elapsed()
-                                        >= std::time::Duration::from_millis(1500)
-                                {
-                                    tracing::info!(
-                                        "viewer: frame gap ({} -> {}) — requesting keyframe",
-                                        last,
-                                        frame.frame_id
-                                    );
-                                    let _ = tp.send_ctl(&serialize(
-                                        &protocol::ControlMsg::KeyframeRequest,
-                                    ));
-                                    last_gap_req = std::time::Instant::now();
-                                }
-                            }
-                            last_frame_id = Some(frame.frame_id);
+                            // Reliable channel: frames arrive whole and in
+                            // sequence, so there is no lost-frame gap to detect
+                            // or recover from — just hand it to the decoder.
                             if let Some(tx) = &video_tx {
                                 let _ = tx.send((frame.data, frame.keyframe));
                             }
@@ -1301,6 +1257,11 @@ fn host_media_loop(
     let mut applied_bitrate = cfg.bitrate_bps;
     let mut sent: u64 = 0;
     let mut last_frame_at = std::time::Instant::now();
+    // Periodic keyframe: an IDR at least this often bounds artifact lifetime and
+    // makes window-switches resolve promptly (reliable delivery means each IDR
+    // fully clears any prior state). ~3s is a good picture/bandwidth balance.
+    const KEYFRAME_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+    let mut last_keyframe_at = std::time::Instant::now();
 
     while !stop.load(Ordering::SeqCst) {
         // Frame-rate cap: never encode faster than MAX_FPS_INTERVAL. The pacing
@@ -1337,12 +1298,26 @@ fn host_media_loop(
                     let _ = cursor_tx.send(serde_json::to_vec(&msg).unwrap_or_default());
                 }
 
+                // Source pacing: while the reliable send queue is deep, STOP
+                // producing frames (release and skip). Fewer frames under load,
+                // but nothing is dropped mid-flight, so the reference chain stays
+                // intact and every delivered frame decodes whole. When we resume,
+                // the next frame is a delta from the last frame we DID send (the
+                // viewer has it, reliably), so no resync keyframe is needed.
+                if VIDEO_CONGESTED.load(Ordering::SeqCst) && !force_key.load(Ordering::SeqCst) {
+                    dup.release();
+                    std::thread::sleep(std::time::Duration::from_millis(4));
+                    continue;
+                }
+
                 // §5a adaptive frame rate: a pointer-only update or a frame with
                 // no changed region costs ~0 — send nothing, don't wake the
                 // encoder into an idle stream. EXCEPT when a keyframe is owed
-                // (channel just opened / viewer requested): the viewer is blind
-                // until an IDR arrives, so encode this frame even if unchanged.
-                let want_key = force_key.load(Ordering::SeqCst);
+                // (channel just opened / viewer requested) OR the periodic resync
+                // is due: a fresh IDR every few seconds bounds how long any
+                // artifact could ever linger and makes window-switches snap in.
+                let periodic_key = last_keyframe_at.elapsed() >= KEYFRAME_INTERVAL;
+                let want_key = force_key.load(Ordering::SeqCst) || periodic_key;
                 let has_change = !frame.pointer_only
                     && (!frame.dirty_rects.is_empty() || !frame.move_rects.is_empty());
                 if !has_change && !want_key {
@@ -1352,6 +1327,7 @@ fn host_media_loop(
                 if want_key {
                     encoder.force_keyframe();
                     force_key.store(false, Ordering::SeqCst);
+                    last_keyframe_at = std::time::Instant::now();
                 }
                 // BGRA→NV12 + encode happen inside the encoder path (§5b).
                 match encoder.encode(&frame.texture) {

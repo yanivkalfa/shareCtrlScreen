@@ -782,13 +782,20 @@ fn start_viewer_transport(engine: &Engine, peer: String, offer_sdp: String) {
     let mut threads = vec![t, r, i];
 
     // Shortcut capture (§8a): grab OS-reserved combos (Alt+Tab, Win) via
-    // WH_KEYBOARD_LL and forward them to the host — but ONLY while the session
-    // window is foreground (focus gate inside the hook), so clicking any other
-    // window instantly returns the keyboard to this machine. Always on for a
-    // session: this is what makes Alt+Tab act on the REMOTE, the expected
-    // remote-desktop behavior. (Previously gated behind an opt-in setting that
-    // also only took effect on the next session — nobody could discover it.)
-    {
+    // WH_KEYBOARD_LL and forward them to the host, gated on the session window
+    // being foreground. CRITICAL: only install it when this process actually has
+    // UIAccess — Windows silently ignores injected shell shortcuts from a
+    // non-UIAccess app (anti-malware wall, per Microsoft docs), so without it
+    // the hook would suppress Alt+Tab locally and forward keystrokes the host
+    // can't act on, risking stuck modifiers for zero benefit. UIAccess requires
+    // a signed build installed to a trusted location (the NSIS installer path);
+    // the unsigned test exe intentionally leaves Alt+Tab to the local machine.
+    if !elevation::process_has_uiaccess() {
+        tracing::info!(
+            "shortcut capture disabled — this build lacks UIAccess, so Alt+Tab/Win \
+             stay local (a signed, installed build is required for remote shell shortcuts)"
+        );
+    } else {
         input::keyhook::set_focus_root(RENDER_HWND.load(Ordering::SeqCst));
         let ctl = ctl_tx.clone();
         let stop_k = stop.clone();

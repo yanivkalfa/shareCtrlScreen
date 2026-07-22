@@ -25,7 +25,7 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
     D3D11_COMPARISON_NEVER, D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_SAMPLER_DESC,
     D3D11_SHADER_RESOURCE_VIEW_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC_0, D3D11_TEX2D_ARRAY_SRV,
-    D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_VIEWPORT,
+    D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_VIEWPORT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
@@ -119,6 +119,11 @@ pub struct Renderer {
     cursor_ps: ID3D11PixelShader,
     cursor_cb: ID3D11Buffer,
     allow_tearing: bool,
+    /// The child HWND we present into — used to track its client size so the
+    /// swapchain matches it (no DXGI stretch-scaling) and the video is letterboxed
+    /// to the real window, scaled exactly once by our shader.
+    hwnd: HWND,
+    /// Current swapchain (backbuffer) size = the window client size.
     width: u32,
     height: u32,
     /// Diagnostics: successful Present count (first one logged).
@@ -134,8 +139,12 @@ pub struct Renderer {
 
 impl Renderer {
     /// Create the swapchain for `hwnd` (Option A native child HWND, §7) using the
-    /// device shared with the decoder so decoded textures need no copy.
-    pub fn new(device: &ID3D11Device, hwnd: HWND, width: u32, height: u32) -> Result<Self, Error> {
+    /// device shared with the decoder so decoded textures need no copy. The
+    /// swapchain is sized to the window's CLIENT area (not the video resolution)
+    /// so DXGI never stretch-scales; the video is fit into it, aspect-preserved,
+    /// by the shader — one clean scale instead of two lossy ones.
+    pub fn new(device: &ID3D11Device, hwnd: HWND, _vw: u32, _vh: u32) -> Result<Self, Error> {
+        let (width, height) = client_size(hwnd);
         let context = unsafe { device.GetImmediateContext()? };
 
         // Get the DXGI factory that made this device.
@@ -195,6 +204,7 @@ impl Renderer {
             cursor_ps,
             cursor_cb,
             allow_tearing,
+            hwnd,
             width,
             height,
             presented: 0,
@@ -212,9 +222,17 @@ impl Renderer {
         array_index: u32,
         cursor: Option<(f64, f64)>,
     ) -> Result<(), Error> {
+        // Keep the swapchain matched to the window client size so DXGI never
+        // stretch-scales (the biggest source of blur); resize is a no-op when
+        // unchanged.
+        self.sync_size();
+
         // Block until the swapchain can accept a new frame (1-deep).
         // SAFETY: waitable handle from the swapchain.
         unsafe { WaitForSingleObjectEx(self.waitable, 1000, false) };
+
+        // Video's real pixel size, for aspect-preserving letterbox.
+        let (vw, vh) = texture_size(nv12);
 
         // SRVs from the per-slice cache (created once per texture/slice).
         let key = (nv12.as_raw() as usize, array_index);
@@ -240,14 +258,10 @@ impl Renderer {
                     .ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0]);
             }
             self.context.OMSetRenderTargets(Some(&rtvs), None);
-            let vp = D3D11_VIEWPORT {
-                TopLeftX: 0.0,
-                TopLeftY: 0.0,
-                Width: self.width as f32,
-                Height: self.height as f32,
-                MinDepth: 0.0,
-                MaxDepth: 1.0,
-            };
+            // Aspect-preserving letterbox: fit the video rect inside the window,
+            // centered, with black bars — no stretch/distortion. The shader maps
+            // the full texture (uv 0..1) into this viewport, so one clean scale.
+            let vp = letterbox(self.width, self.height, vw, vh);
             self.context.RSSetViewports(Some(&[vp]));
             self.context.VSSetShader(&self.vs, None);
             self.context.PSSetShader(&self.ps, None);
@@ -315,6 +329,16 @@ impl Renderer {
         Ok(())
     }
 
+    /// Match the swapchain to the window's current client size (no-op if same).
+    /// Called each frame so mid-session window resizes stay crisp (1:1, no DXGI
+    /// stretch). Errors are swallowed — a failed resize keeps the old buffers.
+    fn sync_size(&mut self) {
+        let (w, h) = client_size(self.hwnd);
+        if w != self.width || h != self.height {
+            let _ = self.resize(w, h);
+        }
+    }
+
     /// Resize the swapchain (window/stream resolution change).
     pub fn resize(&mut self, width: u32, height: u32) -> Result<(), Error> {
         self.width = width;
@@ -368,6 +392,41 @@ impl Renderer {
                 .CreateShaderResourceView(tex, Some(&desc), Some(&mut srv))?
         };
         srv.ok_or_else(|| Error::Shader("null SRV".into()))
+    }
+}
+
+/// Window client-area size in physical pixels (each at least 1).
+fn client_size(hwnd: HWND) -> (u32, u32) {
+    let mut rc = windows::Win32::Foundation::RECT::default();
+    // SAFETY: valid child HWND.
+    let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rc) };
+    (
+        (rc.right - rc.left).max(1) as u32,
+        (rc.bottom - rc.top).max(1) as u32,
+    )
+}
+
+/// A texture's pixel dimensions.
+fn texture_size(tex: &ID3D11Texture2D) -> (u32, u32) {
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    // SAFETY: valid texture.
+    unsafe { tex.GetDesc(&mut desc) };
+    (desc.Width.max(1), desc.Height.max(1))
+}
+
+/// Aspect-preserving letterbox: the largest (vw×vh)-aspect rect that fits inside
+/// (ww×wh), centered. The shader maps the whole texture into this viewport.
+fn letterbox(ww: u32, wh: u32, vw: u32, vh: u32) -> D3D11_VIEWPORT {
+    let (ww, wh, vw, vh) = (ww as f32, wh as f32, vw as f32, vh as f32);
+    let scale = (ww / vw).min(wh / vh);
+    let (w, h) = (vw * scale, vh * scale);
+    D3D11_VIEWPORT {
+        TopLeftX: ((ww - w) * 0.5).max(0.0),
+        TopLeftY: ((wh - h) * 0.5).max(0.0),
+        Width: w,
+        Height: h,
+        MinDepth: 0.0,
+        MaxDepth: 1.0,
     }
 }
 

@@ -32,3 +32,36 @@ pub use session::{active_console_session, launch_in_session, user_token, Session
 pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
+
+/// Whether THIS process has the UIAccess privilege (manifest `uiAccess="true"` +
+/// signed + trusted install location). Windows **silently ignores** injected
+/// shell shortcuts (Alt+Tab, the Win key, the task switcher) from a process
+/// without it — an anti-malware wall documented by Microsoft. So the shortcut
+/// hook must only run when this is true: otherwise it captures those combos
+/// locally and forwards keystrokes the host can never act on, which just risks
+/// stuck modifiers for zero benefit.
+pub fn process_has_uiaccess() -> bool {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::{GetTokenInformation, TokenUIAccess, TOKEN_QUERY};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    // SAFETY: standard token query; handle closed before return.
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut ui_access: u32 = 0;
+        let mut ret_len: u32 = 0;
+        let ok = GetTokenInformation(
+            token,
+            TokenUIAccess,
+            Some(&mut ui_access as *mut _ as *mut _),
+            std::mem::size_of::<u32>() as u32,
+            &mut ret_len,
+        )
+        .is_ok();
+        let _ = windows::Win32::Foundation::CloseHandle(token);
+        ok && ui_access != 0
+    }
+}

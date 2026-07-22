@@ -958,6 +958,15 @@ fn transport_driver(d: Driver) {
     let mut cursor_open = false;
     let mut ctl_backlog: Vec<Vec<u8>> = Vec::new();
 
+    // Host-side backpressure (the AnyDesk property: prefer DROPPING to LAGGING).
+    // If SCTP has more than this many bytes still unsent, the link is behind —
+    // queueing another frame would only grow glass-to-glass latency, so delta
+    // frames are dropped and the encoder is told to produce a fresh IDR, which
+    // is sent as soon as the queue drains. Latency stays bounded (~LIMIT + one
+    // keyframe at link rate) instead of compounding forever.
+    const VIDEO_QUEUE_LIMIT: usize = 64 * 1024;
+    let mut dropped_frames: u64 = 0;
+
     let mut buf = [0u8; 2048];
     let mut video_count: u64 = 0;
     // Viewer: frame-id continuity tracking. The video channel is unreliable and
@@ -1008,11 +1017,29 @@ fn transport_driver(d: Driver) {
         }
         if let Some(frame_rx) = &frame_rx {
             while let Ok((au, keyframe)) = frame_rx.try_recv() {
-                if video_open {
-                    let _ = tp.send_video(&au, keyframe);
+                if !video_open {
+                    // Pre-open frames can never reach the peer; a keyframe is
+                    // forced the moment the channel opens.
+                    continue;
                 }
-                // else: dropped — a pre-open frame can never reach the peer, and
-                // a keyframe is forced the moment the channel opens.
+                let buffered = tp.video_buffered();
+                if buffered > VIDEO_QUEUE_LIMIT {
+                    // Link behind: drop (deltas AND keyframes — a keyframe into a
+                    // full queue just deepens the lag). Ask the encoder for a
+                    // fresh IDR; it will be retried each frame until the queue
+                    // has drained enough to accept it.
+                    dropped_frames += 1;
+                    if let Some(fk) = &force_key {
+                        fk.store(true, Ordering::SeqCst);
+                    }
+                    if dropped_frames <= 5 || dropped_frames % 120 == 0 {
+                        tracing::info!(
+                            "host: link behind ({buffered} B queued) — dropped frame #{dropped_frames} (latency held flat)"
+                        );
+                    }
+                    continue;
+                }
+                let _ = tp.send_video(&au, keyframe);
             }
         }
         // Host: cursor position updates on the cursor channel (§5a/§7). Stale
@@ -1374,53 +1401,107 @@ fn viewer_media_loop(
     let mut ts = 0i64;
     let mut rendered: u64 = 0;
     let mut render_errors: u64 = 0;
+    let mut skipped: u64 = 0;
     // Keyframe watchdog: if AUs arrive but the decoder produces nothing, the
     // keyframe was lost (unreliable channel) — ask the host for a fresh one,
     // rate-limited to ~1/s so a slow link isn't flooded.
     let mut undecoded_streak: u32 = 0;
     let mut last_kf_req = std::time::Instant::now();
+    // Catch-up state: after locally dumping a delta backlog, deltas are useless
+    // (their reference frames were skipped) until the requested IDR arrives.
+    let mut awaiting_keyframe = false;
     while !stop.load(Ordering::SeqCst) {
         // Track window resizes (and hover-reveal offsets) — no-op when unchanged.
         render::window::fit(hwnd_raw);
         match video_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok((au, keyframe)) => {
-                // 100-ns MF units at ~60 fps — decoders (esp. the software AV1
-                // MFT) can stall on nonsense timestamps like 1,2,3….
-                ts += 166_667;
-                match decoder.decode(&au, keyframe, ts) {
-                    Ok(Some(frame)) => {
-                        undecoded_streak = 0;
-                        rendered += 1;
-                        if rendered == 1 || rendered % 120 == 0 {
-                            tracing::info!("viewer: decoded frame #{rendered}");
-                        }
-                        // Draw the out-of-band cursor sprite on top (§7).
-                        let cursor = match *CURSOR.lock() {
-                            Some((x, y, true)) => Some((x, y)),
-                            _ => None,
-                        };
-                        // A failing render is NOT silent: this was exactly the
-                        // place a black screen hid (decode fine, render dead).
-                        if let Err(e) =
-                            renderer.render_frame(&frame.texture, frame.array_index, cursor)
-                        {
-                            render_errors += 1;
-                            if render_errors <= 10 || render_errors % 120 == 0 {
-                                tracing::warn!("render error #{render_errors}: {e}");
+            Ok(first) => {
+                // Batch-drain the queue, then CATCH UP instead of falling behind
+                // (the AnyDesk property): software decode at ~20-30ms/frame can
+                // never out-decode a backlog, so latency would compound forever.
+                let mut pending: Vec<(Vec<u8>, bool)> = vec![first];
+                while let Ok(next) = video_rx.try_recv() {
+                    pending.push(next);
+                }
+
+                if let Some(k) = pending.iter().rposition(|(_, kf)| *kf) {
+                    // A keyframe is queued: decoding from the NEWEST one is
+                    // always valid — everything older is pure latency. Skip it.
+                    if k > 0 {
+                        skipped += k as u64;
+                        tracing::debug!("viewer: catch-up — skipped {k} stale frame(s)");
+                    }
+                    pending.drain(..k);
+                    awaiting_keyframe = false;
+                } else if awaiting_keyframe {
+                    // Deltas can't decode until the requested IDR arrives.
+                    skipped += pending.len() as u64;
+                    if last_kf_req.elapsed() >= std::time::Duration::from_secs(1) {
+                        let _ = ctl_tx.send(serialize(&protocol::ControlMsg::KeyframeRequest));
+                        last_kf_req = std::time::Instant::now();
+                    }
+                    continue;
+                } else if pending.len() > 6 {
+                    // Hopeless delta backlog (>~200ms behind, no keyframe in
+                    // sight): dump it and resync via a fresh IDR.
+                    skipped += pending.len() as u64;
+                    awaiting_keyframe = true;
+                    tracing::info!(
+                        "viewer: {} frame(s) behind — dumped backlog, requesting keyframe",
+                        pending.len()
+                    );
+                    let _ = ctl_tx.send(serialize(&protocol::ControlMsg::KeyframeRequest));
+                    last_kf_req = std::time::Instant::now();
+                    continue;
+                }
+
+                // Decode the batch; PRESENT only the newest decoded frame (the
+                // earlier ones only exist to carry decoder references forward).
+                let count = pending.len();
+                for (i, (au, keyframe)) in pending.into_iter().enumerate() {
+                    // 100-ns MF units at ~60 fps — decoders (esp. the software
+                    // AV1 MFT) can stall on nonsense timestamps like 1,2,3….
+                    ts += 166_667;
+                    match decoder.decode(&au, keyframe, ts) {
+                        Ok(Some(frame)) => {
+                            undecoded_streak = 0;
+                            rendered += 1;
+                            if rendered == 1 || rendered % 120 == 0 {
+                                tracing::info!(
+                                    "viewer: decoded frame #{rendered} (skipped {skipped} total)"
+                                );
+                            }
+                            if i + 1 < count {
+                                continue; // reference-only; present the newest
+                            }
+                            // Draw the out-of-band cursor sprite on top (§7).
+                            let cursor = match *CURSOR.lock() {
+                                Some((x, y, true)) => Some((x, y)),
+                                _ => None,
+                            };
+                            // A failing render is NOT silent: this was exactly the
+                            // place a black screen hid (decode fine, render dead).
+                            if let Err(e) =
+                                renderer.render_frame(&frame.texture, frame.array_index, cursor)
+                            {
+                                render_errors += 1;
+                                if render_errors <= 10 || render_errors % 120 == 0 {
+                                    tracing::warn!("render error #{render_errors}: {e}");
+                                }
                             }
                         }
-                    }
-                    Ok(None) => {
-                        undecoded_streak += 1;
-                        if undecoded_streak >= 5
-                            && last_kf_req.elapsed() >= std::time::Duration::from_secs(1)
-                        {
-                            tracing::info!("viewer: no decodable frames — requesting keyframe");
-                            let _ = ctl_tx.send(serialize(&protocol::ControlMsg::KeyframeRequest));
-                            last_kf_req = std::time::Instant::now();
+                        Ok(None) => {
+                            undecoded_streak += 1;
+                            if undecoded_streak >= 5
+                                && last_kf_req.elapsed() >= std::time::Duration::from_secs(1)
+                            {
+                                tracing::info!("viewer: no decodable frames — requesting keyframe");
+                                let _ =
+                                    ctl_tx.send(serialize(&protocol::ControlMsg::KeyframeRequest));
+                                last_kf_req = std::time::Instant::now();
+                            }
                         }
+                        Err(e) => tracing::warn!("decode error: {e}"),
                     }
-                    Err(e) => tracing::warn!("decode error: {e}"),
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}

@@ -137,6 +137,20 @@ impl Transport {
         Ok(())
     }
 
+    /// Bytes currently queued (unsent) on the video channel's SCTP stream. The
+    /// congestion signal for host-side backpressure: when the link can't drain
+    /// this, queueing more frames only adds latency — drop instead (§6).
+    pub fn video_buffered(&mut self) -> usize {
+        match self.video {
+            Some(id) => self
+                .rtc
+                .channel(id)
+                .map(|mut ch| ch.buffered_amount())
+                .unwrap_or(0),
+            None => 0,
+        }
+    }
+
     /// Send an encoded access unit on the unreliable video channel: fragment to
     /// ≤MTU datagrams (§6). Keyframe framing is tagged so the viewer can request
     /// FEC/priority; FEC recovery shards for keyframes are added by the caller.

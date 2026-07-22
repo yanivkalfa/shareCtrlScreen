@@ -231,8 +231,10 @@ impl Renderer {
         // SAFETY: waitable handle from the swapchain.
         unsafe { WaitForSingleObjectEx(self.waitable, 1000, false) };
 
-        // Video's real pixel size, for aspect-preserving letterbox.
+        // Video's real pixel size, for aspect-preserving letterbox. Publish it so
+        // input normalization maps clicks over the same letterbox rect.
         let (vw, vh) = texture_size(nv12);
+        window::set_video_size(vw, vh);
 
         // SRVs from the per-slice cache (created once per texture/slice).
         let key = (nv12.as_raw() as usize, array_index);

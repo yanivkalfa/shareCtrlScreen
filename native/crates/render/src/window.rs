@@ -8,6 +8,7 @@
 //! The window is created on the caller's thread (the app's UI thread, which owns
 //! the message pump) so `WM_SIZE`/paint are serviced by the parent's loop.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 
@@ -54,6 +55,23 @@ pub enum VideoInput {
 /// wndproc forwards captured input to it. `None` ⇒ input is dropped (view-only
 /// or no session), so we never capture when we shouldn't.
 static INPUT_SINK: Mutex<Option<Sender<VideoInput>>> = Mutex::new(None);
+
+/// The rendered video's pixel size (`w<<32 | h`), published by the renderer each
+/// frame. Input normalization MUST use it: the video is drawn in an
+/// aspect-preserving letterbox rect inside the window, so a click's position has
+/// to be normalized over that rect — not the whole window — or it lands offset by
+/// the black-bar size (the "clicks 1cm off" bug). 0 ⇒ not yet known (full window).
+static VIDEO_DIMS: AtomicU64 = AtomicU64::new(0);
+
+/// Renderer publishes the current video size so input maps to the letterbox rect.
+pub fn set_video_size(w: u32, h: u32) {
+    VIDEO_DIMS.store(((w as u64) << 32) | h as u64, Ordering::Relaxed);
+}
+
+fn video_dims() -> (f64, f64) {
+    let v = VIDEO_DIMS.load(Ordering::Relaxed);
+    ((v >> 32) as u32 as f64, (v & 0xffff_ffff) as u32 as f64)
+}
 
 /// Hover-reveal state for the session menu bar (§7): the native video surface
 /// covers the whole client area *including* the web UI's session bar, so pushing
@@ -279,7 +297,8 @@ pub fn fit(hwnd_raw: isize) {
 pub fn hide(hwnd_raw: isize) {
     let hwnd = HWND(hwnd_raw as *mut _);
     REVEAL_OFFSET.store(0, std::sync::atomic::Ordering::SeqCst);
-    // SAFETY: valid child HWND.
+    VIDEO_DIMS.store(0, Ordering::Relaxed); // avoid stale mapping next session
+                                            // SAFETY: valid child HWND.
     unsafe {
         let _ = ShowWindow(hwnd, SW_HIDE);
     }
@@ -307,16 +326,30 @@ fn register_class() {
 // (§7) and forwards it to the engine, which relays it to the host. Capture is
 // gated by the sink being installed — only during a viewer session with control.
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    // Normalized cursor position from lParam (signed 16-bit lo/hi).
+    // Normalized cursor position from lParam (signed 16-bit lo/hi), mapped over
+    // the LETTERBOX rect (must match the renderer's letterbox exactly), so clicks
+    // land where the cursor is on the remote — not offset by the black bars.
     let norm_pos = |lp: LPARAM| -> (f64, f64) {
-        let x = (lp.0 & 0xffff) as i16 as f64;
-        let y = ((lp.0 >> 16) & 0xffff) as i16 as f64;
+        let px = (lp.0 & 0xffff) as i16 as f64;
+        let py = ((lp.0 >> 16) & 0xffff) as i16 as f64;
         let mut rc = RECT::default();
         // SAFETY: valid HWND.
         let _ = unsafe { GetClientRect(hwnd, &mut rc) };
-        let w = (rc.right - rc.left).max(1) as f64;
-        let h = (rc.bottom - rc.top).max(1) as f64;
-        ((x / w).clamp(0.0, 1.0), (y / h).clamp(0.0, 1.0))
+        let cw = (rc.right - rc.left).max(1) as f64;
+        let ch = (rc.bottom - rc.top).max(1) as f64;
+        let (vw, vh) = video_dims();
+        if vw <= 0.0 || vh <= 0.0 {
+            return ((px / cw).clamp(0.0, 1.0), (py / ch).clamp(0.0, 1.0));
+        }
+        // Same letterbox math as the renderer: scale to fit, center.
+        let scale = (cw / vw).min(ch / vh);
+        let (dispw, disph) = (vw * scale, vh * scale);
+        let offx = (cw - dispw) * 0.5;
+        let offy = (ch - disph) * 0.5;
+        (
+            ((px - offx) / dispw).clamp(0.0, 1.0),
+            ((py - offy) / disph).clamp(0.0, 1.0),
+        )
     };
 
     match msg {

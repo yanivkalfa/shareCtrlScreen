@@ -651,28 +651,20 @@ fn apply_low_latency_recipe(api: &ICodecAPI, cfg: &EncoderConfig) {
         &boolv(true),
         "AVLowLatencyMode",
     );
-    // Constant-QUALITY rate control, NOT CBR. This is the readability fix: CBR
-    // gives every frame the same byte budget, so a full-screen keyframe is
-    // coarsely quantized (blocky text) and only *refines* over the next second
-    // as static P-frames spend their budget on detail — the "barely readable
-    // until it gains pixels" look. Constant quality encodes each frame to a
-    // fixed quality: desktop text is sharp on the FIRST frame, and a static
-    // screen costs almost no bandwidth (bits are spent only where pixels
-    // change). Motion bursts spike bandwidth, but the transport's frame-drop
-    // backpressure bounds that. Best-effort: if the encoder rejects quality
-    // mode it keeps its default and the MeanBitRate hint below applies.
+    // CBR rate control, steered live by the adaptive-bitrate controller (§6).
+    // This is what makes it SMOOTH instead of stalling: the target bitrate tracks
+    // the link's actual throughput (the transport's send-queue depth signal), so
+    // the encoder never outruns the link — exactly what the browser's congestion
+    // control did automatically in the Electron build. On a slow link the target
+    // (and thus per-frame quality) drops, but the picture keeps MOVING; on a fast
+    // link it climbs back for sharpness. Resolution is never reduced (the browser's
+    // "maintain-resolution"); frame rate flexes via source pacing.
     set_codec_value(
         api,
         &CODECAPI_AVEncCommonRateControlMode,
-        &u32v(eAVEncCommonRateControlMode_Quality.0 as u32),
-        "RateControlMode=Quality",
+        &u32v(eAVEncCommonRateControlMode_CBR.0 as u32),
+        "RateControlMode=CBR",
     );
-    // 0..100, higher = sharper. 70 balances readable text against FRAME SIZE:
-    // quality 92 produced huge keyframes/scene-change frames that took seconds to
-    // move over a slow relay (stall + "black then fills in"). 70 is still legible
-    // and small enough to flow. (A real BWE loop would tune this live.)
-    set_codec_value(api, &CODECAPI_AVEncCommonQuality, &u32v(70), "Quality=70");
-    // Bitrate hint (used only if quality mode was rejected → VBR/CBR default).
     set_codec_value(
         api,
         &CODECAPI_AVEncCommonMeanBitRate,

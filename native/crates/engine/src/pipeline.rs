@@ -86,6 +86,9 @@ struct Driver {
     /// viewer `KeyframeRequest`). Frames sent before the channel opened are lost
     /// on the wire, so the first *deliverable* frame must restart the decoder.
     force_key: Option<Arc<AtomicBool>>,
+    /// Host: the live target bitrate the adaptive controller steers from the
+    /// send-queue depth. The encode loop reads it and re-tunes the CBR encoder.
+    bitrate: Option<Arc<std::sync::atomic::AtomicU32>>,
     /// The bound UDP socket (candidates were gathered from it before the SDP was
     /// generated, so the peer receives them embedded in the offer/answer).
     socket: std::net::UdpSocket,
@@ -409,12 +412,14 @@ fn parse_stun_mapped_address(buf: &[u8], tid: &[u8; 12]) -> Option<std::net::Soc
     plain
 }
 
-/// Default target bitrate. 8 Mbps floods a cellular/relay path and — with a
-/// software encoder that can't sustain it — pushes latency into seconds; but
-/// 2.5 Mbps at 1080p turns desktop text to mush. 4 Mbps at the 30fps cap is the
-/// sharp-enough middle (same per-frame budget as 8 Mbps at 60fps). A real BWE
-/// loop would adapt this; fixed is the safe interim.
-const DEFAULT_BITRATE: u32 = 4_000_000;
+/// Adaptive-bitrate bounds (§6). The controller starts at DEFAULT and walks
+/// between MIN and MAX using the send-queue depth as the congestion signal.
+/// MIN keeps a usable picture on a bad cellular link; MAX allows sharp text on a
+/// good one. STEP is the additive probe-up per 250ms tick.
+const DEFAULT_BITRATE: u32 = 2_000_000;
+const MIN_BITRATE: u32 = 400_000;
+const MAX_BITRATE: u32 = 12_000_000;
+const BITRATE_STEP: u32 = 400_000;
 
 /// Host encode frame-rate cap. 60fps of software H.264 is what makes this pair
 /// crawl; 30fps halves encode CPU on the host, decode CPU on the viewer, and the
@@ -620,6 +625,7 @@ pub fn begin_host(engine: &Engine, peer: String, permission: Permission) {
         cursor_rx: Some(cursor_rx),
         channels: Some(channels),
         force_key: Some(force_key.clone()),
+        bitrate: Some(bitrate.clone()),
         socket,
         turn: turn_alloc,
         stop: stop.clone(),
@@ -770,6 +776,7 @@ fn start_viewer_transport(engine: &Engine, peer: String, offer_sdp: String) {
         cursor_rx: None,
         channels: None, // learned from ChannelOpen by label
         force_key: None,
+        bitrate: None,
         socket,
         turn: turn_alloc,
         stop: stop.clone(),
@@ -936,6 +943,7 @@ fn transport_driver(d: Driver) {
         cursor_rx,
         channels,
         force_key,
+        bitrate,
         socket,
         mut turn,
         stop,
@@ -976,6 +984,7 @@ fn transport_driver(d: Driver) {
     // stops producing until it drains — fewer frames under load, but every one
     // arrives whole and decodes. ~256KB ≈ 0.5s at 4Mbps: bounded, not compounding.
     const VIDEO_QUEUE_LIMIT: usize = 256 * 1024;
+    let mut last_adapt = std::time::Instant::now();
 
     let mut buf = [0u8; 2048];
     let mut video_count: u64 = 0;
@@ -1027,11 +1036,33 @@ fn transport_driver(d: Driver) {
                 }
                 // Reliable channel: SEND every frame the encoder produced (never
                 // drop — that corrupts the reference chain). Congestion is
-                // handled by pacing the SOURCE: publish the queue depth so the
-                // encode loop stops producing while we're behind.
+                // handled by ADAPTING the bitrate (below) and pacing the SOURCE.
                 let _ = tp.send_video(&au, keyframe);
             }
-            VIDEO_CONGESTED.store(tp.video_buffered() > VIDEO_QUEUE_LIMIT, Ordering::SeqCst);
+            let buffered = tp.video_buffered();
+            VIDEO_CONGESTED.store(buffered > VIDEO_QUEUE_LIMIT, Ordering::SeqCst);
+
+            // Adaptive bitrate (AIMD on the send-queue depth — the same idea as
+            // TCP/GCC congestion control, which is what made the browser smooth).
+            // Queue building ⇒ we're outrunning the link ⇒ back off multiplicatively.
+            // Queue near-empty ⇒ headroom ⇒ probe up additively. This keeps the
+            // encoder's output matched to the link so it never floods and stalls.
+            if let Some(br) = &bitrate {
+                if last_adapt.elapsed() >= std::time::Duration::from_millis(250) {
+                    last_adapt = std::time::Instant::now();
+                    let cur = br.load(Ordering::SeqCst);
+                    let next = if buffered > 128 * 1024 {
+                        (cur * 82 / 100).max(MIN_BITRATE) // link behind — cut fast
+                    } else if buffered < 16 * 1024 {
+                        (cur + BITRATE_STEP).min(MAX_BITRATE) // headroom — probe up
+                    } else {
+                        cur
+                    };
+                    if next != cur {
+                        br.store(next, Ordering::SeqCst);
+                    }
+                }
+            }
         }
         // Host: cursor position updates on the cursor channel (§5a/§7). Stale
         // pre-open positions are worthless — drop, don't buffer.
@@ -1329,9 +1360,10 @@ fn host_media_loop(
                             sent += 1;
                             if sent == 1 || sent % 120 == 0 {
                                 tracing::info!(
-                                    "host: encoded+sent AU #{sent} ({} bytes, keyframe={})",
+                                    "host: encoded+sent AU #{sent} ({} bytes, keyframe={}, bitrate={}kbps)",
                                     u.data.len(),
-                                    u.keyframe
+                                    u.keyframe,
+                                    applied_bitrate / 1000
                                 );
                             }
                             let _ = frame_tx.send((u.data, u.keyframe));

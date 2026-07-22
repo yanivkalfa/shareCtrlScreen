@@ -402,7 +402,16 @@ fn parse_stun_mapped_address(buf: &[u8], tid: &[u8; 12]) -> Option<std::net::Soc
     plain
 }
 
-const DEFAULT_BITRATE: u32 = 8_000_000;
+/// Default target bitrate. 8 Mbps floods a cellular/relay path and — with a
+/// software encoder that can't sustain it — pushes latency into seconds. 2.5 Mbps
+/// is plenty for desktop content at the capped frame rate and leaves headroom on
+/// constrained links. (A real BWE loop would adapt this; fixed is the safe win.)
+const DEFAULT_BITRATE: u32 = 2_500_000;
+
+/// Host encode frame-rate cap. 60fps of software H.264 is what makes this pair
+/// crawl; 30fps halves encode CPU on the host, decode CPU on the viewer, and the
+/// bytes on the wire, and desktop interaction still feels smooth at 30.
+const MAX_FPS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
 
 /// One usable TURN server: `host:port` + long-term credentials.
 struct TurnServer {
@@ -1096,7 +1105,7 @@ fn transport_driver(d: Driver) {
                                 if frame.frame_id != expected
                                     && !frame.keyframe
                                     && last_gap_req.elapsed()
-                                        >= std::time::Duration::from_millis(700)
+                                        >= std::time::Duration::from_millis(1500)
                                 {
                                     tracing::info!(
                                         "viewer: frame gap ({} -> {}) — requesting keyframe",
@@ -1215,8 +1224,19 @@ fn host_media_loop(
     encoder.force_keyframe();
     let mut applied_bitrate = cfg.bitrate_bps;
     let mut sent: u64 = 0;
+    let mut last_frame_at = std::time::Instant::now();
 
     while !stop.load(Ordering::SeqCst) {
+        // Frame-rate cap: never encode faster than MAX_FPS_INTERVAL. The pacing
+        // sleep only bites when we're running FASTER than the cap (a busy screen);
+        // a slow software encoder or an idle screen sets the real rate. This alone
+        // roughly halves host+viewer CPU and the bytes on the wire vs uncapped 60.
+        let since = last_frame_at.elapsed();
+        if since < MAX_FPS_INTERVAL {
+            std::thread::sleep(MAX_FPS_INTERVAL - since);
+        }
+        last_frame_at = std::time::Instant::now();
+
         // §6 adaptive bitrate: feed the current BWE target to the encoder.
         let target = bitrate.load(Ordering::SeqCst);
         if target != applied_bitrate {

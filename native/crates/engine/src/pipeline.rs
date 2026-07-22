@@ -82,6 +82,9 @@ struct Driver {
     /// The bound UDP socket (candidates were gathered from it before the SDP was
     /// generated, so the peer receives them embedded in the offer/answer).
     socket: std::net::UdpSocket,
+    /// TURN allocation when one was obtained: transmits sourced from the relayed
+    /// address are wrapped for the relay; Data Indications are unwrapped.
+    turn: Option<crate::turn::TurnAllocation>,
     stop: Arc<AtomicBool>,
 }
 
@@ -115,12 +118,16 @@ fn local_host_candidates(port: u16) -> Vec<std::net::SocketAddr> {
 
 /// Bind the session UDP socket and register its candidates on `rtc` **before**
 /// the SDP offer/answer is generated, so str0m embeds them and the peer learns
-/// how to reach us. Gathers host candidates (LAN direct path, §6) AND a
-/// server-reflexive (srflx) candidate via STUN (the machine's public `ip:port`),
-/// which is what lets two machines on *different* networks traverse typical NATs.
-/// Symmetric/strict NATs still need TURN (not yet wired). `stun_urls` come from
-/// the config's `iceServers`.
-fn bind_and_gather(rtc: &mut str0m::Rtc, stun_urls: &[String]) -> Option<std::net::UdpSocket> {
+/// how to reach us. Gathers three candidate tiers (§6):
+///   1. host (LAN direct path),
+///   2. server-reflexive via STUN (public `ip:port` — friendly-NAT traversal),
+///   3. relayed via TURN (works behind symmetric/carrier-grade NATs where
+///      hole-punching fails; lowest ICE priority, so it's only used when the
+///      direct paths lose).
+fn bind_and_gather(
+    rtc: &mut str0m::Rtc,
+    ice: &IceConfig,
+) -> Option<(std::net::UdpSocket, Option<crate::turn::TurnAllocation>)> {
     // Bind to the *primary local IP*, not 0.0.0.0. str0m correlates a received
     // packet to a local ICE candidate by the destination address we report on
     // `Input::Receive` — which is `socket.local_addr()`. A wildcard bind makes
@@ -148,7 +155,7 @@ fn bind_and_gather(rtc: &mut str0m::Rtc, stun_urls: &[String]) -> Option<std::ne
     // STUN discovery for the public address (done while the socket is still
     // blocking, with a short read timeout), then switch to non-blocking for the
     // transport loop.
-    if let Some(srflx) = gather_srflx(&socket, stun_urls, &host) {
+    if let Some(srflx) = gather_srflx(&socket, &ice.stun_urls, &host) {
         tracing::info!("STUN srflx candidate: {srflx}");
         // Base = a local host candidate matching the srflx family.
         if let Some(base) = host.iter().find(|a| a.is_ipv4() == srflx.is_ipv4()) {
@@ -160,11 +167,49 @@ fn bind_and_gather(rtc: &mut str0m::Rtc, stun_urls: &[String]) -> Option<std::ne
             }
         }
     } else {
-        tracing::warn!("no STUN srflx candidate — cross-network may fail (need TURN)");
+        tracing::warn!("no STUN srflx candidate — relying on TURN for cross-network");
+    }
+
+    // TURN allocation: the guaranteed cross-network path. First server that
+    // allocates wins; failure just means we fall back to direct-only.
+    let mut turn_alloc = None;
+    for t in &ice.turn_servers {
+        let Some(server) = resolve_first(&t.hostport) else {
+            tracing::warn!("TURN server {} did not resolve", t.hostport);
+            continue;
+        };
+        match crate::turn::TurnAllocation::allocate(&socket, server, &t.username, &t.credential) {
+            Some(alloc) => {
+                // Local base = our bound socket addr (str0m sets the relayed
+                // candidate's transmit `source` to the relayed address, which is
+                // how the driver routes it through the TURN server).
+                match str0m::Candidate::relayed(alloc.relayed, bound, "udp") {
+                    Ok(cand) => {
+                        rtc.add_local_candidate(cand);
+                        turn_alloc = Some(alloc);
+                    }
+                    Err(e) => tracing::warn!("relayed candidate rejected: {e}"),
+                }
+                if turn_alloc.is_some() {
+                    break;
+                }
+            }
+            None => tracing::warn!("TURN allocation failed on {server}"),
+        }
+    }
+    if turn_alloc.is_none() && !ice.turn_servers.is_empty() {
+        tracing::warn!("no TURN allocation — strict-NAT cross-network may fail");
     }
 
     let _ = socket.set_nonblocking(true);
-    Some(socket)
+    Some((socket, turn_alloc))
+}
+
+/// Resolve `host:port` to its first socket address (blocking DNS, bounded by
+/// the OS resolver — acceptable during session setup).
+fn resolve_first(hostport: &str) -> Option<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    hostport.to_socket_addrs().ok()?.next()
 }
 
 /// Bind a UDP socket to the primary local IP (the source address the OS would use
@@ -330,28 +375,79 @@ fn parse_stun_mapped_address(buf: &[u8], tid: &[u8; 12]) -> Option<std::net::Soc
 
 const DEFAULT_BITRATE: u32 = 8_000_000;
 
-/// STUN server URLs from the config's `iceServers` (contract §5). Falls back to
-/// Google's public STUN if none are usable.
-fn stun_urls_from(engine: &Engine) -> Vec<String> {
-    let mut urls: Vec<String> = engine
-        .config()
-        .ice_servers
-        .into_iter()
-        .map(|s| s.urls)
-        .filter(|u| u.starts_with("stun:") || u.starts_with("stuns:"))
-        .collect();
-    // Always append public fallbacks (dedup) so a single slow/blocked server
-    // doesn't lose us the srflx candidate cross-network.
+/// One usable TURN server: `host:port` + long-term credentials.
+struct TurnServer {
+    hostport: String,
+    username: String,
+    credential: String,
+}
+
+/// ICE servers resolved from config (contract §5 `iceServers`) + public
+/// fallbacks.
+struct IceConfig {
+    stun_urls: Vec<String>,
+    turn_servers: Vec<TurnServer>,
+}
+
+/// Parse the config's `iceServers` (contract §5). STUN gets public fallbacks
+/// appended; TURN entries need credentials (`username`/`credential`). A free
+/// public relay (Open Relay / metered.ca) is appended as the TURN fallback so
+/// cross-network works out of the box — swap in your own relay via config for
+/// production traffic.
+fn ice_config_from(engine: &Engine) -> IceConfig {
+    let servers = engine.config().ice_servers;
+    let mut stun_urls: Vec<String> = Vec::new();
+    let mut turn_servers: Vec<TurnServer> = Vec::new();
+
+    for s in servers {
+        let url = s.urls.clone();
+        if url.starts_with("stun:") || url.starts_with("stuns:") {
+            stun_urls.push(url);
+        } else if let Some(rest) = url.strip_prefix("turn:") {
+            // Only UDP transport is supported; "?transport=tcp" entries skip.
+            if url.contains("transport=tcp") {
+                continue;
+            }
+            let hostport = rest.split(['?', '&']).next().unwrap_or(rest).to_string();
+            let hostport = if hostport.contains(':') {
+                hostport
+            } else {
+                format!("{hostport}:3478")
+            };
+            turn_servers.push(TurnServer {
+                hostport,
+                username: s.username.clone().unwrap_or_default(),
+                credential: s.credential.clone().unwrap_or_default(),
+            });
+        }
+    }
+
+    // STUN fallbacks (dedup) so one slow/blocked server doesn't cost the srflx.
     for fallback in [
         "stun:stun.l.google.com:19302",
         "stun:stun1.l.google.com:19302",
         "stun:stun.cloudflare.com:3478",
     ] {
-        if !urls.iter().any(|u| u == fallback) {
-            urls.push(fallback.to_string());
+        if !stun_urls.iter().any(|u| u == fallback) {
+            stun_urls.push(fallback.to_string());
         }
     }
-    urls
+
+    // TURN fallback: Open Relay (free public TURN, openrelayproject creds).
+    if turn_servers.is_empty() {
+        for hostport in ["openrelay.metered.ca:80", "openrelay.metered.ca:443"] {
+            turn_servers.push(TurnServer {
+                hostport: hostport.to_string(),
+                username: "openrelayproject".to_string(),
+                credential: "openrelayproject".to_string(),
+            });
+        }
+    }
+
+    IceConfig {
+        stun_urls,
+        turn_servers,
+    }
 }
 
 /// The negotiated codec for the current/next session (§3), set by the host when
@@ -422,8 +518,8 @@ pub fn begin_host(engine: &Engine, peer: String, permission: Permission) {
     // (the peer learns how to reach us). Then relay the offer through the
     // Cloudflare signaling (opaque `signal.data`, §6).
     let mut rtc = str0m::Rtc::new(std::time::Instant::now());
-    let stun_urls = stun_urls_from(engine);
-    let socket = match bind_and_gather(&mut rtc, &stun_urls) {
+    let ice = ice_config_from(engine);
+    let (socket, turn_alloc) = match bind_and_gather(&mut rtc, &ice) {
         Some(s) => s,
         None => {
             tracing::error!("host: failed to bind UDP socket");
@@ -480,6 +576,7 @@ pub fn begin_host(engine: &Engine, peer: String, permission: Permission) {
         channels: Some(channels),
         force_key: Some(force_key.clone()),
         socket,
+        turn: turn_alloc,
         stop: stop.clone(),
     };
     let t = std::thread::spawn(move || transport_driver(driver));
@@ -536,10 +633,11 @@ fn start_viewer_transport(engine: &Engine, peer: String, offer_sdp: String) {
     let (video_tx, video_rx) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
 
     let mut rtc = str0m::Rtc::new(std::time::Instant::now());
-    // Bind + gather host/srflx candidates before accepting the offer, so the
-    // answer str0m generates carries them back to the host (§6 + NAT traversal).
-    let stun_urls = stun_urls_from(engine);
-    let socket = match bind_and_gather(&mut rtc, &stun_urls) {
+    // Bind + gather host/srflx/relay candidates before accepting the offer, so
+    // the answer str0m generates carries them back to the host (§6 + NAT
+    // traversal).
+    let ice = ice_config_from(engine);
+    let (socket, turn_alloc) = match bind_and_gather(&mut rtc, &ice) {
         Some(s) => s,
         None => {
             tracing::error!("viewer: failed to bind UDP socket");
@@ -596,6 +694,7 @@ fn start_viewer_transport(engine: &Engine, peer: String, offer_sdp: String) {
         channels: None, // learned from ChannelOpen by label
         force_key: None,
         socket,
+        turn: turn_alloc,
         stop: stop.clone(),
     };
     let t = std::thread::spawn(move || transport_driver(driver));
@@ -756,6 +855,7 @@ fn transport_driver(d: Driver) {
         channels,
         force_key,
         socket,
+        mut turn,
         stop,
     } = d;
     use transport::{Inbound, Transport};
@@ -855,16 +955,51 @@ fn transport_driver(d: Driver) {
             }
         }
 
+        // 2.5) TURN housekeeping: refresh the allocation before it expires.
+        if let Some(alloc) = turn.as_mut() {
+            alloc.tick(&socket);
+        }
+
         // 3) Drive str0m: emit transmits, handle timeouts, surface events.
         match tp.poll_output() {
             Ok(str0m::Output::Transmit(t)) => {
-                let _ = socket.send_to(&t.contents, t.destination);
+                // Transmits sourced from the relayed address go via the TURN
+                // server (Send Indication); everything else is direct UDP.
+                let via_relay = turn.as_ref().is_some_and(|alloc| t.source == alloc.relayed);
+                if via_relay {
+                    if let Some(alloc) = turn.as_mut() {
+                        alloc.send_via_relay(&socket, t.destination, &t.contents);
+                    }
+                } else {
+                    let _ = socket.send_to(&t.contents, t.destination);
+                }
             }
             Ok(str0m::Output::Timeout(_)) => {
                 // 4) Pull any pending UDP and feed it in; else advance time.
                 match socket.recv_from(&mut buf) {
                     Ok((n, from)) => {
-                        if let Ok(local) = socket.local_addr() {
+                        // Packets from the TURN server: unwrap Data Indications
+                        // (relayed peer traffic, reported as arriving on the
+                        // relayed address) and consume control responses.
+                        let is_turn_server =
+                            turn.as_ref().is_some_and(|alloc| from == alloc.server);
+                        if is_turn_server {
+                            let alloc = turn.as_mut().expect("checked above");
+                            if let Some((peer, data)) = alloc.handle_server_packet(&buf[..n]) {
+                                let recv = str0m::net::Receive::new(
+                                    str0m::net::Protocol::Udp,
+                                    peer,
+                                    alloc.relayed,
+                                    &data,
+                                );
+                                if let Ok(recv) = recv {
+                                    let _ = tp.handle_input(str0m::Input::Receive(
+                                        std::time::Instant::now(),
+                                        recv,
+                                    ));
+                                }
+                            }
+                        } else if let Ok(local) = socket.local_addr() {
                             let recv = str0m::net::Receive::new(
                                 str0m::net::Protocol::Udp,
                                 from,

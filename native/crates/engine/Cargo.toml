@@ -24,6 +24,11 @@ hex.workspace = true
 
 str0m.workspace = true
 if-addrs = "0.15.0"
+# TURN long-term-credential auth (RFC 5766/5389): HMAC-SHA1 MESSAGE-INTEGRITY
+# over an MD5(user:realm:pass) key. All RustCrypto, MIT OR Apache-2.0.
+hmac = "0.12"
+sha1 = "0.10"
+md-5 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 capture = { path = "../capture" }

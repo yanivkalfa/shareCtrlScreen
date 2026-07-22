@@ -56,8 +56,11 @@ pub fn channel_configs() -> [ChannelConfig; 3] {
             // block a newer frame — our reassembler orders by frame id anyway.
             // Congestion is handled by pacing the SOURCE (the host stops encoding
             // while the send queue is deep), never by dropping encoded frames,
-            // which is what corrupts the reference chain.
-            ordered: false,
+            // which is what corrupts the reference chain. ORDERED so the
+            // reassembler sees fragments in sequence (unordered reliable delivered
+            // them interleaved, which its supersede logic mishandled → partial
+            // frames / the "black then fills in" on a scene change).
+            ordered: true,
             reliability: Reliability::Reliable,
             negotiated: None,
             protocol: String::new(),

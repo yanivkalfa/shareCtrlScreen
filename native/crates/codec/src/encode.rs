@@ -667,10 +667,11 @@ fn apply_low_latency_recipe(api: &ICodecAPI, cfg: &EncoderConfig) {
         &u32v(eAVEncCommonRateControlMode_Quality.0 as u32),
         "RateControlMode=Quality",
     );
-    // 0..100, higher = sharper. 92 keeps small UI text crisp; on a static
-    // desktop it costs little (only changed pixels are coded), and motion bursts
-    // are bounded by the transport's frame-drop backpressure.
-    set_codec_value(api, &CODECAPI_AVEncCommonQuality, &u32v(92), "Quality=92");
+    // 0..100, higher = sharper. 70 balances readable text against FRAME SIZE:
+    // quality 92 produced huge keyframes/scene-change frames that took seconds to
+    // move over a slow relay (stall + "black then fills in"). 70 is still legible
+    // and small enough to flow. (A real BWE loop would tune this live.)
+    set_codec_value(api, &CODECAPI_AVEncCommonQuality, &u32v(70), "Quality=70");
     // Bitrate hint (used only if quality mode was rejected → VBR/CBR default).
     set_codec_value(
         api,

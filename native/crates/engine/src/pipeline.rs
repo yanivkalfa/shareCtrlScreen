@@ -1257,11 +1257,6 @@ fn host_media_loop(
     let mut applied_bitrate = cfg.bitrate_bps;
     let mut sent: u64 = 0;
     let mut last_frame_at = std::time::Instant::now();
-    // Periodic keyframe: an IDR at least this often bounds artifact lifetime and
-    // makes window-switches resolve promptly (reliable delivery means each IDR
-    // fully clears any prior state). ~3s is a good picture/bandwidth balance.
-    const KEYFRAME_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
-    let mut last_keyframe_at = std::time::Instant::now();
 
     while !stop.load(Ordering::SeqCst) {
         // Frame-rate cap: never encode faster than MAX_FPS_INTERVAL. The pacing
@@ -1311,13 +1306,12 @@ fn host_media_loop(
                 }
 
                 // §5a adaptive frame rate: a pointer-only update or a frame with
-                // no changed region costs ~0 — send nothing, don't wake the
-                // encoder into an idle stream. EXCEPT when a keyframe is owed
-                // (channel just opened / viewer requested) OR the periodic resync
-                // is due: a fresh IDR every few seconds bounds how long any
-                // artifact could ever linger and makes window-switches snap in.
-                let periodic_key = last_keyframe_at.elapsed() >= KEYFRAME_INTERVAL;
-                let want_key = force_key.load(Ordering::SeqCst) || periodic_key;
+                // no changed region costs ~0 — send nothing. EXCEPT when a
+                // keyframe is owed (channel just opened / viewer requested). With
+                // reliable delivery no periodic keyframe is needed — nothing is
+                // ever lost, so a scene change is just a (large) delta that
+                // arrives whole. NO more periodic full-screen IDR stalls.
+                let want_key = force_key.load(Ordering::SeqCst);
                 let has_change = !frame.pointer_only
                     && (!frame.dirty_rects.is_empty() || !frame.move_rects.is_empty());
                 if !has_change && !want_key {
@@ -1327,7 +1321,6 @@ fn host_media_loop(
                 if want_key {
                     encoder.force_keyframe();
                     force_key.store(false, Ordering::SeqCst);
-                    last_keyframe_at = std::time::Instant::now();
                 }
                 // BGRA→NV12 + encode happen inside the encoder path (§5b).
                 match encoder.encode(&frame.texture) {

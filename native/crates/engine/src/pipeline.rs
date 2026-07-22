@@ -174,27 +174,42 @@ fn bind_and_gather(
     // allocates wins; failure just means we fall back to direct-only.
     let mut turn_alloc = None;
     for t in &ice.turn_servers {
-        let Some(server) = resolve_first(&t.hostport) else {
-            tracing::warn!("TURN server {} did not resolve", t.hostport);
+        // Resolve to an address of the SAME family as our bound socket. Cloudflare
+        // TURN has both A and AAAA records; picking an IPv6 address for an
+        // IPv4-bound socket makes every send fail and the allocation time out
+        // (exactly what stranded the host — its DNS returned the IPv6 address).
+        let candidates = resolve_all(&t.hostport, bound.is_ipv4());
+        if candidates.is_empty() {
+            tracing::warn!(
+                "TURN server {} did not resolve to a usable address",
+                t.hostport
+            );
             continue;
-        };
-        match crate::turn::TurnAllocation::allocate(&socket, server, &t.username, &t.credential) {
-            Some(alloc) => {
-                // Local base = our bound socket addr (str0m sets the relayed
-                // candidate's transmit `source` to the relayed address, which is
-                // how the driver routes it through the TURN server).
-                match str0m::Candidate::relayed(alloc.relayed, bound, "udp") {
-                    Ok(cand) => {
-                        rtc.add_local_candidate(cand);
-                        turn_alloc = Some(alloc);
-                    }
-                    Err(e) => tracing::warn!("relayed candidate rejected: {e}"),
-                }
-                if turn_alloc.is_some() {
-                    break;
-                }
+        }
+        let mut alloc_opt = None;
+        for server in candidates {
+            if let Some(alloc) =
+                crate::turn::TurnAllocation::allocate(&socket, server, &t.username, &t.credential)
+            {
+                alloc_opt = Some(alloc);
+                break;
             }
-            None => tracing::warn!("TURN allocation failed on {server}"),
+            tracing::warn!("TURN allocation failed on {server}");
+        }
+        if let Some(alloc) = alloc_opt {
+            // Local base = our bound socket addr (str0m sets the relayed
+            // candidate's transmit `source` to the relayed address, which is
+            // how the driver routes it through the TURN server).
+            match str0m::Candidate::relayed(alloc.relayed, bound, "udp") {
+                Ok(cand) => {
+                    rtc.add_local_candidate(cand);
+                    turn_alloc = Some(alloc);
+                }
+                Err(e) => tracing::warn!("relayed candidate rejected: {e}"),
+            }
+        }
+        if turn_alloc.is_some() {
+            break;
         }
     }
     if turn_alloc.is_none() && !ice.turn_servers.is_empty() {
@@ -205,11 +220,25 @@ fn bind_and_gather(
     Some((socket, turn_alloc))
 }
 
-/// Resolve `host:port` to its first socket address (blocking DNS, bounded by
-/// the OS resolver — acceptable during session setup).
-fn resolve_first(hostport: &str) -> Option<std::net::SocketAddr> {
+/// Resolve `host:port` to socket addresses matching the bound socket's family
+/// (`want_ipv4`), so a UDP send can actually reach them. Same-family addresses
+/// first; if none match, falls back to whatever resolved (best-effort).
+fn resolve_all(hostport: &str, want_ipv4: bool) -> Vec<std::net::SocketAddr> {
     use std::net::ToSocketAddrs;
-    hostport.to_socket_addrs().ok()?.next()
+    let Ok(addrs) = hostport.to_socket_addrs() else {
+        return Vec::new();
+    };
+    let all: Vec<std::net::SocketAddr> = addrs.collect();
+    let matching: Vec<std::net::SocketAddr> = all
+        .iter()
+        .copied()
+        .filter(|a| a.is_ipv4() == want_ipv4)
+        .collect();
+    if matching.is_empty() {
+        all
+    } else {
+        matching
+    }
 }
 
 /// Bind a UDP socket to the primary local IP (the source address the OS would use

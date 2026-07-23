@@ -48,20 +48,16 @@ pub fn channel_configs() -> [ChannelConfig; 3] {
     [
         ChannelConfig {
             label: "video".to_string(),
-            // RELIABLE, unordered. Every fragment is retransmitted until it
-            // arrives, so a frame is never partially received — the fix for
-            // "pixels missing" and the never-clearing image on a lossy relay
-            // (a single lost packet used to corrupt every following frame until a
-            // keyframe). Unordered so a lost old fragment doesn't head-of-line
-            // block a newer frame — our reassembler orders by frame id anyway.
-            // Congestion is handled by pacing the SOURCE (the host stops encoding
-            // while the send queue is deep), never by dropping encoded frames,
-            // which is what corrupts the reference chain. ORDERED so the
-            // reassembler sees fragments in sequence (unordered reliable delivered
-            // them interleaved, which its supersede logic mishandled → partial
-            // frames / the "black then fills in" on a scene change).
-            ordered: true,
-            reliability: Reliability::Reliable,
+            // UNRELIABLE, unordered — the ONLY correct choice for real-time video
+            // (this is what RTP/the browser use). A reliable channel head-of-line
+            // blocks: one lost packet on a lossy relay freezes the WHOLE stream
+            // until it's retransmitted → the "stuck on the same image for a long
+            // time" freeze. Unreliable never blocks; loss is repaired instead:
+            // keyframes are FEC-protected ([`fec`]) to survive small loss, and a
+            // lost/undecodable frame triggers a fast keyframe (scene-change /
+            // periodic / viewer PLI request). Latency stays at the floor.
+            ordered: false,
+            reliability: Reliability::MaxRetransmits { retransmits: 0 },
             negotiated: None,
             protocol: String::new(),
         },

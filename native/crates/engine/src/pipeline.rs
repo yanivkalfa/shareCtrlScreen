@@ -89,6 +89,11 @@ struct Driver {
     /// Host: the live target bitrate the adaptive controller steers from the
     /// send-queue depth. The encode loop reads it and re-tunes the CBR encoder.
     bitrate: Option<Arc<std::sync::atomic::AtomicU32>>,
+    /// Notify the UI + reset the role when the transport dies unexpectedly (the
+    /// driver thread has no `&Engine`). This is the fix for "you get disconnected
+    /// but the controller thinks it's still alive with no notification."
+    ui: tokio::sync::mpsc::UnboundedSender<crate::UiEvent>,
+    role: Arc<Mutex<crate::Role>>,
     /// The bound UDP socket (candidates were gathered from it before the SDP was
     /// generated, so the peer receives them embedded in the offer/answer).
     socket: std::net::UdpSocket,
@@ -626,6 +631,8 @@ pub fn begin_host(engine: &Engine, peer: String, permission: Permission) {
         channels: Some(channels),
         force_key: Some(force_key.clone()),
         bitrate: Some(bitrate.clone()),
+        ui: engine.ui_sender(),
+        role: engine.role_handle(),
         socket,
         turn: turn_alloc,
         stop: stop.clone(),
@@ -777,6 +784,8 @@ fn start_viewer_transport(engine: &Engine, peer: String, offer_sdp: String) {
         channels: None, // learned from ChannelOpen by label
         force_key: None,
         bitrate: None,
+        ui: engine.ui_sender(),
+        role: engine.role_handle(),
         socket,
         turn: turn_alloc,
         stop: stop.clone(),
@@ -944,11 +953,30 @@ fn transport_driver(d: Driver) {
         channels,
         force_key,
         bitrate,
+        ui,
+        role,
         socket,
         mut turn,
         stop,
     } = d;
     use transport::{Inbound, Transport};
+
+    // Liveness: report the disconnect to the UI and reset the role exactly once,
+    // however the loop exits (ICE dead, consent lost, inactivity, error). Without
+    // this the controller sits on a dead session with no notification.
+    let notify_dead = {
+        let ui = ui.clone();
+        let role = role.clone();
+        move |reason: &str| {
+            let was_active = !matches!(&*role.lock(), crate::Role::Idle);
+            if was_active {
+                *role.lock() = crate::Role::Idle;
+                let _ = ui.send(crate::UiEvent::Toast(format!("Disconnected: {reason}")));
+                let _ = ui.send(crate::UiEvent::RoleChanged(crate::Role::Idle));
+            }
+            was_active
+        }
+    };
 
     // Host side: injector for remote input, gated by the live control permission.
     let mut injector = inject.as_ref().map(|_| input::Injector::new());
@@ -978,17 +1006,33 @@ fn transport_driver(d: Driver) {
     let mut cursor_open = false;
     let mut ctl_backlog: Vec<Vec<u8>> = Vec::new();
 
-    // Host source-pacing threshold. The video channel is RELIABLE now, so we
-    // never drop encoded frames (that corrupts the H.264 reference chain). When
-    // the send queue exceeds this, we flag VIDEO_CONGESTED and the encode loop
-    // stops producing until it drains — fewer frames under load, but every one
-    // arrives whole and decodes. ~256KB ≈ 0.5s at 4Mbps: bounded, not compounding.
+    // Host source-pacing threshold (video is unreliable, so this just bounds the
+    // send queue for the congestion signal; excess is dropped by SCTP anyway).
     const VIDEO_QUEUE_LIMIT: usize = 256 * 1024;
     let mut last_adapt = std::time::Instant::now();
+
+    // Liveness watchdog: if NOTHING arrives from the peer for this long, the
+    // connection is dead even if ICE hasn't declared it yet. str0m's ICE consent
+    // checks also emit Disconnected within a few seconds; this is the backstop.
+    const DEAD_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+    let mut last_rx = std::time::Instant::now();
+    let mut connected = false; // becomes true on the first Connected event
+
+    // Viewer: PLI. On the unreliable channel a lost fragment drops its frame, so
+    // frame ids skip; that breaks the decoder's reference chain → ask the host
+    // for a keyframe (rate-limited) to resync fast instead of showing corruption.
+    let mut last_frame_id: Option<u32> = None;
+    let mut last_pli = std::time::Instant::now() - std::time::Duration::from_secs(5);
 
     let mut buf = [0u8; 2048];
     let mut video_count: u64 = 0;
     while !stop.load(Ordering::SeqCst) {
+        // Liveness: once connected, no traffic for DEAD_AFTER ⇒ declare it dead.
+        if connected && last_rx.elapsed() > DEAD_AFTER {
+            tracing::warn!("transport: no data for {DEAD_AFTER:?} — declaring dead");
+            notify_dead("no response from the peer");
+            break;
+        }
         // 0) Host: if control was just revoked (view-only), release any input we
         // are holding down so the host is never left with a stuck key/button.
         if let (Some(inj), Some(gate)) = (injector.as_mut(), inject.as_ref()) {
@@ -1034,9 +1078,11 @@ fn transport_driver(d: Driver) {
                     // forced the moment the channel opens.
                     continue;
                 }
-                // Reliable channel: SEND every frame the encoder produced (never
-                // drop — that corrupts the reference chain). Congestion is
-                // handled by ADAPTING the bitrate (below) and pacing the SOURCE.
+                // Send every frame the encoder produced. On the unreliable
+                // channel SCTP itself drops what the link can't carry; we never
+                // pre-drop here (that would corrupt the reference chain even when
+                // the link had room). Congestion is handled by ADAPTING the
+                // bitrate (below) and pacing the SOURCE so we rarely overrun.
                 let _ = tp.send_video(&au, keyframe);
             }
             let buffered = tp.video_buffered();
@@ -1097,6 +1143,8 @@ fn transport_driver(d: Driver) {
                 // 4) Pull any pending UDP and feed it in; else advance time.
                 match socket.recv_from(&mut buf) {
                     Ok((n, from)) => {
+                        // Liveness: any datagram from the peer proves the link.
+                        last_rx = std::time::Instant::now();
                         // Packets from the TURN server: unwrap Data Indications
                         // (relayed peer traffic, reported as arriving on the
                         // relayed address) and consume control responses.
@@ -1143,6 +1191,8 @@ fn transport_driver(d: Driver) {
                 if let Some(inbound) = tp.on_event(ev) {
                     match inbound {
                         Inbound::Connected => {
+                            connected = true;
+                            last_rx = std::time::Instant::now();
                             tracing::info!(
                                 "transport connected ({})",
                                 if inject.is_some() { "host" } else { "viewer" }
@@ -1179,9 +1229,23 @@ fn transport_driver(d: Driver) {
                                     frame.keyframe
                                 );
                             }
-                            // Reliable channel: frames arrive whole and in
-                            // sequence, so there is no lost-frame gap to detect
-                            // or recover from — just hand it to the decoder.
+                            // PLI: a skipped frame id means a fragment (and its
+                            // whole frame) was lost on the unreliable channel →
+                            // the decoder's reference is now broken → ask the host
+                            // for a keyframe to resync fast (rate-limited so a
+                            // lossy link isn't flooded with requests).
+                            if let Some(last) = last_frame_id {
+                                if frame.frame_id != last.wrapping_add(1)
+                                    && !frame.keyframe
+                                    && last_pli.elapsed() >= std::time::Duration::from_millis(500)
+                                {
+                                    let _ = tp.send_ctl(&serialize(
+                                        &protocol::ControlMsg::KeyframeRequest,
+                                    ));
+                                    last_pli = std::time::Instant::now();
+                                }
+                            }
+                            last_frame_id = Some(frame.frame_id);
                             if let Some(tx) = &video_tx {
                                 let _ = tx.send((frame.data, frame.keyframe));
                             }
@@ -1238,6 +1302,7 @@ fn transport_driver(d: Driver) {
                         }
                         Inbound::Disconnected => {
                             tracing::info!("transport disconnected");
+                            notify_dead("the connection dropped");
                             break;
                         }
                     }
@@ -1245,11 +1310,17 @@ fn transport_driver(d: Driver) {
             }
             Err(e) => {
                 tracing::warn!("transport poll error: {e}");
+                notify_dead("transport error");
                 break;
             }
         }
     }
 
+    // If the transport died (role still active), also stop the session's other
+    // threads so nothing keeps running behind a dead connection.
+    if !matches!(&*role.lock(), crate::Role::Idle) {
+        stop.store(true, Ordering::SeqCst);
+    }
     // Host: whatever ends the session (disconnect, teardown, transport error),
     // never leave remotely-injected keys/buttons held down on this machine.
     if let Some(inj) = injector.as_mut() {

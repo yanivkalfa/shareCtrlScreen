@@ -520,4 +520,16 @@ impl Engine {
     pub(crate) fn signaling(&self) -> &SignalingClient {
         &self.signaling
     }
+
+    /// Clone of the UI event sender, so the transport thread can notify the UI
+    /// directly when the connection dies (it doesn't hold `&Engine`).
+    pub(crate) fn ui_sender(&self) -> tokio::sync::mpsc::UnboundedSender<UiEvent> {
+        self.ui.clone()
+    }
+
+    /// Handle to the current role, so the transport thread can reset it to Idle
+    /// on an unexpected disconnect.
+    pub(crate) fn role_handle(&self) -> Arc<Mutex<Role>> {
+        self.role.clone()
+    }
 }

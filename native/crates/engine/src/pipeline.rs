@@ -413,13 +413,17 @@ fn parse_stun_mapped_address(buf: &[u8], tid: &[u8; 12]) -> Option<std::net::Soc
     plain
 }
 
-/// Adaptive-bitrate bounds (§6). The encoder's CBR target tracks str0m's real
-/// BWE (Google Congestion Control), clamped to this range: MIN keeps a usable
-/// picture on a bad cellular link, MAX allows sharp text on a good one. DEFAULT
-/// is the BWE's initial estimate before it has measured the link.
-const DEFAULT_BITRATE: u32 = 2_000_000;
+/// Bitrate policy (§6) — deliberately BORING. The encoder runs a FIXED CBR
+/// target; str0m's BWE (Google Congestion Control) is used only to BACK OFF
+/// below it when the link measurably can't carry it, never to hunt upward.
+/// Chasing the estimate both ways made quality visibly pump (estimate jitter →
+/// bitrate jitter → blur flicker). One stable rate + back-off-on-congestion is
+/// the predictable baseline to iterate from.
+const TARGET_BITRATE: u32 = 3_000_000;
 const MIN_BITRATE: u32 = 400_000;
-const MAX_BITRATE: u32 = 12_000_000;
+/// What we ask the BWE to probe toward — just above TARGET so it can confirm
+/// the link sustains it, without flooding a cellular uplink with padding.
+const DESIRED_BITRATE: u32 = 3_500_000;
 
 /// Host encode frame-rate cap. 60fps of software H.264 is what makes this pair
 /// crawl; 30fps halves encode CPU on the host, decode CPU on the viewer, and the
@@ -575,7 +579,7 @@ pub fn begin_host(engine: &Engine, peer: String, permission: Permission) {
     // type is unambiguous when we resolve it to write frames.
     let mut rtc = {
         let builder = str0m::RtcConfig::new()
-            .enable_bwe(Some(str0m::bwe::Bitrate::bps(DEFAULT_BITRATE as u64)))
+            .enable_bwe(Some(str0m::bwe::Bitrate::bps(TARGET_BITRATE as u64)))
             .clear_codecs();
         let builder = match negotiated_codec() {
             codec::Codec::Hevc => builder.enable_h265(true),
@@ -632,7 +636,7 @@ pub fn begin_host(engine: &Engine, peer: String, permission: Permission) {
     };
 
     let control = Arc::new(AtomicBool::new(permission == Permission::Control));
-    let bitrate = Arc::new(std::sync::atomic::AtomicU32::new(DEFAULT_BITRATE));
+    let bitrate = Arc::new(std::sync::atomic::AtomicU32::new(TARGET_BITRATE));
     let force_key = Arc::new(AtomicBool::new(false));
 
     // Transport driver thread (owns the Rtc + UDP socket).
@@ -1020,7 +1024,7 @@ fn transport_driver(d: Driver) {
     }
     let host_side = frame_rx.is_some();
     if host_side {
-        tp.set_desired_bitrate(MAX_BITRATE);
+        tp.set_desired_bitrate(DESIRED_BITRATE);
     }
 
     // ctl messages are BUFFERED until the ctl channel opens (they're control
@@ -1038,11 +1042,23 @@ fn transport_driver(d: Driver) {
     let mut last_rx = std::time::Instant::now();
     let mut connected = false; // becomes true on the first Connected event
 
-    // Viewer: PLI fallback. str0m NACK-repairs most loss transparently; when a gap
-    // survives its reorder window it delivers a frame with `contiguous=false`,
-    // which breaks the decoder's reference chain → ask the host for a keyframe
-    // (rate-limited) to resync fast instead of showing corruption.
+    // Viewer: NEVER hand the decoder a delta whose reference chain is broken.
+    // str0m NACK-repairs most loss; when a gap survives its reorder window it
+    // delivers the next frame with `contiguous=false`. From that instant every
+    // delta is undecodable garbage (the "random black/smeared pixels") — drop
+    // them all and request a keyframe (rate-limited) until an IDR arrives.
+    let mut drop_till_key = false;
     let mut last_pli = std::time::Instant::now() - std::time::Duration::from_secs(5);
+
+    // Periodic pipeline stats (both sides, every 5s) so field tests yield DATA:
+    // host logs frames/IDRs sent + applied bitrate + last BWE estimate; viewer
+    // logs frames received + gaps + frames dropped while awaiting an IDR.
+    let mut last_stats = std::time::Instant::now();
+    let mut stat_sent: u64 = 0;
+    let mut stat_idr: u64 = 0;
+    let mut stat_gaps: u64 = 0;
+    let mut stat_dropped: u64 = 0;
+    let mut last_est: u32 = 0;
 
     let mut buf = [0u8; 2048];
     let mut video_count: u64 = 0;
@@ -1052,6 +1068,34 @@ fn transport_driver(d: Driver) {
             tracing::warn!("transport: no data for {DEAD_AFTER:?} — declaring dead");
             notify_dead("no response from the peer");
             break;
+        }
+        // Field-test telemetry: one INFO line per 5s per side.
+        if connected && last_stats.elapsed() >= std::time::Duration::from_secs(5) {
+            let secs = last_stats.elapsed().as_secs_f64();
+            last_stats = std::time::Instant::now();
+            if host_side {
+                tracing::info!(
+                    "video/tx: {:.1} fps, {} idr, applied {} kbps, bwe {} kbps",
+                    stat_sent as f64 / secs,
+                    stat_idr,
+                    bitrate
+                        .as_ref()
+                        .map(|b| b.load(Ordering::SeqCst) / 1000)
+                        .unwrap_or(0),
+                    last_est / 1000,
+                );
+            } else {
+                tracing::info!(
+                    "video/rx: {:.1} fps, {} gap(s), {} dropped awaiting idr",
+                    stat_sent as f64 / secs, // viewer: frames received this window
+                    stat_gaps,
+                    stat_dropped,
+                );
+            }
+            stat_sent = 0;
+            stat_idr = 0;
+            stat_gaps = 0;
+            stat_dropped = 0;
         }
         // 0) Host: if control was just revoked (view-only), release any input we
         // are holding down so the host is never left with a stuck key/button.
@@ -1092,11 +1136,15 @@ fn transport_driver(d: Driver) {
             }
         }
         if let Some(frame_rx) = &frame_rx {
-            while let Ok((au, _keyframe)) = frame_rx.try_recv() {
+            while let Ok((au, keyframe)) = frame_rx.try_recv() {
                 // Write onto the RTP media track. str0m packetizes, paces, and
                 // NACK-repairs; it no-ops until the track is connected. The encoder
-                // bitrate is steered by the real BWE estimate (Inbound::BweEstimate
+                // bitrate is steered by the BWE back-off (Inbound::BweEstimate
                 // below), not a hand-rolled send-queue heuristic.
+                stat_sent += 1;
+                if keyframe {
+                    stat_idr += 1;
+                }
                 let _ = tp.send_video(&au);
             }
         }
@@ -1130,24 +1178,45 @@ fn transport_driver(d: Driver) {
                 }
             }
             Ok(str0m::Output::Timeout(_)) => {
-                // 4) Pull any pending UDP and feed it in; else advance time.
-                match socket.recv_from(&mut buf) {
-                    Ok((n, from)) => {
-                        // Liveness: any datagram from the peer proves the link.
-                        last_rx = std::time::Instant::now();
-                        // Packets from the TURN server: unwrap Data Indications
-                        // (relayed peer traffic, reported as arriving on the
-                        // relayed address) and consume control responses.
-                        let is_turn_server =
-                            turn.as_ref().is_some_and(|alloc| from == alloc.server);
-                        if is_turn_server {
-                            let alloc = turn.as_mut().expect("checked above");
-                            if let Some((peer, data)) = alloc.handle_server_packet(&buf[..n]) {
+                // 4) Drain ALL pending UDP into str0m (bounded per cycle), then
+                // advance time if there was nothing. One-packet-per-poll-cycle
+                // couldn't keep up at video rates (~300 pkts/s + NACK + TWCC
+                // feedback), which distorted the BWE's arrival timing and delayed
+                // loss repair. The bound keeps transmits flowing under flood.
+                let mut received = 0u32;
+                while received < 64 {
+                    match socket.recv_from(&mut buf) {
+                        Ok((n, from)) => {
+                            received += 1;
+                            // Liveness: any datagram from the peer proves the link.
+                            last_rx = std::time::Instant::now();
+                            // Packets from the TURN server: unwrap Data Indications
+                            // (relayed peer traffic, reported as arriving on the
+                            // relayed address) and consume control responses.
+                            let is_turn_server =
+                                turn.as_ref().is_some_and(|alloc| from == alloc.server);
+                            if is_turn_server {
+                                let alloc = turn.as_mut().expect("checked above");
+                                if let Some((peer, data)) = alloc.handle_server_packet(&buf[..n]) {
+                                    let recv = str0m::net::Receive::new(
+                                        str0m::net::Protocol::Udp,
+                                        peer,
+                                        alloc.relayed,
+                                        &data,
+                                    );
+                                    if let Ok(recv) = recv {
+                                        let _ = tp.handle_input(str0m::Input::Receive(
+                                            std::time::Instant::now(),
+                                            recv,
+                                        ));
+                                    }
+                                }
+                            } else if let Ok(local) = socket.local_addr() {
                                 let recv = str0m::net::Receive::new(
                                     str0m::net::Protocol::Udp,
-                                    peer,
-                                    alloc.relayed,
-                                    &data,
+                                    from,
+                                    local,
+                                    &buf[..n],
                                 );
                                 if let Ok(recv) = recv {
                                     let _ = tp.handle_input(str0m::Input::Receive(
@@ -1156,25 +1225,13 @@ fn transport_driver(d: Driver) {
                                     ));
                                 }
                             }
-                        } else if let Ok(local) = socket.local_addr() {
-                            let recv = str0m::net::Receive::new(
-                                str0m::net::Protocol::Udp,
-                                from,
-                                local,
-                                &buf[..n],
-                            );
-                            if let Ok(recv) = recv {
-                                let _ = tp.handle_input(str0m::Input::Receive(
-                                    std::time::Instant::now(),
-                                    recv,
-                                ));
-                            }
                         }
+                        Err(_) => break, // WouldBlock — nothing pending
                     }
-                    Err(_) => {
-                        let _ = tp.handle_input(str0m::Input::Timeout(std::time::Instant::now()));
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
+                }
+                if received == 0 {
+                    let _ = tp.handle_input(str0m::Input::Timeout(std::time::Instant::now()));
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                 }
             }
             Ok(str0m::Output::Event(ev)) => {
@@ -1213,23 +1270,37 @@ fn transport_driver(d: Driver) {
                             contiguous,
                         } => {
                             video_count += 1;
-                            if video_count <= 5 || video_count % 120 == 0 {
+                            stat_sent += 1;
+                            if video_count <= 5 {
                                 tracing::info!(
                                     "viewer: received video frame #{video_count} ({} bytes, keyframe={keyframe})",
                                     data.len(),
                                 );
                             }
-                            // A non-contiguous frame means loss survived str0m's
-                            // NACK + reorder window → the decoder's reference chain
-                            // is broken. Ask the host for a keyframe to resync fast
-                            // (rate-limited so a lossy link isn't flooded).
-                            if !contiguous
-                                && !keyframe
-                                && last_pli.elapsed() >= std::time::Duration::from_millis(500)
-                            {
-                                let _ =
-                                    tp.send_ctl(&serialize(&protocol::ControlMsg::KeyframeRequest));
-                                last_pli = std::time::Instant::now();
+                            // CORRECTNESS GATE: a non-contiguous frame means loss
+                            // survived str0m's NACK + reorder window, so every delta
+                            // from here is undecodable garbage (black/smeared
+                            // blocks). Drop them ALL until an IDR arrives; keep
+                            // asking for one (rate-limited) on both paths — native
+                            // RTCP PLI and the reliable ctl channel.
+                            if !contiguous && !keyframe && !drop_till_key {
+                                stat_gaps += 1;
+                                drop_till_key = true;
+                            }
+                            if drop_till_key {
+                                if keyframe {
+                                    drop_till_key = false; // clean restart point
+                                } else {
+                                    stat_dropped += 1;
+                                    if last_pli.elapsed() >= std::time::Duration::from_millis(500) {
+                                        tp.request_keyframe();
+                                        let _ = tp.send_ctl(&serialize(
+                                            &protocol::ControlMsg::KeyframeRequest,
+                                        ));
+                                        last_pli = std::time::Instant::now();
+                                    }
+                                    continue; // NEVER feed a broken delta
+                                }
                             }
                             if let Some(tx) = &video_tx {
                                 let _ = tx.send((data, keyframe));
@@ -1243,11 +1314,23 @@ fn transport_driver(d: Driver) {
                             }
                         }
                         Inbound::BweEstimate(bps) => {
-                            // Host: str0m's congestion control measured the link.
-                            // Steer the encoder's CBR target to it (clamped), so
-                            // output tracks capacity — the browser's smoothness.
+                            // Host: BACK-OFF ONLY. The encoder holds TARGET_BITRATE;
+                            // when the measured link can't carry it, follow the
+                            // estimate down (floored), and back up only to TARGET —
+                            // never chase the estimate upward. A 15% hysteresis
+                            // stops estimate jitter from becoming quality flicker.
+                            last_est = bps;
                             if let Some(br) = &bitrate {
-                                br.store(bps.clamp(MIN_BITRATE, MAX_BITRATE), Ordering::SeqCst);
+                                let next = bps.clamp(MIN_BITRATE, TARGET_BITRATE);
+                                let cur = br.load(Ordering::SeqCst);
+                                if next.abs_diff(cur) * 100 > cur * 15 {
+                                    tracing::info!(
+                                        "bwe: estimate {} kbps → encoder {} kbps",
+                                        bps / 1000,
+                                        next / 1000
+                                    );
+                                    br.store(next, Ordering::SeqCst);
+                                }
                             }
                         }
                         Inbound::Ctl(bytes) => {
@@ -1359,10 +1442,6 @@ fn host_media_loop(
     let mut applied_bitrate = cfg.bitrate_bps;
     let mut sent: u64 = 0;
     let mut last_frame_at = std::time::Instant::now();
-    // Periodic safety keyframe. With CBR the IDR is bounded in size (the earlier
-    // stall was constant-QUALITY IDRs at ~500KB); 2s keeps any glitch short-lived.
-    const KEYFRAME_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-    let mut last_keyframe_at = std::time::Instant::now();
 
     while !stop.load(Ordering::SeqCst) {
         // Frame-rate cap: never encode faster than MAX_FPS_INTERVAL. The pacing
@@ -1399,33 +1478,20 @@ fn host_media_loop(
                     let _ = cursor_tx.send(serde_json::to_vec(&msg).unwrap_or_default());
                 }
 
-                // No source-pacing knob is needed anymore: str0m's pacer meters
-                // egress and its BWE lowers the encoder bitrate to fit the link, so
-                // frame SIZE (not frame count) absorbs congestion — resolution and
-                // frame rate are maintained, exactly like the browser build.
                 let has_change = !frame.pointer_only
                     && (!frame.dirty_rects.is_empty() || !frame.move_rects.is_empty());
 
-                // SCENE CHANGE → keyframe (this is the fix for "I tabbed and it
-                // stayed wrong"). When a large fraction of the screen changed at
-                // once (switching windows, a new page), encoding it as a delta off
-                // the previous frame is both wasteful and fragile — any prior
-                // imperfection carries forward and never clears. A clean IDR
-                // repaints the whole screen correctly, exactly like AnyDesk.
-                let dirty_area: u64 = frame
-                    .dirty_rects
-                    .iter()
-                    .map(|r| (r.right - r.left).max(0) as u64 * (r.bottom - r.top).max(0) as u64)
-                    .sum();
-                let frame_area = (cfg.width as u64) * (cfg.height as u64);
-                let scene_change = has_change && dirty_area * 100 >= frame_area * 50;
-
-                // Periodic safety keyframe: a clean full frame at least this often
-                // bounds how long ANY artifact can linger. CBR keeps each IDR
-                // small enough not to stall (the old stall was quality-92 IDRs).
-                let periodic = last_keyframe_at.elapsed() >= KEYFRAME_INTERVAL;
-
-                let want_key = force_key.load(Ordering::SeqCst) || scene_change || periodic;
+                // KEYFRAMES ON DEMAND ONLY (infinite GOP — the AnyDesk model).
+                // No periodic IDR: at CBR every IDR costs ~10x a delta, so the
+                // encoder crushes its quality and deltas spend the next second
+                // sharpening — a visible blur PULSE every interval ("randomly
+                // blurry, then not"). No scene-change IDR either: a full-screen
+                // change is just a big delta the encoder intra-codes anyway.
+                // Corruption can't linger because the viewer NEVER decodes across
+                // a loss gap (it drops deltas and requests an IDR — see the
+                // transport driver), so on-demand recovery covers everything:
+                // connect, RTCP PLI, ctl KeyframeRequest, capture AccessLost.
+                let want_key = force_key.load(Ordering::SeqCst);
                 if !has_change && !want_key {
                     dup.release();
                     continue;
@@ -1433,7 +1499,6 @@ fn host_media_loop(
                 if want_key {
                     encoder.force_keyframe();
                     force_key.store(false, Ordering::SeqCst);
-                    last_keyframe_at = std::time::Instant::now();
                 }
                 // BGRA→NV12 + encode happen inside the encoder path (§5b).
                 match encoder.encode(&frame.texture) {

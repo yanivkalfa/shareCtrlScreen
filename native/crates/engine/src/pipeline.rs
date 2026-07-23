@@ -31,13 +31,6 @@ static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 /// drawn by the render loop as a client-side sprite (§5a/§7).
 static CURSOR: Mutex<Option<(f64, f64, bool)>> = Mutex::new(None);
 
-/// Host source-pacing signal: the transport driver sets this when the reliable
-/// video channel's send queue is deep (link behind). The capture/encode loop
-/// then stops PRODUCING frames until it drains — pacing the source instead of
-/// dropping already-encoded frames, which would corrupt the reference chain on a
-/// reliable channel. One session at a time, so a global is fine.
-static VIDEO_CONGESTED: AtomicBool = AtomicBool::new(false);
-
 /// The app calls this once, passing the Tauri main-window HWND. We create a
 /// native D3D11 child window under it (§7 Option A) and remember its handle; the
 /// swapchain is created on the child, never on the WebView2 window itself.
@@ -80,8 +73,11 @@ struct Driver {
     inject: Option<Arc<AtomicBool>>,
     /// Host: serialized cursor updates to send on the cursor channel.
     cursor_rx: Option<Receiver<Vec<u8>>>,
-    /// Host: the §6 channel ids created on the Rtc in `begin_host` (exactly once).
+    /// Host: the §6 data-channel ids created on the Rtc in `begin_host`.
     channels: Option<transport::Channels>,
+    /// Host: the video RTP media track's mid (from `add_media`). Viewer learns
+    /// its own from `Event::MediaAdded`, so this is `None` there.
+    video_mid: Option<str0m::media::Mid>,
     /// Host: set to make the encoder emit an IDR (on video-channel open, and on a
     /// viewer `KeyframeRequest`). Frames sent before the channel opened are lost
     /// on the wire, so the first *deliverable* frame must restart the decoder.
@@ -417,14 +413,13 @@ fn parse_stun_mapped_address(buf: &[u8], tid: &[u8; 12]) -> Option<std::net::Soc
     plain
 }
 
-/// Adaptive-bitrate bounds (§6). The controller starts at DEFAULT and walks
-/// between MIN and MAX using the send-queue depth as the congestion signal.
-/// MIN keeps a usable picture on a bad cellular link; MAX allows sharp text on a
-/// good one. STEP is the additive probe-up per 250ms tick.
+/// Adaptive-bitrate bounds (§6). The encoder's CBR target tracks str0m's real
+/// BWE (Google Congestion Control), clamped to this range: MIN keeps a usable
+/// picture on a bad cellular link, MAX allows sharp text on a good one. DEFAULT
+/// is the BWE's initial estimate before it has measured the link.
 const DEFAULT_BITRATE: u32 = 2_000_000;
 const MIN_BITRATE: u32 = 400_000;
 const MAX_BITRATE: u32 = 12_000_000;
-const BITRATE_STEP: u32 = 400_000;
 
 /// Host encode frame-rate cap. 60fps of software H.264 is what makes this pair
 /// crawl; 30fps halves encode CPU on the host, decode CPU on the viewer, and the
@@ -572,7 +567,23 @@ pub fn begin_host(engine: &Engine, peer: String, permission: Permission) {
     // candidates BEFORE generating the offer so str0m embeds them in the SDP
     // (the peer learns how to reach us). Then relay the offer through the
     // Cloudflare signaling (opaque `signal.data`, §6).
-    let mut rtc = str0m::Rtc::new(std::time::Instant::now());
+    //
+    // Enable BWE (Google Congestion Control): str0m measures the link and emits
+    // `EgressBitrateEstimate`, which we feed straight to the encoder's CBR target
+    // (§6) — the real congestion control that made the browser build smooth.
+    // Offer exactly the one negotiated video codec so the media track's payload
+    // type is unambiguous when we resolve it to write frames.
+    let mut rtc = {
+        let builder = str0m::RtcConfig::new()
+            .enable_bwe(Some(str0m::bwe::Bitrate::bps(DEFAULT_BITRATE as u64)))
+            .clear_codecs();
+        let builder = match negotiated_codec() {
+            codec::Codec::Hevc => builder.enable_h265(true),
+            codec::Codec::Av1 => builder.enable_av1(true),
+            codec::Codec::H264 => builder.enable_h264(true),
+        };
+        builder.build(std::time::Instant::now())
+    };
     let ice = ice_config_from(engine);
     let (socket, turn_alloc) = match bind_and_gather(&mut rtc, &ice) {
         Some(s) => s,
@@ -581,21 +592,27 @@ pub fn begin_host(engine: &Engine, peer: String, permission: Permission) {
             return;
         }
     };
-    // Create the three §6 channels exactly once, with their reliability configs
-    // (video/cursor unreliable, ctl reliable) via the direct API. Previously the
-    // SDP api ALSO added a "video"/"ctl"/"cursor" set (default reliable/ordered),
-    // so six channels opened, the viewer's label→id map was ambiguous, and video
-    // could bind to the wrong twin.
+    // Create the two §6 data channels (ctl reliable, cursor unreliable-latest)
+    // exactly once via the direct API. Video is NOT a data channel — it is added
+    // as an RTP media track below.
     let channels = {
-        let [v, c, cur] = transport::channel_configs();
+        let [c, cur] = transport::channel_configs();
         let mut dapi = rtc.direct_api();
-        let video = dapi.create_data_channel(v);
         let ctl = dapi.create_data_channel(c);
         let cursor = dapi.create_data_channel(cur);
-        transport::Channels { video, ctl, cursor }
+        transport::Channels { ctl, cursor }
     };
 
     let mut api = rtc.sdp_api();
+    // The video RTP media track (host → viewer). str0m negotiates it in the offer;
+    // the mid is writable once the answer lands (see `Transport::send_video`).
+    let video_mid = api.add_media(
+        str0m::media::MediaKind::Video,
+        str0m::media::Direction::SendOnly,
+        None,
+        None,
+        None,
+    );
     // One throwaway SDP-negotiated channel forces the m=application section into
     // the offer (the SCTP association the direct channels ride on). Its label is
     // never used for media.
@@ -629,6 +646,7 @@ pub fn begin_host(engine: &Engine, peer: String, permission: Permission) {
         inject: Some(control.clone()),
         cursor_rx: Some(cursor_rx),
         channels: Some(channels),
+        video_mid: Some(video_mid),
         force_key: Some(force_key.clone()),
         bitrate: Some(bitrate.clone()),
         ui: engine.ui_sender(),
@@ -781,7 +799,8 @@ fn start_viewer_transport(engine: &Engine, peer: String, offer_sdp: String) {
         video_tx: Some(video_tx),
         inject: None, // viewer never injects
         cursor_rx: None,
-        channels: None, // learned from ChannelOpen by label
+        channels: None,  // learned from ChannelOpen by label
+        video_mid: None, // learned from Event::MediaAdded
         force_key: None,
         bitrate: None,
         ui: engine.ui_sender(),
@@ -951,6 +970,7 @@ fn transport_driver(d: Driver) {
         inject,
         cursor_rx,
         channels,
+        video_mid,
         force_key,
         bitrate,
         ui,
@@ -990,26 +1010,26 @@ fn transport_driver(d: Driver) {
     // The socket was bound and its host candidates registered before the SDP was
     // generated (see `bind_and_gather`), so the peer already has our candidates.
     let mut tp = Transport::new(rtc);
-    // Host: adopt the channel ids created (exactly once) in `begin_host`.
+    // Host: adopt the data-channel ids + video media-track mid created in
+    // `begin_host`, and tell the BWE how high to probe (up to our max bitrate).
     if let Some(ch) = channels {
         tp.set_channels(ch);
     }
-
-    // Nothing written before a channel opens survives — str0m silently drops it.
-    // So: video frames are DISCARDED until the video channel opens (they'd be
-    // stale anyway; a keyframe is forced at open so the viewer can start), and
-    // ctl messages are BUFFERED until the ctl channel opens (they're control
-    // state like the initial Perm — losing them desyncs the session).
+    if let Some(mid) = video_mid {
+        tp.set_video_mid(mid);
+    }
     let host_side = frame_rx.is_some();
-    let mut video_open = false;
+    if host_side {
+        tp.set_desired_bitrate(MAX_BITRATE);
+    }
+
+    // ctl messages are BUFFERED until the ctl channel opens (they're control
+    // state like the initial Perm — losing them desyncs the session). Video is a
+    // media track: `send_video` no-ops until it's negotiated + connected, and a
+    // keyframe is forced on connect so the first delivered frame is decodable.
     let mut ctl_open = false;
     let mut cursor_open = false;
     let mut ctl_backlog: Vec<Vec<u8>> = Vec::new();
-
-    // Host source-pacing threshold (video is unreliable, so this just bounds the
-    // send queue for the congestion signal; excess is dropped by SCTP anyway).
-    const VIDEO_QUEUE_LIMIT: usize = 256 * 1024;
-    let mut last_adapt = std::time::Instant::now();
 
     // Liveness watchdog: if NOTHING arrives from the peer for this long, the
     // connection is dead even if ICE hasn't declared it yet. str0m's ICE consent
@@ -1018,10 +1038,10 @@ fn transport_driver(d: Driver) {
     let mut last_rx = std::time::Instant::now();
     let mut connected = false; // becomes true on the first Connected event
 
-    // Viewer: PLI. On the unreliable channel a lost fragment drops its frame, so
-    // frame ids skip; that breaks the decoder's reference chain → ask the host
-    // for a keyframe (rate-limited) to resync fast instead of showing corruption.
-    let mut last_frame_id: Option<u32> = None;
+    // Viewer: PLI fallback. str0m NACK-repairs most loss transparently; when a gap
+    // survives its reorder window it delivers a frame with `contiguous=false`,
+    // which breaks the decoder's reference chain → ask the host for a keyframe
+    // (rate-limited) to resync fast instead of showing corruption.
     let mut last_pli = std::time::Instant::now() - std::time::Duration::from_secs(5);
 
     let mut buf = [0u8; 2048];
@@ -1072,42 +1092,12 @@ fn transport_driver(d: Driver) {
             }
         }
         if let Some(frame_rx) = &frame_rx {
-            while let Ok((au, keyframe)) = frame_rx.try_recv() {
-                if !video_open {
-                    // Pre-open frames can never reach the peer; a keyframe is
-                    // forced the moment the channel opens.
-                    continue;
-                }
-                // Send every frame the encoder produced. On the unreliable
-                // channel SCTP itself drops what the link can't carry; we never
-                // pre-drop here (that would corrupt the reference chain even when
-                // the link had room). Congestion is handled by ADAPTING the
-                // bitrate (below) and pacing the SOURCE so we rarely overrun.
-                let _ = tp.send_video(&au, keyframe);
-            }
-            let buffered = tp.video_buffered();
-            VIDEO_CONGESTED.store(buffered > VIDEO_QUEUE_LIMIT, Ordering::SeqCst);
-
-            // Adaptive bitrate (AIMD on the send-queue depth — the same idea as
-            // TCP/GCC congestion control, which is what made the browser smooth).
-            // Queue building ⇒ we're outrunning the link ⇒ back off multiplicatively.
-            // Queue near-empty ⇒ headroom ⇒ probe up additively. This keeps the
-            // encoder's output matched to the link so it never floods and stalls.
-            if let Some(br) = &bitrate {
-                if last_adapt.elapsed() >= std::time::Duration::from_millis(250) {
-                    last_adapt = std::time::Instant::now();
-                    let cur = br.load(Ordering::SeqCst);
-                    let next = if buffered > 128 * 1024 {
-                        (cur * 82 / 100).max(MIN_BITRATE) // link behind — cut fast
-                    } else if buffered < 16 * 1024 {
-                        (cur + BITRATE_STEP).min(MAX_BITRATE) // headroom — probe up
-                    } else {
-                        cur
-                    };
-                    if next != cur {
-                        br.store(next, Ordering::SeqCst);
-                    }
-                }
+            while let Ok((au, _keyframe)) = frame_rx.try_recv() {
+                // Write onto the RTP media track. str0m packetizes, paces, and
+                // NACK-repairs; it no-ops until the track is connected. The encoder
+                // bitrate is steered by the real BWE estimate (Inbound::BweEstimate
+                // below), not a hand-rolled send-queue heuristic.
+                let _ = tp.send_video(&au);
             }
         }
         // Host: cursor position updates on the cursor channel (§5a/§7). Stale
@@ -1193,6 +1183,12 @@ fn transport_driver(d: Driver) {
                         Inbound::Connected => {
                             connected = true;
                             last_rx = std::time::Instant::now();
+                            // Host: the viewer's decoder has no reference yet, and
+                            // anything written before connect was dropped — force an
+                            // IDR so the first *delivered* frame is decodable.
+                            if let Some(fk) = &force_key {
+                                fk.store(true, Ordering::SeqCst);
+                            }
                             tracing::info!(
                                 "transport connected ({})",
                                 if inject.is_some() { "host" } else { "viewer" }
@@ -1201,15 +1197,6 @@ fn transport_driver(d: Driver) {
                         Inbound::ChannelOpen(_, label) => {
                             tracing::info!("data channel open: {label}");
                             match label.as_str() {
-                                "video" => {
-                                    video_open = true;
-                                    // Everything encoded before this instant was
-                                    // dropped, so the viewer's decoder has no
-                                    // reference — restart it with a fresh IDR.
-                                    if let Some(fk) = &force_key {
-                                        fk.store(true, Ordering::SeqCst);
-                                    }
-                                }
                                 "ctl" => {
                                     ctl_open = true;
                                     for bytes in ctl_backlog.drain(..) {
@@ -1220,34 +1207,47 @@ fn transport_driver(d: Driver) {
                                 _ => {} // "init" — SDP bootstrap channel, unused
                             }
                         }
-                        Inbound::Video(frame) => {
+                        Inbound::Video {
+                            data,
+                            keyframe,
+                            contiguous,
+                        } => {
                             video_count += 1;
                             if video_count <= 5 || video_count % 120 == 0 {
                                 tracing::info!(
-                                    "viewer: received video frame #{video_count} ({} bytes, keyframe={})",
-                                    frame.data.len(),
-                                    frame.keyframe
+                                    "viewer: received video frame #{video_count} ({} bytes, keyframe={keyframe})",
+                                    data.len(),
                                 );
                             }
-                            // PLI: a skipped frame id means a fragment (and its
-                            // whole frame) was lost on the unreliable channel →
-                            // the decoder's reference is now broken → ask the host
-                            // for a keyframe to resync fast (rate-limited so a
-                            // lossy link isn't flooded with requests).
-                            if let Some(last) = last_frame_id {
-                                if frame.frame_id != last.wrapping_add(1)
-                                    && !frame.keyframe
-                                    && last_pli.elapsed() >= std::time::Duration::from_millis(500)
-                                {
-                                    let _ = tp.send_ctl(&serialize(
-                                        &protocol::ControlMsg::KeyframeRequest,
-                                    ));
-                                    last_pli = std::time::Instant::now();
-                                }
+                            // A non-contiguous frame means loss survived str0m's
+                            // NACK + reorder window → the decoder's reference chain
+                            // is broken. Ask the host for a keyframe to resync fast
+                            // (rate-limited so a lossy link isn't flooded).
+                            if !contiguous
+                                && !keyframe
+                                && last_pli.elapsed() >= std::time::Duration::from_millis(500)
+                            {
+                                let _ =
+                                    tp.send_ctl(&serialize(&protocol::ControlMsg::KeyframeRequest));
+                                last_pli = std::time::Instant::now();
                             }
-                            last_frame_id = Some(frame.frame_id);
                             if let Some(tx) = &video_tx {
-                                let _ = tx.send((frame.data, frame.keyframe));
+                                let _ = tx.send((data, keyframe));
+                            }
+                        }
+                        Inbound::KeyframeRequest => {
+                            // Host: the peer (or str0m on its behalf) asked for a
+                            // keyframe over RTCP — emit an IDR next frame.
+                            if let Some(fk) = &force_key {
+                                fk.store(true, Ordering::SeqCst);
+                            }
+                        }
+                        Inbound::BweEstimate(bps) => {
+                            // Host: str0m's congestion control measured the link.
+                            // Steer the encoder's CBR target to it (clamped), so
+                            // output tracks capacity — the browser's smoothness.
+                            if let Some(br) = &bitrate {
+                                br.store(bps.clamp(MIN_BITRATE, MAX_BITRATE), Ordering::SeqCst);
                             }
                         }
                         Inbound::Ctl(bytes) => {
@@ -1399,18 +1399,10 @@ fn host_media_loop(
                     let _ = cursor_tx.send(serde_json::to_vec(&msg).unwrap_or_default());
                 }
 
-                // Source pacing: while the reliable send queue is deep, STOP
-                // producing frames (release and skip). Fewer frames under load,
-                // but nothing is dropped mid-flight, so the reference chain stays
-                // intact and every delivered frame decodes whole. When we resume,
-                // the next frame is a delta from the last frame we DID send (the
-                // viewer has it, reliably), so no resync keyframe is needed.
-                if VIDEO_CONGESTED.load(Ordering::SeqCst) && !force_key.load(Ordering::SeqCst) {
-                    dup.release();
-                    std::thread::sleep(std::time::Duration::from_millis(4));
-                    continue;
-                }
-
+                // No source-pacing knob is needed anymore: str0m's pacer meters
+                // egress and its BWE lowers the encoder bitrate to fit the link, so
+                // frame SIZE (not frame count) absorbs congestion — resolution and
+                // frame rate are maintained, exactly like the browser build.
                 let has_change = !frame.pointer_only
                     && (!frame.dirty_rects.is_empty() || !frame.move_rects.is_empty());
 

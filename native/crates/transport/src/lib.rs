@@ -1,25 +1,31 @@
-//! Transport over `str0m` data channels — sans-IO WebRTC, **no jitter buffer,
-//! no threads/timers of its own** (Plan 04 §6). str0m gives standards-compliant
-//! ICE (NAT traversal) + DTLS (encryption) + SCTP framing; we own all I/O and
-//! buffering so latency goes to the floor. It reuses our Cloudflare WebSocket
-//! signaling unchanged (str0m's offer/answer + trickle ICE relayed as the opaque
-//! `signal.data` payload).
+//! Transport over `str0m` — sans-IO WebRTC, **no jitter buffer of our own, no
+//! threads/timers** (Plan 04 §6). str0m gives standards-compliant ICE (NAT
+//! traversal) + DTLS (encryption); we own all I/O so latency goes to the floor.
+//! It reuses our Cloudflare WebSocket signaling unchanged (str0m's offer/answer +
+//! trickle ICE relayed as the opaque `signal.data` payload).
 //!
-//! Three channels mirror §6:
-//! | channel  | reliability                         | carries                        |
-//! |----------|-------------------------------------|--------------------------------|
-//! | `video`  | unreliable (`ordered=false`, 0 rtx) | encoded frames, FEC-protected  |
-//! | `ctl`    | reliable, ordered                   | input, permission, cursor shape|
-//! | `cursor` | unreliable-latest                   | high-rate cursor position      |
+//! **Video rides an RTP media track, not a data channel.** This is the whole
+//! point of the rewrite: a media track gets str0m's real-time video stack —
+//! Google Congestion Control bandwidth estimation (BWE/TWCC), RTP packetization,
+//! automatic NACK loss-repair from the send buffer, pacing, and in-order frame
+//! reassembly with a bounded reorder window. That is exactly what the browser
+//! build used to feel smooth; a data channel only offers general-purpose SCTP
+//! flow control, which is why the data-channel video stalled and never matched
+//! AnyDesk. Control and cursor stay on data channels where reliability/ordering
+//! semantics matter more than a specialized congestion controller.
 //!
-//! Video AUs are app-fragmented ([`packet`]) and keyframes FEC-protected
-//! ([`fec`]); delta frames are dropped rather than retransmitted (Parsec model).
+//! | carrier            | reliability            | carries                      |
+//! |--------------------|------------------------|------------------------------|
+//! | `video` RTP media  | unreliable + NACK + BWE| encoded H.264 frames         |
+//! | `ctl` data channel | reliable, ordered      | input, permission, cursor sh.|
+//! | `cursor` data ch.  | unreliable-latest      | high-rate cursor position    |
 
 pub mod fec;
 pub mod packet;
 
-use packet::{ReassembledFrame, Reassembler};
+use str0m::bwe::BweKind;
 use str0m::channel::{ChannelConfig, ChannelId, Reliability};
+use str0m::media::{Frequency, KeyframeRequestKind, MediaKind, MediaTime, Mid, Pt};
 use str0m::{Event, Input, Output, Rtc, RtcError};
 
 pub use std::time::Instant;
@@ -34,33 +40,20 @@ pub enum Error {
     ChannelClosed(&'static str),
 }
 
-/// The three channel ids once opened (§6).
+/// The two data-channel ids once opened (§6). Video is an RTP media track (see
+/// [`Transport::set_video_mid`]), negotiated via the engine's SDP API, so it is
+/// not a channel here.
 #[derive(Debug, Clone, Copy)]
 pub struct Channels {
-    pub video: ChannelId,
     pub ctl: ChannelId,
     pub cursor: ChannelId,
 }
 
-/// §6 channel configs. The host creates all three when building the offer; the
-/// viewer matches them by label.
-pub fn channel_configs() -> [ChannelConfig; 3] {
+/// The two §6 data-channel configs. The host creates both when building the
+/// offer; the viewer matches them by label. Video is added separately as a media
+/// track in the SDP offer (see `begin_host` in the engine).
+pub fn channel_configs() -> [ChannelConfig; 2] {
     [
-        ChannelConfig {
-            label: "video".to_string(),
-            // UNRELIABLE, unordered — the ONLY correct choice for real-time video
-            // (this is what RTP/the browser use). A reliable channel head-of-line
-            // blocks: one lost packet on a lossy relay freezes the WHOLE stream
-            // until it's retransmitted → the "stuck on the same image for a long
-            // time" freeze. Unreliable never blocks; loss is repaired instead:
-            // keyframes are FEC-protected ([`fec`]) to survive small loss, and a
-            // lost/undecodable frame triggers a fast keyframe (scene-change /
-            // periodic / viewer PLI request). Latency stays at the floor.
-            ordered: false,
-            reliability: Reliability::MaxRetransmits { retransmits: 0 },
-            negotiated: None,
-            protocol: String::new(),
-        },
         ChannelConfig {
             label: "ctl".to_string(),
             ordered: true,
@@ -84,49 +77,69 @@ pub fn channel_configs() -> [ChannelConfig; 3] {
 pub enum Inbound {
     Connected,
     Disconnected,
-    /// A fully reassembled video access unit (viewer side).
-    Video(ReassembledFrame),
+    /// A whole decoded video frame from the RTP media track (viewer side). str0m
+    /// has already depacketized and reassembled it; `contiguous` is false when a
+    /// gap (unrecovered loss) preceded it, which may warrant a keyframe request.
+    Video {
+        data: Vec<u8>,
+        keyframe: bool,
+        contiguous: bool,
+    },
+    /// The remote peer asked us (the host) for a keyframe (PLI/FIR over RTCP).
+    KeyframeRequest,
+    /// A fresh send-bandwidth estimate in bits/sec from str0m's congestion
+    /// control (host side). This is the real BWE that steers the encoder bitrate,
+    /// replacing the old hand-rolled AIMD on the SCTP send-queue depth.
+    BweEstimate(u32),
     /// A reliable control message (host: input; viewer: perm/bye/cursor-shape).
     Ctl(Vec<u8>),
     /// A cursor position update.
     Cursor(Vec<u8>),
-    /// A data channel opened; once all three are known the engine has [`Channels`].
+    /// A data channel opened; once both are known the engine has [`Channels`].
     ChannelOpen(ChannelId, String),
 }
 
-/// str0m wrapper holding the three channels and the video reassembler.
+/// str0m wrapper holding the data channels and the video media track.
 pub struct Transport {
     rtc: Rtc,
-    video: Option<ChannelId>,
     ctl: Option<ChannelId>,
     cursor: Option<ChannelId>,
-    reassembler: Reassembler,
-    next_frame_id: u32,
+    /// The video RTP media track's mid. Host: set from `add_media` via
+    /// [`Self::set_video_mid`]. Viewer: learned from `Event::MediaAdded`.
+    video_mid: Option<Mid>,
+    /// Negotiated video payload type + clock, resolved lazily on first send once
+    /// the SDP answer is in (the remote PTs aren't known before that).
+    video_pt: Option<Pt>,
+    video_freq: Option<Frequency>,
+    /// Monotonic origin for RTP media timestamps.
+    media_start: Instant,
 }
 
 impl Transport {
-    /// Wrap an already-built [`Rtc`]. The host builds it as offerer and creates
-    /// the channels via [`Self::create_channels`]; the viewer receives them via
-    /// `Event::ChannelOpen`.
+    /// Wrap an already-built [`Rtc`]. The host builds it as offerer (adding the
+    /// video media track + data channels), the viewer as answerer.
     pub fn new(rtc: Rtc) -> Self {
         Self {
             rtc,
-            video: None,
             ctl: None,
             cursor: None,
-            reassembler: Reassembler::new(),
-            next_frame_id: 0,
+            video_mid: None,
+            video_pt: None,
+            video_freq: None,
+            media_start: Instant::now(),
         }
     }
 
-    /// Host side: adopt the three §6 channel ids created on the `Rtc` before it
-    /// was handed to this transport (they must be created exactly once — creating
-    /// a second set under the same labels makes the viewer's label→id mapping
-    /// ambiguous and doubles every ChannelOpen).
+    /// Host side: adopt the two §6 data-channel ids created on the `Rtc` before it
+    /// was handed to this transport.
     pub fn set_channels(&mut self, ch: Channels) {
-        self.video = Some(ch.video);
         self.ctl = Some(ch.ctl);
         self.cursor = Some(ch.cursor);
+    }
+
+    /// Host side: adopt the video media track's mid returned by `add_media`.
+    pub fn set_video_mid(&mut self, mid: Mid) {
+        self.video_mid = Some(mid);
     }
 
     pub fn rtc_mut(&mut self) -> &mut Rtc {
@@ -144,33 +157,63 @@ impl Transport {
         Ok(())
     }
 
-    /// Bytes currently queued (unsent) on the video channel's SCTP stream. The
-    /// congestion signal for host-side backpressure: when the link can't drain
-    /// this, queueing more frames only adds latency — drop instead (§6).
-    pub fn video_buffered(&mut self) -> usize {
-        match self.video {
-            Some(id) => self
-                .rtc
-                .channel(id)
-                .map(|mut ch| ch.buffered_amount())
-                .unwrap_or(0),
-            None => 0,
-        }
+    /// Host: tell the BWE the bitrate we'd like to eventually reach, so it probes
+    /// up toward it. The actual estimate comes back via
+    /// `Event::EgressBitrateEstimate` → [`Inbound::BweEstimate`].
+    pub fn set_desired_bitrate(&mut self, bps: u32) {
+        self.rtc
+            .bwe()
+            .set_desired_bitrate(str0m::bwe::Bitrate::bps(bps as u64));
     }
 
-    /// Send an encoded access unit on the unreliable video channel: fragment to
-    /// ≤MTU datagrams (§6). Keyframe framing is tagged so the viewer can request
-    /// FEC/priority; FEC recovery shards for keyframes are added by the caller.
-    pub fn send_video(&mut self, au: &[u8], keyframe: bool) -> Result<(), Error> {
-        let id = self.video.ok_or(Error::ChannelClosed("video"))?;
-        let frame_id = self.next_frame_id;
-        self.next_frame_id = self.next_frame_id.wrapping_add(1);
-        for frag in packet::fragment(frame_id, keyframe, au) {
-            if let Some(mut ch) = self.rtc.channel(id) {
-                ch.write(true, &frag.0)?;
+    /// Host: write one encoded H.264 access unit (Annex-B) onto the video media
+    /// track. str0m packetizes it into RTP (FU-A as needed), paces it, and repairs
+    /// loss via NACK from its send buffer. A no-op until the track is negotiated
+    /// and connected — str0m drops pre-connect media anyway, and the engine forces
+    /// a keyframe on connect so the first *delivered* frame is decodable.
+    pub fn send_video(&mut self, au: &[u8]) -> Result<(), Error> {
+        let Some(mid) = self.video_mid else {
+            return Ok(());
+        };
+        // Resolve the negotiated PT + clock once. `payload_params()` is filtered by
+        // the remote's PTs, which are only populated after the answer is accepted;
+        // before that it's empty and we skip (the frame would be dropped anyway).
+        if self.video_pt.is_none() {
+            let resolved = self.rtc.writer(mid).and_then(|w| {
+                w.payload_params()
+                    .next()
+                    .map(|p| (p.pt(), p.spec().clock_rate))
+            });
+            if let Some((pt, freq)) = resolved {
+                self.video_pt = Some(pt);
+                self.video_freq = Some(freq);
             }
         }
+        let (Some(pt), Some(freq)) = (self.video_pt, self.video_freq) else {
+            return Ok(());
+        };
+
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.media_start);
+        // RTP timestamp in the codec clock (90 kHz for video).
+        let ticks = (elapsed.as_micros() as u64) * freq.get() as u64 / 1_000_000;
+        let rtp_time = MediaTime::new(ticks, freq);
+
+        if let Some(writer) = self.rtc.writer(mid) {
+            writer.write(pt, now, rtp_time, au)?;
+        }
         Ok(())
+    }
+
+    /// Viewer: ask the sender for a fresh keyframe via native RTCP PLI. (The
+    /// engine also has a reliable `ctl`-channel keyframe request; this is the
+    /// RTP-native path, used when str0m's reorder window reports a gap.)
+    pub fn request_keyframe(&mut self) {
+        if let Some(mid) = self.video_mid {
+            if let Some(mut writer) = self.rtc.writer(mid) {
+                let _ = writer.request_keyframe(None, KeyframeRequestKind::Pli);
+            }
+        }
     }
 
     /// Send a reliable control payload (input event / perm / bye).
@@ -191,8 +234,8 @@ impl Transport {
         Ok(())
     }
 
-    /// Route a str0m [`Event`] into an [`Inbound`], reassembling video fragments.
-    /// Returns `None` for events the engine does not need to act on.
+    /// Route a str0m [`Event`] into an [`Inbound`]. Returns `None` for events the
+    /// engine does not need to act on.
     pub fn on_event(&mut self, event: Event) -> Option<Inbound> {
         match event {
             Event::Connected => {
@@ -207,10 +250,36 @@ impl Transport {
                     None
                 }
             }
+            Event::MediaAdded(m) => {
+                // Viewer: learn the incoming video track's mid (host set it from
+                // add_media). Nothing for the engine to act on directly.
+                if m.kind == MediaKind::Video {
+                    self.video_mid = Some(m.mid);
+                    tracing::info!("transport: video media track added ({:?})", m.mid);
+                }
+                None
+            }
+            Event::MediaData(d) => {
+                if d.data.is_empty() {
+                    return None;
+                }
+                Some(Inbound::Video {
+                    keyframe: d.is_keyframe(),
+                    contiguous: d.contiguous,
+                    data: d.data.to_vec(),
+                })
+            }
+            Event::KeyframeRequest(_) => Some(Inbound::KeyframeRequest),
+            Event::EgressBitrateEstimate(kind) => {
+                let bps = match kind {
+                    BweKind::Twcc(b) | BweKind::Remb(_, b) => b.as_u64(),
+                    _ => return None,
+                };
+                Some(Inbound::BweEstimate(bps.min(u32::MAX as u64) as u32))
+            }
             Event::ChannelOpen(id, label) => {
                 // Learn ids on the viewer side (channels created by the host).
                 match label.as_str() {
-                    "video" => self.video = Some(id),
                     "ctl" => self.ctl = Some(id),
                     "cursor" => self.cursor = Some(id),
                     _ => {}
@@ -218,9 +287,7 @@ impl Transport {
                 Some(Inbound::ChannelOpen(id, label))
             }
             Event::ChannelData(data) => {
-                if Some(data.id) == self.video {
-                    self.reassembler.push(&data.data).map(Inbound::Video)
-                } else if Some(data.id) == self.ctl {
+                if Some(data.id) == self.ctl {
                     Some(Inbound::Ctl(data.data))
                 } else if Some(data.id) == self.cursor {
                     Some(Inbound::Cursor(data.data))

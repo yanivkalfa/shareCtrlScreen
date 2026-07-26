@@ -293,6 +293,24 @@ pub fn fit(hwnd_raw: isize) {
     }
 }
 
+/// The video child window's current client size in pixels. The viewer reports
+/// this to the host so the host can encode at exactly this size — presenting 1:1
+/// instead of resampling every frame on display.
+pub fn client_size(hwnd_raw: isize) -> (u32, u32) {
+    let hwnd = HWND(hwnd_raw as *mut _);
+    let mut rc = RECT::default();
+    // SAFETY: valid child HWND; GetClientRect only fills the rect.
+    unsafe {
+        if GetClientRect(hwnd, &mut rc).is_err() {
+            return (0, 0);
+        }
+    }
+    (
+        (rc.right - rc.left).max(0) as u32,
+        (rc.bottom - rc.top).max(0) as u32,
+    )
+}
+
 /// Hide the video surface (back to the home screen / settings overlay).
 pub fn hide(hwnd_raw: isize) {
     let hwnd = HWND(hwnd_raw as *mut _);

@@ -31,6 +31,11 @@ static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 /// drawn by the render loop as a client-side sprite (§5a/§7).
 static CURSOR: Mutex<Option<(f64, f64, bool)>> = Mutex::new(None);
 
+/// Host: the viewer's reported display size (`width<<32 | height`, 0 = unknown).
+/// The capture/encode loop scales to this so the viewer presents 1:1 instead of
+/// resampling every frame. One session at a time, so a global is fine.
+static VIEW_SIZE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The app calls this once, passing the Tauri main-window HWND. We create a
 /// native D3D11 child window under it (§7 Option A) and remember its handle; the
 /// swapchain is created on the child, never on the WebView2 window itself.
@@ -571,6 +576,8 @@ pub fn set_codec_from_str(s: &str) {
 /// and start the capture→encode→transport pipeline.
 pub fn begin_host(engine: &Engine, peer: String, permission: Permission) {
     teardown(engine); // ensure clean slate
+                      // Start at the native screen size; the viewer reports its own once it renders.
+    VIEW_SIZE.store(0, Ordering::SeqCst);
     let stop = Arc::new(AtomicBool::new(false));
     let (signal_tx, signal_rx) = std::sync::mpsc::channel::<SignalData>();
     let (ctl_tx, ctl_rx) = std::sync::mpsc::channel::<Vec<u8>>();
@@ -1369,6 +1376,20 @@ fn transport_driver(d: Driver) {
                                 }
                                 continue;
                             }
+                            // Host: the viewer told us its display size — encode to
+                            // exactly that so it presents 1:1 (no resampling blur)
+                            // and we don't spend bits on pixels it never shows.
+                            if host_side {
+                                if let Ok(protocol::ControlMsg::ViewSize { width, height }) =
+                                    serde_json::from_slice::<protocol::ControlMsg>(&bytes)
+                                {
+                                    VIEW_SIZE.store(
+                                        ((width as u64) << 32) | height as u64,
+                                        Ordering::SeqCst,
+                                    );
+                                    continue;
+                                }
+                            }
                             // Host: inbound ctl is remote input — inject it,
                             // gated on the current control permission (§4.1).
                             if let (Some(inj), Some(gate)) = (injector.as_mut(), inject.as_ref()) {
@@ -1431,6 +1452,24 @@ fn transport_driver(d: Driver) {
     }
 }
 
+/// The largest `src`-aspect size that fits inside `want`, never upscaling past
+/// `src`, rounded to even dimensions (H.264 chroma is subsampled 2x2 and MFTs
+/// reject odd sizes). Preserving the source aspect matters: the viewer letterboxes
+/// to the same ratio, so anything else would be displayed with bars AND rescaled.
+fn fit_within(want: (u32, u32), src: (u32, u32)) -> (u32, u32) {
+    if want.0 == 0 || want.1 == 0 || src.0 == 0 || src.1 == 0 {
+        return src;
+    }
+    // Scale by the tighter of the two axes, capped at 1.0 (no upscaling — it
+    // would cost bitrate without adding any real detail).
+    let sx = want.0 as f64 / src.0 as f64;
+    let sy = want.1 as f64 / src.1 as f64;
+    let s = sx.min(sy).min(1.0);
+    let w = ((src.0 as f64 * s).round() as u32) & !1;
+    let h = ((src.1 as f64 * s).round() as u32) & !1;
+    (w.max(2), h.max(2))
+}
+
 // ---- Host capture → encode --------------------------------------------------
 
 fn host_media_loop(
@@ -1471,6 +1510,9 @@ fn host_media_loop(
     // The first emitted frame must be an IDR so the viewer can start decoding.
     encoder.force_keyframe();
     let mut applied_bitrate = cfg.bitrate_bps;
+    let mut encoder_size = (cfg.width, cfg.height);
+    // A viewer size the encoder refused — don't retry it every frame.
+    let mut rejected_size: Option<(u32, u32)> = None;
     let mut sent: u64 = 0;
     let mut last_frame_at = std::time::Instant::now();
 
@@ -1501,6 +1543,47 @@ fn host_media_loop(
             let _ = encoder.set_bitrate(target);
             applied_bitrate = target;
             cfg.bitrate_bps = target;
+        }
+
+        // Encode at the size the viewer actually displays (never upscaling past
+        // our own screen), so it presents 1:1 with no resampling. The GPU
+        // converter already scales, so this costs nothing extra — and encoding
+        // fewer pixels puts more bits into each one. Rebuild only on a material
+        // change; the viewer debounces, and every rebuild costs a keyframe.
+        let want = match VIEW_SIZE.load(Ordering::SeqCst) {
+            0 => (cap_w, cap_h),
+            v => {
+                let (vw, vh) = ((v >> 32) as u32, v as u32);
+                fit_within((vw, vh), (cap_w, cap_h))
+            }
+        };
+        if want != encoder_size && want.0 >= 2 && want.1 >= 2 && rejected_size != Some(want) {
+            tracing::info!(
+                "host: re-encoding at {}x{} (was {}x{})",
+                want.0,
+                want.1,
+                encoder_size.0,
+                encoder_size.1
+            );
+            cfg.width = want.0;
+            cfg.height = want.1;
+            match Encoder::new(dup.device(), cfg) {
+                Ok(e) => {
+                    encoder = e;
+                    encoder.force_keyframe(); // new SPS/PPS — restart the decoder
+                    applied_bitrate = cfg.bitrate_bps;
+                    encoder_size = want;
+                    rejected_size = None;
+                }
+                Err(e) => {
+                    // Keep streaming at the working size; remember the bad one so
+                    // we don't rebuild-storm on every frame.
+                    tracing::warn!("host: encoder rebuild at {want:?} failed ({e}) — keeping size");
+                    cfg.width = encoder_size.0;
+                    cfg.height = encoder_size.1;
+                    rejected_size = Some(want);
+                }
+            }
         }
 
         // Drain the bucket by what the LINK (not the encoder target) could have
@@ -1636,9 +1719,33 @@ fn viewer_media_loop(
     // Catch-up state: after locally dumping a delta backlog, deltas are useless
     // (their reference frames were skipped) until the requested IDR arrives.
     let mut awaiting_keyframe = false;
+    // Tell the host what size we're actually displaying at, so it encodes to that
+    // and we can present 1:1 (no resampling blur). Debounced: a drag-resize would
+    // otherwise rebuild the host's encoder on every intermediate size.
+    let mut reported_size: (u32, u32) = (0, 0);
+    let mut size_settled_at = std::time::Instant::now();
+    let mut pending_size: (u32, u32) = (0, 0);
     while !stop.load(Ordering::SeqCst) {
         // Track window resizes (and hover-reveal offsets) — no-op when unchanged.
         render::window::fit(hwnd_raw);
+        {
+            let now_size = render::window::client_size(hwnd_raw);
+            if now_size != pending_size {
+                pending_size = now_size; // still moving — restart the debounce
+                size_settled_at = std::time::Instant::now();
+            } else if now_size != reported_size
+                && now_size.0 >= 320
+                && now_size.1 >= 240
+                && size_settled_at.elapsed() >= std::time::Duration::from_millis(600)
+            {
+                reported_size = now_size;
+                tracing::info!("viewer: requesting {}x{} from host", now_size.0, now_size.1);
+                let _ = ctl_tx.send(serialize(&protocol::ControlMsg::ViewSize {
+                    width: now_size.0,
+                    height: now_size.1,
+                }));
+            }
+        }
         match video_rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(first) => {
                 // Batch-drain the queue, then CATCH UP instead of falling behind
@@ -1766,8 +1873,31 @@ fn create_render_device(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_stun_mapped_address;
+    use super::{fit_within, parse_stun_mapped_address};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn fit_within_never_upscales() {
+        // A viewer window bigger than the screen must not inflate the encode.
+        assert_eq!(fit_within((3840, 2160), (1920, 1080)), (1920, 1080));
+    }
+
+    #[test]
+    fn fit_within_preserves_aspect_and_evenness() {
+        // Maximized 1080p viewer: some height lost to chrome. The result keeps
+        // 16:9 (the viewer letterboxes to that) and stays even for 4:2:0 chroma.
+        let (w, h) = fit_within((1920, 1040), (1920, 1080));
+        assert_eq!((w, h), (1848, 1040));
+        assert_eq!(w % 2, 0);
+        assert_eq!(h % 2, 0);
+    }
+
+    #[test]
+    fn fit_within_handles_degenerate_input() {
+        // Unknown/zero sizes fall back to the source rather than producing 0x0.
+        assert_eq!(fit_within((0, 0), (1920, 1080)), (1920, 1080));
+        assert_eq!(fit_within((1280, 720), (0, 0)), (0, 0));
+    }
 
     #[test]
     fn parses_xor_mapped_address_ipv4() {

@@ -32,6 +32,13 @@ pub enum ControlMsg {
         #[serde(default = "default_visible", skip_serializing_if = "is_true")]
         visible: bool,
     },
+    /// Viewer → Host: the pixel size the viewer is actually displaying video at.
+    /// The host encodes to exactly this (never upscaling past its own screen), so
+    /// the viewer can present 1:1. Otherwise the frame is resampled on display —
+    /// at a non-integer ratio that visibly softens every glyph — and bits are
+    /// spent on pixels the viewer never shows.
+    #[serde(rename = "vsize")]
+    ViewSize { width: u32, height: u32 },
 }
 
 fn default_visible() -> bool {

@@ -44,13 +44,32 @@ impl Default for EncoderConfig {
         Self {
             width: 1920,
             height: 1080,
-            fps_num: 60,
+            // MUST match the rate the capture loop actually feeds us. CBR rate
+            // control divides the bitrate target by the DECLARED frame rate to
+            // get a per-frame bit budget: declaring 60 while feeding 30 gave
+            // every frame HALF the bits it was entitled to and put only half the
+            // configured bitrate on the wire. That single mismatch was the
+            // largest cause of the blurry picture.
+            fps_num: 30,
             fps_den: 1,
             bitrate_bps: 8_000_000,
             codec: Codec::H264,
         }
     }
 }
+
+/// Quality floor: the worst quantizer the encoder may use (H.264 QP is 0–51,
+/// where higher = blurrier; the MF default is 51, i.e. "blur without limit").
+///
+/// This is the knob that makes a remote desktop READABLE. With plain CBR the
+/// encoder will destroy detail without bound to hit its bit target, which is why
+/// text turned to mush on a constrained link. Capping QP means the encoder
+/// refuses to go below this quality: when the content needs more bits than the
+/// target allows, it overshoots the bitrate instead — and the caller responds by
+/// sending FEWER FRAMES, not worse ones (source pacing in the engine). Slower,
+/// readable motion beats fast mush. ~32 is roughly the "text stays legible"
+/// point, matching RustDesk's max-quantizer policy scaled to H.264's range.
+const MAX_QP: u32 = 32;
 
 /// A configured MF encoder bound to the shared D3D11 device. Hardware MFTs run
 /// the async event pump with zero-copy GPU input; the software fallback (the
@@ -671,6 +690,10 @@ fn apply_low_latency_recipe(api: &ICodecAPI, cfg: &EncoderConfig) {
         &u32v(cfg.bitrate_bps),
         "MeanBitRate",
     );
+    // QUALITY FLOOR (see MAX_QP). Static property — must be set before
+    // MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, which is where this recipe runs.
+    // H.264 encoders are required to support it; best-effort like the rest.
+    set_codec_value(api, &CODECAPI_AVEncVideoMaxQP, &u32v(MAX_QP), "MaxQP");
     // Zero B-frames — mandatory (reorder delay would blow the budget).
     set_codec_value(
         api,
@@ -681,14 +704,16 @@ fn apply_low_latency_recipe(api: &ICodecAPI, cfg: &EncoderConfig) {
     // Long GOP: no frequent periodic IDR (LTR recovery instead). Some H.264 MFTs
     // reject u32::MAX, so use a large finite value they accept.
     set_codec_value(api, &CODECAPI_AVEncMPVGOPSize, &u32v(600), "GOPSize");
-    // Favor SPEED over quality-per-bit (0=fastest, 100=best). Matters most for
-    // the software encoder, where per-frame CPU time IS the latency floor; a
-    // hardware MFT largely ignores it. Best-effort like the rest.
+    // Favor QUALITY over speed (0=fastest, 100=best). We previously asked for 33
+    // — explicitly trading away the sharpness this app exists to deliver. For a
+    // desktop stream the content is mostly static, so the encoder has CPU budget
+    // to spare; spend it on detail. Frame rate is the thing we're willing to
+    // give up under load, not legibility.
     set_codec_value(
         api,
         &CODECAPI_AVEncCommonQualityVsSpeed,
-        &u32v(33),
-        "QualityVsSpeed=33",
+        &u32v(66),
+        "QualityVsSpeed=66",
     );
 }
 

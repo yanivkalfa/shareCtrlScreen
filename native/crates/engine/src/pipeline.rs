@@ -82,9 +82,14 @@ struct Driver {
     /// viewer `KeyframeRequest`). Frames sent before the channel opened are lost
     /// on the wire, so the first *deliverable* frame must restart the decoder.
     force_key: Option<Arc<AtomicBool>>,
-    /// Host: the live target bitrate the adaptive controller steers from the
-    /// send-queue depth. The encode loop reads it and re-tunes the CBR encoder.
+    /// Host: the encoder's CBR target — BWE clamped to [MIN_BITRATE, TARGET].
+    /// Floored on purpose: below MIN a 1080p desktop can't stay legible.
     bitrate: Option<Arc<std::sync::atomic::AtomicU32>>,
+    /// Host: the RAW measured link capacity from BWE, unfloored. The source pacer
+    /// drains against THIS, not `bitrate` — if the link genuinely carries less
+    /// than the quality floor we must send fewer FRAMES, not pretend the capacity
+    /// exists and sit in permanent congestion.
+    link: Option<Arc<std::sync::atomic::AtomicU32>>,
     /// Notify the UI + reset the role when the transport dies unexpectedly (the
     /// driver thread has no `&Engine`). This is the fix for "you get disconnected
     /// but the controller thinks it's still alive with no notification."
@@ -413,22 +418,27 @@ fn parse_stun_mapped_address(buf: &[u8], tid: &[u8; 12]) -> Option<std::net::Soc
     plain
 }
 
-/// Bitrate policy (§6) — deliberately BORING. The encoder runs a FIXED CBR
-/// target; str0m's BWE (Google Congestion Control) is used only to BACK OFF
-/// below it when the link measurably can't carry it, never to hunt upward.
-/// Chasing the estimate both ways made quality visibly pump (estimate jitter →
-/// bitrate jitter → blur flicker). One stable rate + back-off-on-congestion is
-/// the predictable baseline to iterate from.
-const TARGET_BITRATE: u32 = 3_000_000;
-const MIN_BITRATE: u32 = 400_000;
+/// Bitrate policy (§6). H.264 needs real headroom to keep TEXT sharp — the
+/// Electron build this rewrite replaced ran at 8 Mbps and looked right; the 3
+/// Mbps "safe baseline" tried here was a large part of why the native build
+/// looked like mush. The floor is deliberately high for the same reason: below
+/// ~2.5 Mbps a 1080p desktop cannot stay legible, so when the link can't carry
+/// that we spend FRAMES instead of sharpness (see the source pacer).
+const TARGET_BITRATE: u32 = 8_000_000;
+const MIN_BITRATE: u32 = 2_500_000;
 /// What we ask the BWE to probe toward — just above TARGET so it can confirm
 /// the link sustains it, without flooding a cellular uplink with padding.
-const DESIRED_BITRATE: u32 = 3_500_000;
+const DESIRED_BITRATE: u32 = 9_000_000;
 
-/// Host encode frame-rate cap. 60fps of software H.264 is what makes this pair
-/// crawl; 30fps halves encode CPU on the host, decode CPU on the viewer, and the
-/// bytes on the wire, and desktop interaction still feels smooth at 30.
-const MAX_FPS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+/// Host encode frame-rate cap (30fps). NOTE: `EncoderConfig::fps_num` MUST match
+/// this — CBR budgets bits per DECLARED frame, so a mismatch silently halves
+/// both per-frame quality and the bitrate actually used.
+const MAX_FPS: u32 = 30;
+const MAX_FPS_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(1000 / MAX_FPS as u64);
+/// Never pace the source below this — under a truly bad link we want a slow but
+/// still-updating picture, not a slideshow that looks frozen.
+const MIN_FPS: u32 = 4;
 
 /// One usable TURN server: `host:port` + long-term credentials.
 struct TurnServer {
@@ -637,6 +647,7 @@ pub fn begin_host(engine: &Engine, peer: String, permission: Permission) {
 
     let control = Arc::new(AtomicBool::new(permission == Permission::Control));
     let bitrate = Arc::new(std::sync::atomic::AtomicU32::new(TARGET_BITRATE));
+    let link = Arc::new(std::sync::atomic::AtomicU32::new(TARGET_BITRATE));
     let force_key = Arc::new(AtomicBool::new(false));
 
     // Transport driver thread (owns the Rtc + UDP socket).
@@ -653,6 +664,7 @@ pub fn begin_host(engine: &Engine, peer: String, permission: Permission) {
         video_mid: Some(video_mid),
         force_key: Some(force_key.clone()),
         bitrate: Some(bitrate.clone()),
+        link: Some(link.clone()),
         ui: engine.ui_sender(),
         role: engine.role_handle(),
         socket,
@@ -664,8 +676,9 @@ pub fn begin_host(engine: &Engine, peer: String, permission: Permission) {
     // Host capture→encode thread (own D3D11 device shared capture↔encode).
     let stop_m = stop.clone();
     let bitrate_m = bitrate.clone();
+    let link_m = link.clone();
     let m = std::thread::spawn(move || {
-        if let Err(e) = host_media_loop(frame_tx, cursor_tx, bitrate_m, force_key, stop_m) {
+        if let Err(e) = host_media_loop(frame_tx, cursor_tx, bitrate_m, link_m, force_key, stop_m) {
             tracing::warn!("host media loop ended: {e}");
         }
     });
@@ -807,6 +820,7 @@ fn start_viewer_transport(engine: &Engine, peer: String, offer_sdp: String) {
         video_mid: None, // learned from Event::MediaAdded
         force_key: None,
         bitrate: None,
+        link: None,
         ui: engine.ui_sender(),
         role: engine.role_handle(),
         socket,
@@ -977,6 +991,7 @@ fn transport_driver(d: Driver) {
         video_mid,
         force_key,
         bitrate,
+        link: link_bw,
         ui,
         role,
         socket,
@@ -1314,18 +1329,23 @@ fn transport_driver(d: Driver) {
                             }
                         }
                         Inbound::BweEstimate(bps) => {
-                            // Host: BACK-OFF ONLY. The encoder holds TARGET_BITRATE;
-                            // when the measured link can't carry it, follow the
-                            // estimate down (floored), and back up only to TARGET —
-                            // never chase the estimate upward. A 15% hysteresis
-                            // stops estimate jitter from becoming quality flicker.
                             last_est = bps;
+                            // The pacer needs the RAW capacity to decide how many
+                            // frames the link can actually carry.
+                            if let Some(lk) = &link_bw {
+                                lk.store(bps.max(100_000), Ordering::SeqCst);
+                            }
+                            // The encoder's target is the estimate FLOORED at
+                            // MIN_BITRATE: quality never drops below legible, even
+                            // when that means the link can't take every frame.
+                            // 15% hysteresis stops estimate jitter from becoming
+                            // visible quality flicker.
                             if let Some(br) = &bitrate {
                                 let next = bps.clamp(MIN_BITRATE, TARGET_BITRATE);
                                 let cur = br.load(Ordering::SeqCst);
                                 if next.abs_diff(cur) * 100 > cur * 15 {
                                     tracing::info!(
-                                        "bwe: estimate {} kbps → encoder {} kbps",
+                                        "bwe: link {} kbps → encoder {} kbps",
                                         bps / 1000,
                                         next / 1000
                                     );
@@ -1417,6 +1437,7 @@ fn host_media_loop(
     frame_tx: Sender<(Vec<u8>, bool)>,
     cursor_tx: Sender<Vec<u8>>,
     bitrate: Arc<std::sync::atomic::AtomicU32>,
+    link: Arc<std::sync::atomic::AtomicU32>,
     force_key: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1424,18 +1445,28 @@ fn host_media_loop(
 
     let mut dup = capture::Duplicator::new(0, 0)?;
     let codec = negotiated_codec();
+    // Encode at the screen's REAL size. Assuming 1920x1080 made the GPU
+    // converter rescale every frame on any other monitor (soft picture, wrong
+    // aspect) — the viewer adapts to whatever size actually arrives.
+    let (cap_w, cap_h) = dup.dimensions();
     let mut cfg = EncoderConfig {
         codec,
         bitrate_bps: bitrate.load(Ordering::SeqCst),
-        ..Default::default()
+        // Even dimensions: H.264 chroma is subsampled 2x2 and MFTs reject odd sizes.
+        width: (cap_w & !1).max(2),
+        height: (cap_h & !1).max(2),
+        fps_num: MAX_FPS,
+        fps_den: 1,
     };
     // Encoder shares the capture device (§5c zero-copy).
     let mut encoder = Encoder::new(dup.device(), cfg)?;
     tracing::info!(
-        "host: capture+encoder ready ({}x{}, {})",
+        "host: capture+encoder ready ({}x{} @{}fps, {}, {} kbps)",
         cfg.width,
         cfg.height,
-        codec.as_caps_str()
+        MAX_FPS,
+        codec.as_caps_str(),
+        cfg.bitrate_bps / 1000,
     );
     // The first emitted frame must be an IDR so the viewer can start decoding.
     encoder.force_keyframe();
@@ -1443,11 +1474,21 @@ fn host_media_loop(
     let mut sent: u64 = 0;
     let mut last_frame_at = std::time::Instant::now();
 
+    // Source pacing = the "readable but slower" trade, made explicit. The encoder
+    // now has a hard QUALITY floor (codec::MAX_QP), so when the screen needs more
+    // bits than the link can carry it OVERSHOOTS the bitrate instead of blurring.
+    // This token bucket absorbs that: we track the bytes actually produced and,
+    // when we're ahead of what the link can drain, we skip capturing the next
+    // frame rather than let the encoder degrade. Sharpness is preserved; frame
+    // rate is what gives. (Bucket is capped at ~1s of credit so an idle screen
+    // can still burst a full keyframe out immediately when something changes.)
+    let mut debt_bytes: i64 = 0;
+    let mut last_debt_at = std::time::Instant::now();
+
     while !stop.load(Ordering::SeqCst) {
         // Frame-rate cap: never encode faster than MAX_FPS_INTERVAL. The pacing
         // sleep only bites when we're running FASTER than the cap (a busy screen);
-        // a slow software encoder or an idle screen sets the real rate. This alone
-        // roughly halves host+viewer CPU and the bytes on the wire vs uncapped 60.
+        // a slow software encoder or an idle screen sets the real rate.
         let since = last_frame_at.elapsed();
         if since < MAX_FPS_INTERVAL {
             std::thread::sleep(MAX_FPS_INTERVAL - since);
@@ -1460,6 +1501,23 @@ fn host_media_loop(
             let _ = encoder.set_bitrate(target);
             applied_bitrate = target;
             cfg.bitrate_bps = target;
+        }
+
+        // Drain the bucket by what the LINK (not the encoder target) could have
+        // carried since the last pass. These differ on a bad link: the encoder is
+        // floored at MIN_BITRATE to stay legible, so if real capacity is below
+        // that, the difference has to come out of the frame rate.
+        let link_bps = link.load(Ordering::SeqCst).max(100_000);
+        let elapsed = last_debt_at.elapsed();
+        last_debt_at = std::time::Instant::now();
+        let drained = (link_bps as f64 / 8.0 * elapsed.as_secs_f64()) as i64;
+        debt_bytes = (debt_bytes - drained).max(0);
+        // More than MIN_FPS's worth of unsent credit? Skip this capture rather
+        // than pile more onto a link that hasn't drained the last frame yet.
+        let max_debt = (link_bps as i64 / 8) / MIN_FPS as i64;
+        if debt_bytes > max_debt && !force_key.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            continue;
         }
 
         match dup.acquire(std::time::Duration::from_millis(16)) {
@@ -1505,6 +1563,10 @@ fn host_media_loop(
                     Ok(units) => {
                         for u in units {
                             sent += 1;
+                            // Charge the pacing bucket with what we actually
+                            // produced — with a QP floor this can exceed the CBR
+                            // target, and paying for it in frames is the point.
+                            debt_bytes += u.data.len() as i64;
                             if sent == 1 || sent % 120 == 0 {
                                 tracing::info!(
                                     "host: encoded+sent AU #{sent} ({} bytes, keyframe={}, bitrate={}kbps)",

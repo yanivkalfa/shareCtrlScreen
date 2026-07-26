@@ -260,11 +260,31 @@ impl Decoder {
                     // 1080 frame size back onto it fails with MF_E_INVALIDMEDIATYPE.
                     // Then retry — the frame is still pending inside the transform.
                     tracing::debug!("decoder: output format change — adopting new NV12 type");
-                    let (_, coded_h) = adopt_decoder_output_type(&self.transform, self.output_id)?;
+                    let (coded, disp) = adopt_decoder_output_type(&self.transform, self.output_id)?;
                     // Source chroma plane starts at stride*coded_height (1088 for
                     // 1080p) — remember it for the upload copy.
-                    if coded_h > 0 {
-                        self.src_height = coded_h;
+                    if coded.1 > 0 {
+                        self.src_height = coded.1;
+                    }
+                    // Adopt the stream's REAL display size. The caller's
+                    // constructor size is only a hint (the host encodes at its
+                    // own screen resolution, which we can't know in advance);
+                    // trusting the hint on a non-1080p host produced a
+                    // wrong-sized upload texture and a garbled picture.
+                    if disp.0 > 0 && disp.1 > 0 && (disp.0, disp.1) != (self.width, self.height) {
+                        tracing::info!(
+                            "decoder: stream is {}x{} (was {}x{}) — resizing",
+                            disp.0,
+                            disp.1,
+                            self.width,
+                            self.height
+                        );
+                        self.width = disp.0;
+                        self.height = disp.1;
+                        // Force the software upload textures to be rebuilt at the
+                        // new size on the next frame.
+                        self.upload_staging = None;
+                        self.upload_tex = None;
                     }
                     continue;
                 }
@@ -619,14 +639,17 @@ fn set_decoder_input_type(
     Ok(())
 }
 
+/// A `(width, height)` pixel size.
+type Size = (u32, u32);
+
 /// After `MF_E_TRANSFORM_STREAM_CHANGE`: pick the decoder's advertised NV12
 /// output type unmodified (its frame size is authoritative — e.g. 1920x1088 for
-/// coded 1080p) and return the coded `(width, height)` so the upload path reads
-/// the chroma plane from the right offset.
+/// coded 1080p). Returns `(coded, display)`: the coded size locates the chroma
+/// plane for the upload copy, the display size is what should actually be shown.
 fn adopt_decoder_output_type(
     transform: &IMFTransform,
     output_id: u32,
-) -> Result<(u32, u32), Error> {
+) -> Result<(Size, Size), Error> {
     // SAFETY: standard available-type iteration.
     unsafe {
         let mut i = 0u32;
@@ -634,16 +657,41 @@ fn adopt_decoder_output_type(
             let sub = mt.GetGUID(&MF_MT_SUBTYPE).unwrap_or_default();
             if sub == MFVideoFormat_NV12 {
                 let size = mt.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(0);
-                let (w, h) = ((size >> 32) as u32, size as u32);
+                let coded = ((size >> 32) as u32, size as u32);
                 let stride = mt.GetUINT32(&MF_MT_DEFAULT_STRIDE).unwrap_or(0);
-                tracing::info!("decoder: new output type NV12 {w}x{h} (stride {stride})");
+                let disp = display_aperture(&mt).unwrap_or(coded);
+                tracing::info!(
+                    "decoder: new output type NV12 coded {}x{}, display {}x{} (stride {stride})",
+                    coded.0,
+                    coded.1,
+                    disp.0,
+                    disp.1
+                );
                 transform.SetOutputType(output_id, &mt, 0)?;
-                return Ok((w, h));
+                return Ok((coded, disp));
             }
             i += 1;
         }
     }
     Err(Error::NoDecoder(Codec::H264))
+}
+
+/// The type's minimum display aperture, i.e. the visible rectangle after the
+/// codec's cropping (H.264 codes 1080 as 1088 and crops it away here). Returns
+/// `None` when the MFT publishes no aperture, in which case the coded size is
+/// the display size.
+fn display_aperture(mt: &IMFMediaType) -> Option<Size> {
+    // MFVideoArea layout: MFOffset OffsetX (4B), MFOffset OffsetY (4B),
+    // SIZE Area { LONG cx, LONG cy } (8B) = 16 bytes total.
+    let mut buf = [0u8; 16];
+    // SAFETY: buffer is exactly one MFVideoArea; GetBlob only writes into it.
+    unsafe {
+        mt.GetBlob(&MF_MT_MINIMUM_DISPLAY_APERTURE, &mut buf, None)
+            .ok()?;
+    }
+    let cx = i32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    let cy = i32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+    (cx > 0 && cy > 0).then_some((cx as u32, cy as u32))
 }
 
 fn set_decoder_output_type(

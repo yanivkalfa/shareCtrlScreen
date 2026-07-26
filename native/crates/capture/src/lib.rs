@@ -30,7 +30,7 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_U
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutput5,
     IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_NOT_FOUND,
-    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT,
+    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT,
     DXGI_OUTDUPL_POINTER_POSITION, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
 };
 
@@ -114,6 +114,17 @@ impl Duplicator {
             last_cursor_pos: POINT::default(),
             cursor_visible: false,
         })
+    }
+
+    /// The duplicated output's real pixel size. The encoder MUST be built from
+    /// this rather than an assumed 1920x1080: any mismatch makes the GPU
+    /// converter rescale every frame (`VideoProcessorBlt` stretches to the
+    /// encoder's size), which silently softens the whole picture — and on a
+    /// non-16:9 monitor distorts it too.
+    pub fn dimensions(&self) -> (u32, u32) {
+        // SAFETY: valid duplication; GetDesc just returns the descriptor.
+        let desc: DXGI_OUTDUPL_DESC = unsafe { self.dupl.GetDesc() };
+        (desc.ModeDesc.Width, desc.ModeDesc.Height)
     }
 
     /// The D3D11 device — shared with the encoder (§5c: one device for capture

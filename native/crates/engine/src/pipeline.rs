@@ -1090,6 +1090,7 @@ fn transport_driver(d: Driver) {
     let mut stat_idr: u64 = 0;
     let mut stat_gaps: u64 = 0;
     let mut stat_dropped: u64 = 0;
+    let mut stat_pli: u64 = 0;
     let mut last_est: u32 = 0;
 
     let mut buf = [0u8; 2048];
@@ -1123,9 +1124,10 @@ fn transport_driver(d: Driver) {
             last_stats = std::time::Instant::now();
             if host_side {
                 tracing::info!(
-                    "video/tx: {:.1} fps, {} idr, applied {} kbps, bwe {} kbps",
+                    "video/tx: {:.1} fps, {} idr, {} pli in, applied {} kbps, bwe {} kbps",
                     stat_sent as f64 / secs,
                     stat_idr,
+                    stat_pli,
                     bitrate
                         .as_ref()
                         .map(|b| b.load(Ordering::SeqCst) / 1000)
@@ -1144,6 +1146,7 @@ fn transport_driver(d: Driver) {
             stat_idr = 0;
             stat_gaps = 0;
             stat_dropped = 0;
+            stat_pli = 0;
         }
         // 0) Host: if control was just revoked (view-only), release any input we
         // are holding down so the host is never left with a stuck key/button.
@@ -1360,7 +1363,12 @@ fn transport_driver(d: Driver) {
                         }
                         Inbound::KeyframeRequest => {
                             // Host: the peer (or str0m on its behalf) asked for a
-                            // keyframe over RTCP — emit an IDR next frame.
+                            // keyframe over RTCP. Counted, because this path was
+                            // invisible in the field logs while the ctl-channel
+                            // requests were counted — leaving most IDRs
+                            // unattributed. The host rate-limits what it actually
+                            // emits (see `host_media_loop`).
+                            stat_pli += 1;
                             if let Some(fk) = &force_key {
                                 fk.store(true, Ordering::SeqCst);
                             }
@@ -1564,6 +1572,15 @@ fn host_media_loop(
     let mut debt_bytes: i64 = 0;
     let mut last_debt_at = std::time::Instant::now();
 
+    // Keyframe rate limiting + attribution (see the emit site below). The first
+    // keyframe must not be delayed, so start the clock a full gap in the past.
+    const MIN_KEYFRAME_GAP: std::time::Duration = std::time::Duration::from_millis(1000);
+    let mut last_keyframe_at = std::time::Instant::now() - MIN_KEYFRAME_GAP;
+    let mut requested_idr: u32 = 0; // we asked for it (connect / PLI / resize)
+    let mut encoder_idr: u32 = 0; // Media Foundation decided on its own
+    let mut deferred_keys: u32 = 0; // requests the rate limiter held back
+    let mut last_key_log = std::time::Instant::now();
+
     while !stop.load(Ordering::SeqCst) {
         // Frame-rate cap: never encode faster than MAX_FPS_INTERVAL. The pacing
         // sleep only bites when we're running FASTER than the cap (a busy screen);
@@ -1623,6 +1640,21 @@ fn host_media_loop(
             }
         }
 
+        // Where keyframes actually come from — the open question the field logs
+        // could not answer, because a request-side counter can't see the ones
+        // Media Foundation inserts by itself.
+        if last_key_log.elapsed() >= std::time::Duration::from_secs(5) {
+            last_key_log = std::time::Instant::now();
+            if requested_idr + encoder_idr + deferred_keys > 0 {
+                tracing::info!(
+                    "keyframes/5s: {requested_idr} requested, {encoder_idr} encoder-initiated, {deferred_keys} deferred"
+                );
+            }
+            requested_idr = 0;
+            encoder_idr = 0;
+            deferred_keys = 0;
+        }
+
         // Drain the bucket by what the LINK (not the encoder target) could have
         // carried since the last pass. These differ on a bad link: the encoder is
         // floored at MIN_BITRATE to stay legible, so if real capacity is below
@@ -1669,20 +1701,46 @@ fn host_media_loop(
                 // a loss gap (it drops deltas and requests an IDR — see the
                 // transport driver), so on-demand recovery covers everything:
                 // connect, RTCP PLI, ctl KeyframeRequest, capture AccessLost.
+                // RATE-LIMITED. Field logs showed 3-5 IDRs every 5 seconds on
+                // idle content, and each one is a burst big enough to spike the
+                // relay's queuing delay — which congestion control reads as
+                // congestion, collapsing the estimate from ~5 Mbps to ~150 kbps.
+                // The pacer then starves the viewer, the starved viewer asks for
+                // a keyframe, and the loop feeds itself. Honouring at most one
+                // request per MIN_KEYFRAME_GAP breaks it at the narrowest point.
+                // A request is never dropped, only deferred: `force_key` stays
+                // set and fires as soon as the gap has elapsed.
                 let want_key = force_key.load(Ordering::SeqCst);
-                if !has_change && !want_key {
+                let key_now = want_key && last_keyframe_at.elapsed() >= MIN_KEYFRAME_GAP;
+                if want_key && !key_now {
+                    deferred_keys += 1;
+                }
+                if !has_change && !key_now {
                     dup.release();
                     continue;
                 }
-                if want_key {
+                if key_now {
                     encoder.force_keyframe();
                     force_key.store(false, Ordering::SeqCst);
+                    last_keyframe_at = std::time::Instant::now();
                 }
                 // BGRA→NV12 + encode happen inside the encoder path (§5b).
                 match encoder.encode(&frame.texture) {
                     Ok(units) => {
                         for u in units {
                             sent += 1;
+                            // Attribute every IDR. An IDR we did NOT ask for is
+                            // the encoder's own doing (Media Foundation runs its
+                            // own scene-change detection and honours GOPSize), and
+                            // that is the one keyframe source we cannot see from
+                            // the request side — so count it separately.
+                            if u.keyframe {
+                                if key_now {
+                                    requested_idr += 1;
+                                } else {
+                                    encoder_idr += 1;
+                                }
+                            }
                             // Charge the pacing bucket with what we actually
                             // produced — with a QP floor this can exceed the CBR
                             // target, and paying for it in frames is the point.

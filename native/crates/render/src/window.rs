@@ -56,12 +56,18 @@ pub enum VideoInput {
 /// or no session), so we never capture when we shouldn't.
 static INPUT_SINK: Mutex<Option<Sender<VideoInput>>> = Mutex::new(None);
 
+/// A file drop on the video surface: the paths, plus WHERE on the remote screen
+/// they landed (normalized over the letterbox rect, exactly like a click). The
+/// host focuses the window under that point before pasting, so the file goes
+/// where it was aimed.
+pub type FileDrop = (Vec<std::path::PathBuf>, f64, f64);
+
 /// Files dropped onto the video surface, for push-to-host transfer. Installed by
 /// the viewer session; `None` ⇒ drops are ignored.
-static FILE_DROP_SINK: Mutex<Option<Sender<Vec<std::path::PathBuf>>>> = Mutex::new(None);
+static FILE_DROP_SINK: Mutex<Option<Sender<FileDrop>>> = Mutex::new(None);
 
 /// Start accepting dropped files on the video window and route them to `tx`.
-pub fn set_file_drop_sink(tx: Sender<Vec<std::path::PathBuf>>) {
+pub fn set_file_drop_sink(tx: Sender<FileDrop>) {
     if let Ok(mut g) = FILE_DROP_SINK.lock() {
         *g = Some(tx);
     }
@@ -98,10 +104,19 @@ fn drop_target_hwnd() -> isize {
 
 /// Pull the dropped paths out of a `WM_DROPFILES` handle and hand them to the
 /// sink. Always frees the drop handle, including when there is no sink.
-fn deliver_dropped_files(wparam: WPARAM) {
-    use windows::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP};
+fn deliver_dropped_files(hwnd: HWND, wparam: WPARAM) {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::Shell::{DragFinish, DragQueryFileW, DragQueryPoint, HDROP};
     let hdrop = HDROP(wparam.0 as *mut _);
     let mut paths = Vec::new();
+    // Where in the video the user let go — this is what lets the host paste into
+    // the window the file was aimed at, instead of just filing it away.
+    let mut pt = POINT::default();
+    // SAFETY: hdrop is valid until DragFinish; pt is an out-param.
+    let drop_at = unsafe {
+        let _ = DragQueryPoint(hdrop, &mut pt);
+        normalize_client(hwnd, pt.x as f64, pt.y as f64)
+    };
     // SAFETY: hdrop comes straight from WM_DROPFILES and is freed below.
     unsafe {
         // Passing u32::MAX as the index asks for the count.
@@ -126,7 +141,7 @@ fn deliver_dropped_files(wparam: WPARAM) {
     }
     if let Ok(guard) = FILE_DROP_SINK.lock() {
         if let Some(tx) = guard.as_ref() {
-            let _ = tx.send(paths);
+            let _ = tx.send((paths, drop_at.0, drop_at.1));
         }
     }
 }
@@ -146,6 +161,31 @@ pub fn set_video_size(w: u32, h: u32) {
 fn video_dims() -> (f64, f64) {
     let v = VIDEO_DIMS.load(Ordering::Relaxed);
     ((v >> 32) as u32 as f64, (v & 0xffff_ffff) as u32 as f64)
+}
+
+/// Map a client-area pixel position to a normalized `[0,1]` position over the
+/// LETTERBOX rect — the same math the renderer uses to place the video, so a
+/// click (or a file drop) lands where the cursor actually is on the remote,
+/// rather than offset by the black bars.
+fn normalize_client(hwnd: HWND, px: f64, py: f64) -> (f64, f64) {
+    let mut rc = RECT::default();
+    // SAFETY: valid HWND.
+    let _ = unsafe { GetClientRect(hwnd, &mut rc) };
+    let cw = (rc.right - rc.left).max(1) as f64;
+    let ch = (rc.bottom - rc.top).max(1) as f64;
+    let (vw, vh) = video_dims();
+    if vw <= 0.0 || vh <= 0.0 {
+        return ((px / cw).clamp(0.0, 1.0), (py / ch).clamp(0.0, 1.0));
+    }
+    // Same letterbox math as the renderer: scale to fit, center.
+    let scale = (cw / vw).min(ch / vh);
+    let (dispw, disph) = (vw * scale, vh * scale);
+    let offx = (cw - dispw) * 0.5;
+    let offy = (ch - disph) * 0.5;
+    (
+        ((px - offx) / dispw).clamp(0.0, 1.0),
+        ((py - offy) / disph).clamp(0.0, 1.0),
+    )
 }
 
 /// Hover-reveal state for the session menu bar (§7): the native video surface
@@ -458,24 +498,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     let norm_pos = |lp: LPARAM| -> (f64, f64) {
         let px = (lp.0 & 0xffff) as i16 as f64;
         let py = ((lp.0 >> 16) & 0xffff) as i16 as f64;
-        let mut rc = RECT::default();
-        // SAFETY: valid HWND.
-        let _ = unsafe { GetClientRect(hwnd, &mut rc) };
-        let cw = (rc.right - rc.left).max(1) as f64;
-        let ch = (rc.bottom - rc.top).max(1) as f64;
-        let (vw, vh) = video_dims();
-        if vw <= 0.0 || vh <= 0.0 {
-            return ((px / cw).clamp(0.0, 1.0), (py / ch).clamp(0.0, 1.0));
-        }
-        // Same letterbox math as the renderer: scale to fit, center.
-        let scale = (cw / vw).min(ch / vh);
-        let (dispw, disph) = (vw * scale, vh * scale);
-        let offx = (cw - dispw) * 0.5;
-        let offy = (ch - disph) * 0.5;
-        (
-            ((px - offx) / dispw).clamp(0.0, 1.0),
-            ((py - offy) / disph).clamp(0.0, 1.0),
-        )
+        normalize_client(hwnd, px, py)
     };
 
     match msg {
@@ -578,7 +601,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         // Files dropped on the video surface: the viewer pushes them to the host.
         WM_DROPFILES => {
-            deliver_dropped_files(wparam);
+            deliver_dropped_files(hwnd, wparam);
             return LRESULT(0);
         }
         _ => {}

@@ -236,6 +236,46 @@ mod imp {
 #[cfg(windows)]
 pub use imp::Injector;
 
+/// Bring the window under a normalized point to the foreground, so a following
+/// keystroke (e.g. a paste) lands there.
+///
+/// Deliberately focus-only: a real drop delivers to the window under the cursor
+/// WITHOUT clicking it, and a synthetic click here could press whatever button
+/// happens to be under the drop point. Returns whether a window was found.
+#[cfg(windows)]
+pub fn focus_window_at(nx: f64, ny: f64) -> bool {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetAncestor, GetSystemMetrics, SetForegroundWindow, WindowFromPoint, GA_ROOT,
+        SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    };
+    // SAFETY: plain metric/window queries; no ownership transferred.
+    unsafe {
+        let ox = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let oy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let w = GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1);
+        let h = GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1);
+        let pt = POINT {
+            x: ox + (nx.clamp(0.0, 1.0) * w as f64).round() as i32,
+            y: oy + (ny.clamp(0.0, 1.0) * h as f64).round() as i32,
+        };
+        let hwnd = WindowFromPoint(pt);
+        if hwnd.0.is_null() {
+            return false;
+        }
+        // Target the top-level window: WindowFromPoint returns the child control
+        // under the point, which is usually not what accepts the paste.
+        let root = GetAncestor(hwnd, GA_ROOT);
+        let target = if root.0.is_null() { hwnd } else { root };
+        SetForegroundWindow(target).as_bool()
+    }
+}
+
+#[cfg(not(windows))]
+pub fn focus_window_at(_nx: f64, _ny: f64) -> bool {
+    false
+}
+
 // Non-Windows stub so the crate type-checks on any host (tests of `scancode`
 // still run). The real product is Windows-only.
 #[cfg(not(windows))]

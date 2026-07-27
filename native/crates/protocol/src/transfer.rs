@@ -25,16 +25,21 @@ pub const CHUNK_BYTES: usize = 16 * 1024;
 pub const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Announced at the start of a transfer.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FileMeta {
     /// The sender's file name. **Untrusted** — the receiver sanitizes it before
     /// touching the filesystem ([`sanitize_file_name`]).
     pub name: String,
     pub size: u64,
+    /// Where on the remote screen the file was dropped, normalized `[0,1]`. The
+    /// receiver focuses the window under this point before pasting, so the file
+    /// lands in whatever the user aimed at. `None` ⇒ save only, don't paste.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drop_at: Option<(f64, f64)>,
 }
 
 /// One decoded frame from the bulk channel.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum BulkFrame {
     Begin(FileMeta),
     Chunk(Vec<u8>),
@@ -123,6 +128,7 @@ mod tests {
         let meta = FileMeta {
             name: "notes.txt".into(),
             size: 42,
+            drop_at: Some((0.5, 0.25)),
         };
         for f in [
             BulkFrame::Begin(meta),

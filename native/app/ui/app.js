@@ -173,6 +173,7 @@ function openSettings() {
   $('set-share-display').value = config.shareDisplayId || '';
   $('set-auto-login').checked = !!config.autoLogin;
   $('set-clipboard-sync').checked = config.clipboardSync !== false;
+  $('set-paste-dropped').checked = config.pasteDroppedFiles !== false;
   const saved = config.savedLoginCount || 0;
   const clear = $('set-clear-logins');
   clear.checked = false;
@@ -200,6 +201,7 @@ async function saveSettings() {
     shareDisplayId: $('set-share-display').value || null,
     autoLogin: $('set-auto-login').checked,
     clipboardSync: $('set-clipboard-sync').checked,
+    pasteDroppedFiles: $('set-paste-dropped').checked,
     clearSavedLogins: $('set-clear-logins').checked
   };
 

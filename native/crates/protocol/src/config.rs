@@ -76,6 +76,9 @@ pub struct Config {
     /// Mirror clipboard TEXT between the two machines during a session. Host
     /// side additionally requires the live control permission.
     pub clipboard_sync: bool,
+    /// Host-side: paste a received file into the window it was dropped on. Off
+    /// leaves it on the clipboard so the user chooses where it lands.
+    pub paste_dropped_files: bool,
     /// Viewer-side: when a host asks for a password we already have working
     /// credentials for, submit them without prompting.
     pub auto_login: bool,
@@ -106,6 +109,7 @@ impl Default for Config {
             recent_ids: Vec::new(),
             capture_shortcuts: false,
             clipboard_sync: true,
+            paste_dropped_files: true,
             auto_login: false,
             saved_logins: BTreeMap::new(),
         }

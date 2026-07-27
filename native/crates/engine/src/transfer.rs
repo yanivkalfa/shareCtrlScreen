@@ -138,13 +138,20 @@ mod tests {
         d
     }
 
+    /// A transfer announcement as a peer would send it. `drop_at` is irrelevant
+    /// to receipt — it only steers the paste afterwards.
+    fn meta(name: &str, size: u64) -> FileMeta {
+        FileMeta {
+            name: name.into(),
+            size,
+            drop_at: None,
+        }
+    }
+
     #[test]
     fn writes_a_file_and_reports_path() {
         let dir = tmp("write");
-        let meta = FileMeta {
-            name: "hello.txt".into(),
-            size: 5,
-        };
+        let meta = meta("hello.txt", 5);
         let mut inc = Incoming::begin(&meta, &dir).unwrap();
         inc.write(b"hello").unwrap();
         let path = inc.finish().unwrap();
@@ -155,10 +162,7 @@ mod tests {
     #[test]
     fn traversal_name_stays_inside_the_directory() {
         let dir = tmp("traversal");
-        let meta = FileMeta {
-            name: r"..\..\..\evil.txt".into(),
-            size: 2,
-        };
+        let meta = meta(r"..\..\..\evil.txt", 2);
         let mut inc = Incoming::begin(&meta, &dir).unwrap();
         inc.write(b"xx").unwrap();
         let path = inc.finish().unwrap();
@@ -172,10 +176,7 @@ mod tests {
         let dir = tmp("nodup");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), b"original").unwrap();
-        let meta = FileMeta {
-            name: "a.txt".into(),
-            size: 3,
-        };
+        let meta = meta("a.txt", 3);
         let mut inc = Incoming::begin(&meta, &dir).unwrap();
         inc.write(b"new").unwrap();
         let path = inc.finish().unwrap();
@@ -187,10 +188,7 @@ mod tests {
     #[test]
     fn rejects_more_bytes_than_declared() {
         let dir = tmp("oversend");
-        let meta = FileMeta {
-            name: "small.bin".into(),
-            size: 4,
-        };
+        let meta = meta("small.bin", 4);
         let mut inc = Incoming::begin(&meta, &dir).unwrap();
         assert!(inc.write(b"12345").is_err());
     }
@@ -198,30 +196,21 @@ mod tests {
     #[test]
     fn rejects_absurd_declared_size() {
         let dir = tmp("huge");
-        let meta = FileMeta {
-            name: "huge.bin".into(),
-            size: MAX_FILE_BYTES + 1,
-        };
+        let meta = meta("huge.bin", MAX_FILE_BYTES + 1);
         assert!(Incoming::begin(&meta, &dir).is_err());
     }
 
     #[test]
     fn rejects_unusable_name() {
         let dir = tmp("badname");
-        let meta = FileMeta {
-            name: "..".into(),
-            size: 1,
-        };
+        let meta = meta("..", 1);
         assert!(Incoming::begin(&meta, &dir).is_err());
     }
 
     #[test]
     fn truncated_transfer_is_discarded() {
         let dir = tmp("truncated");
-        let meta = FileMeta {
-            name: "part.bin".into(),
-            size: 10,
-        };
+        let meta = meta("part.bin", 10);
         let mut inc = Incoming::begin(&meta, &dir).unwrap();
         inc.write(b"123").unwrap();
         let path = dir.join("part.bin");

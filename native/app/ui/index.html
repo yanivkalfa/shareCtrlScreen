@@ -218,8 +218,21 @@
           <div class="hint">
             Text only, both directions. On the machine being controlled this
             follows the control permission &mdash; a view-only session never
-            reads or writes its clipboard. Drag files onto the remote screen to
-            send them; they land in <b>Downloads\ShareCtrlScreen</b>.
+            reads or writes its clipboard.
+          </div>
+
+          <label class="radio">
+            <input type="checkbox" id="set-paste-dropped" />
+            Paste dropped files into the window they landed on
+          </label>
+          <div class="hint">
+            Drag files onto the remote screen to send them. With this on, the
+            file is pasted straight into whatever you dropped it on (a chat, an
+            email, a folder) &mdash; Windows has no way to fake a true drop, so
+            it goes via the clipboard as a file, exactly as if you had copied it
+            there. With it off the file is just placed on the remote clipboard
+            for you to paste yourself. Either way a copy is saved to
+            <b>Downloads\ShareCtrlScreen</b>.
           </div>
         </fieldset>
 

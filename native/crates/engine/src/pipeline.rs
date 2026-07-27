@@ -35,6 +35,10 @@ static CURSOR: Mutex<Option<(f64, f64, bool)>> = Mutex::new(None);
 /// re-apply it without reaching for the config lock from the session path.
 static CLIPBOARD_SETTING: AtomicBool = AtomicBool::new(true);
 
+/// Whether a received file is pasted into the window it was dropped on. Off
+/// leaves it on the clipboard for the user to paste wherever they choose.
+static PASTE_DROPPED: AtomicBool = AtomicBool::new(true);
+
 /// Host: the viewer's reported display size (`width<<32 | height`, 0 = unknown).
 /// The capture/encode loop scales to this so the viewer presents 1:1 instead of
 /// resampling every frame. One session at a time, so a global is fine.
@@ -676,6 +680,7 @@ pub fn begin_host(engine: &Engine, peer: String, permission: Permission) {
     // clipboard (which can hold a password that was never on screen) or write to
     // it. Flipping to view-only mid-session stops it immediately.
     CLIPBOARD_SETTING.store(engine.config().clipboard_sync, Ordering::SeqCst);
+    PASTE_DROPPED.store(engine.config().paste_dropped_files, Ordering::SeqCst);
     let clip_on = Arc::new(AtomicBool::new(
         engine.config().clipboard_sync && permission == Permission::Control,
     ));
@@ -797,7 +802,7 @@ fn start_viewer_transport(engine: &Engine, peer: String, offer_sdp: String) {
     // this thread streams each one as bulk frames. Reading/chunking on its own
     // thread keeps a slow disk off the transport loop.
     let (bulk_tx, bulk_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    let (drop_tx, drop_rx) = std::sync::mpsc::channel::<Vec<std::path::PathBuf>>();
+    let (drop_tx, drop_rx) = std::sync::mpsc::channel::<render::window::FileDrop>();
     render::window::set_file_drop_sink(drop_tx);
     let stop_f = stop.clone();
     let ui_f = engine.ui_sender();
@@ -1126,8 +1131,10 @@ fn transport_driver(d: Driver) {
     let mut ctl_open = false;
     let mut cursor_open = false;
     let mut bulk_open = false;
-    // Host: the file transfer currently being received, if any.
+    // Host: the file transfer currently being received, if any, and where on
+    // this screen the sender aimed it.
     let mut incoming: Option<crate::transfer::Incoming> = None;
+    let mut incoming_drop_at: Option<(f64, f64)> = None;
     let mut ctl_backlog: Vec<Vec<u8>> = Vec::new();
 
     // Liveness watchdog: if NOTHING arrives from the peer for this long, the
@@ -1590,6 +1597,7 @@ fn transport_driver(d: Driver) {
                                         prev.abort();
                                     }
                                     let dir = crate::transfer::receive_dir();
+                                    incoming_drop_at = meta.drop_at;
                                     match crate::transfer::Incoming::begin(&meta, &dir) {
                                         Ok(inc) => {
                                             tracing::info!(
@@ -1634,9 +1642,19 @@ fn transport_driver(d: Driver) {
                                                     .unwrap_or_default()
                                                     .to_string_lossy()
                                                     .into_owned();
-                                                let _ = ui.send(crate::UiEvent::Toast(format!(
-                                                    "Saved {name} to Downloads\\ShareCtrlScreen"
-                                                )));
+                                                let pasted = deliver_received_file(
+                                                    &path,
+                                                    incoming_drop_at.take(),
+                                                    injector.as_mut(),
+                                                );
+                                                let _ = ui.send(crate::UiEvent::Toast(if pasted {
+                                                    format!("Pasted {name}")
+                                                } else {
+                                                    format!(
+                                                        "{name} is on the clipboard \
+                                                         (also saved to Downloads\\ShareCtrlScreen)"
+                                                    )
+                                                }));
                                             }
                                             Err(e) => {
                                                 let _ = ui.send(crate::UiEvent::Toast(format!(
@@ -1717,7 +1735,7 @@ fn fit_within(want: (u32, u32), src: (u32, u32)) -> (u32, u32) {
 /// bulk channel is ordered and a transfer has no id, so overlapping them would
 /// interleave two files into one.
 fn file_send_loop(
-    drops: Receiver<Vec<std::path::PathBuf>>,
+    drops: Receiver<render::window::FileDrop>,
     out: Sender<Vec<u8>>,
     ui: tokio::sync::mpsc::UnboundedSender<crate::UiEvent>,
     stop: Arc<AtomicBool>,
@@ -1726,7 +1744,8 @@ fn file_send_loop(
     use std::io::Read;
 
     while !stop.load(Ordering::SeqCst) {
-        let Ok(paths) = drops.recv_timeout(std::time::Duration::from_millis(200)) else {
+        let Ok((paths, drop_x, drop_y)) = drops.recv_timeout(std::time::Duration::from_millis(200))
+        else {
             continue;
         };
         for path in paths {
@@ -1764,6 +1783,9 @@ fn file_send_loop(
                 BulkFrame::Begin(FileMeta {
                     name: name.clone(),
                     size,
+                    // Where it was dropped, so the host can paste it into the
+                    // window under that point rather than just filing it away.
+                    drop_at: Some((drop_x, drop_y)),
                 })
                 .encode(),
             );
@@ -1810,6 +1832,47 @@ fn file_send_loop(
             let _ = out.send(BulkFrame::End.encode());
         }
     }
+}
+
+/// Make a just-received file behave like one dropped locally.
+///
+/// Windows gives no way to synthesize a real OLE drop into another process, so
+/// this does the next best thing, which every app that accepts a pasted file
+/// treats identically: put the file on the clipboard as a `CF_HDROP` file-drop
+/// list (exactly what Explorer writes when you copy a file), focus the window
+/// the sender aimed at, and press Ctrl+V.
+///
+/// Focus is set WITHOUT clicking: a real drop doesn't click either, and a
+/// synthetic click could press whatever button sits under the drop point.
+/// Returns whether the paste was actually attempted; the file is on the
+/// clipboard (and on disk) either way.
+fn deliver_received_file(
+    path: &std::path::Path,
+    drop_at: Option<(f64, f64)>,
+    injector: Option<&mut input::Injector>,
+) -> bool {
+    if crate::clipboard::set_files(std::slice::from_ref(&path.to_path_buf())).is_none() {
+        tracing::warn!("could not put {path:?} on the clipboard");
+        return false;
+    }
+    if !PASTE_DROPPED.load(Ordering::SeqCst) {
+        return false;
+    }
+    let (Some((nx, ny)), Some(inj)) = (drop_at, injector) else {
+        return false; // saved + on the clipboard; the user pastes it themselves
+    };
+    if !input::focus_window_at(nx, ny) {
+        tracing::info!("no window under the drop point — file left on the clipboard");
+        return false;
+    }
+    // Give the focused window a moment to become foreground before typing.
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    inj.key("ControlLeft", true);
+    inj.key("KeyV", true);
+    inj.key("KeyV", false);
+    inj.key("ControlLeft", false);
+    tracing::info!("pasted {path:?} at ({nx:.3}, {ny:.3})");
+    true
 }
 
 // ---- Clipboard sync (both directions) ---------------------------------------

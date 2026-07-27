@@ -1064,6 +1064,16 @@ fn transport_driver(d: Driver) {
     let mut last_rx = std::time::Instant::now();
     let mut connected = false; // becomes true on the first Connected event
 
+    // Application-level ping/pong. UDP liveness (`last_rx`) counts STUN/TURN
+    // keepalives too, so it can look healthy while the session itself is wedged.
+    // Both sides ping; both sides enforce the grace period, so a dead link tears
+    // BOTH ends down rather than leaving one staring at a frozen picture.
+    const PING_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+    const PONG_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+    let mut last_ping_sent = std::time::Instant::now();
+    let mut last_pong = std::time::Instant::now();
+    let mut ping_seq: u32 = 0;
+
     // Viewer: NEVER hand the decoder a delta whose reference chain is broken.
     // str0m NACK-repairs most loss; when a gap survives its reorder window it
     // delivers the next frame with `contiguous=false`. From that instant every
@@ -1090,6 +1100,22 @@ fn transport_driver(d: Driver) {
             tracing::warn!("transport: no data for {DEAD_AFTER:?} — declaring dead");
             notify_dead("no response from the peer");
             break;
+        }
+        // Application-level keepalive: ping on a timer, and give up if the peer
+        // has not answered within the grace period. Best-effort Bye first so the
+        // other end tears down promptly instead of waiting out its own timer.
+        if connected && ctl_open {
+            if last_ping_sent.elapsed() >= PING_EVERY {
+                last_ping_sent = std::time::Instant::now();
+                ping_seq = ping_seq.wrapping_add(1);
+                let _ = tp.send_ctl(&serialize(&protocol::ControlMsg::Ping { seq: ping_seq }));
+            }
+            if last_pong.elapsed() > PONG_GRACE {
+                tracing::warn!("transport: no pong for {PONG_GRACE:?} — declaring dead");
+                let _ = tp.send_ctl(&serialize(&protocol::ControlMsg::Bye));
+                notify_dead("the peer stopped responding");
+                break;
+            }
         }
         // Field-test telemetry: one INFO line per 5s per side.
         if connected && last_stats.elapsed() >= std::time::Duration::from_secs(5) {
@@ -1262,9 +1288,10 @@ fn transport_driver(d: Driver) {
                         Inbound::Connected => {
                             connected = true;
                             last_rx = std::time::Instant::now();
-                            // Host: the viewer's decoder has no reference yet, and
-                            // anything written before connect was dropped — force an
-                            // IDR so the first *delivered* frame is decodable.
+                            last_pong = std::time::Instant::now(); // start the grace period here
+                                                                   // Host: the viewer's decoder has no reference yet, and
+                                                                   // anything written before connect was dropped — force an
+                                                                   // IDR so the first *delivered* frame is decodable.
                             if let Some(fk) = &force_key {
                                 fk.store(true, Ordering::SeqCst);
                             }
@@ -1278,6 +1305,9 @@ fn transport_driver(d: Driver) {
                             match label.as_str() {
                                 "ctl" => {
                                     ctl_open = true;
+                                    // Ping/pong only starts now — don't count the
+                                    // channel-setup time against the grace period.
+                                    last_pong = std::time::Instant::now();
                                     for bytes in ctl_backlog.drain(..) {
                                         let _ = tp.send_ctl(&bytes);
                                     }
@@ -1361,27 +1391,37 @@ fn transport_driver(d: Driver) {
                             }
                         }
                         Inbound::Ctl(bytes) => {
-                            // Host: a viewer keyframe request restarts the stream
-                            // (decoder never started / lost the keyframe). NOT
-                            // gated on control — view-only viewers need it too.
-                            if host_side
-                                && matches!(
-                                    serde_json::from_slice::<protocol::ControlMsg>(&bytes),
-                                    Ok(protocol::ControlMsg::KeyframeRequest)
-                                )
-                            {
-                                tracing::info!("viewer requested keyframe");
-                                if let Some(fk) = &force_key {
-                                    fk.store(true, Ordering::SeqCst);
+                            // Control messages both sides understand, handled once
+                            // up front. Anything that isn't one falls through to
+                            // the host's input-injection path below.
+                            match serde_json::from_slice::<protocol::ControlMsg>(&bytes) {
+                                // Liveness: answer probes, and count any reply as
+                                // proof the peer is alive.
+                                Ok(protocol::ControlMsg::Ping { seq }) => {
+                                    last_pong = std::time::Instant::now();
+                                    let _ = tp
+                                        .send_ctl(&serialize(&protocol::ControlMsg::Pong { seq }));
+                                    continue;
                                 }
-                                continue;
-                            }
-                            // Host: the viewer told us its display size — encode to
-                            // exactly that so it presents 1:1 (no resampling blur)
-                            // and we don't spend bits on pixels it never shows.
-                            if host_side {
-                                if let Ok(protocol::ControlMsg::ViewSize { width, height }) =
-                                    serde_json::from_slice::<protocol::ControlMsg>(&bytes)
+                                Ok(protocol::ControlMsg::Pong { .. }) => {
+                                    last_pong = std::time::Instant::now();
+                                    continue;
+                                }
+                                // A viewer keyframe request restarts the stream
+                                // (decoder never started / lost the keyframe). NOT
+                                // gated on control — view-only viewers need it too.
+                                Ok(protocol::ControlMsg::KeyframeRequest) if host_side => {
+                                    tracing::info!("viewer requested keyframe");
+                                    if let Some(fk) = &force_key {
+                                        fk.store(true, Ordering::SeqCst);
+                                    }
+                                    continue;
+                                }
+                                // The viewer told us its display size — encode to
+                                // exactly that so it presents 1:1 (no resampling
+                                // blur) and we don't spend bits on unseen pixels.
+                                Ok(protocol::ControlMsg::ViewSize { width, height })
+                                    if host_side =>
                                 {
                                     VIEW_SIZE.store(
                                         ((width as u64) << 32) | height as u64,
@@ -1389,9 +1429,15 @@ fn transport_driver(d: Driver) {
                                     );
                                     continue;
                                 }
+                                // A clean goodbye from either end.
+                                Ok(protocol::ControlMsg::Bye) => {
+                                    notify_dead("the other side ended the session");
+                                    break;
+                                }
+                                _ => {}
                             }
-                            // Host: inbound ctl is remote input — inject it,
-                            // gated on the current control permission (§4.1).
+                            // Host: anything else on ctl is remote input — inject
+                            // it, gated on the current control permission (§4.1).
                             if let (Some(inj), Some(gate)) = (injector.as_mut(), inject.as_ref()) {
                                 if gate.load(Ordering::SeqCst) {
                                     // Re-attach to the current input desktop first
@@ -1404,15 +1450,6 @@ fn transport_driver(d: Driver) {
                                     {
                                         inj.dispatch(&msg);
                                     }
-                                }
-                            }
-                            // Viewer: inbound ctl is a ControlMsg (perm/bye). A
-                            // clean `bye` ends the session.
-                            if inject.is_none() {
-                                if let Ok(protocol::ControlMsg::Bye) =
-                                    serde_json::from_slice::<protocol::ControlMsg>(&bytes)
-                                {
-                                    break;
                                 }
                             }
                         }

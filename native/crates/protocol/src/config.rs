@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Host access mode (contract §5).
@@ -72,6 +73,14 @@ pub struct Config {
     pub recent_ids: Vec<String>,
     /// Viewer-side: capture OS-reserved shortcuts (Alt+Tab/Win) locally.
     pub capture_shortcuts: bool,
+    /// Viewer-side: when a host asks for a password we already have working
+    /// credentials for, submit them without prompting.
+    pub auto_login: bool,
+    /// Host UUID → that host's password, encrypted at rest with DPAPI (scoped to
+    /// this Windows account, so the config file alone is not enough to read it).
+    /// Only written after a password has actually been accepted, so a wrong
+    /// guess is never persisted. Opaque here — the engine owns the crypto.
+    pub saved_logins: BTreeMap<String, String>,
 }
 
 const MAX_RECENTS: usize = 10;
@@ -93,6 +102,8 @@ impl Default for Config {
             share_display_id: None,
             recent_ids: Vec::new(),
             capture_shortcuts: false,
+            auto_login: false,
+            saved_logins: BTreeMap::new(),
         }
     }
 }

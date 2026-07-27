@@ -11,6 +11,7 @@
 pub mod handshake;
 #[cfg(windows)]
 pub mod pipeline;
+pub mod secret;
 pub mod turn;
 
 use std::path::PathBuf;
@@ -79,6 +80,14 @@ pub struct Engine {
     /// expanded to one `IceServer` per URL. Fetched on register and cached; the
     /// pipeline reads them when gathering the relayed candidate.
     turn_servers: Arc<Mutex<Vec<protocol::IceServer>>>,
+    /// Viewer: the password just submitted, held until the host accepts it.
+    /// Only then is it worth saving — a rejected guess must never be persisted.
+    /// `(host, plaintext, remember)`.
+    pending_login: Arc<Mutex<Option<(String, String, bool)>>>,
+    /// Viewer: the host we last auto-submitted a saved password to. If that host
+    /// challenges us again, the saved credential is stale — drop it and fall back
+    /// to prompting, instead of looping on a password that no longer works.
+    auto_attempted: Arc<Mutex<Option<String>>>,
 }
 
 impl Engine {
@@ -108,6 +117,8 @@ impl Engine {
             pending_nonce: Arc::new(Mutex::new(Default::default())),
             pending_caps: Arc::new(Mutex::new(Default::default())),
             turn_servers: Arc::new(Mutex::new(Vec::new())),
+            pending_login: Arc::new(Mutex::new(None)),
+            auto_attempted: Arc::new(Mutex::new(None)),
         });
         (engine, ui_rx, sig_rx)
     }
@@ -394,23 +405,64 @@ impl Engine {
     }
 
     async fn on_password_required(&self, from: String, nonce: String) {
-        // Stash the nonce, then let the UI collect the plaintext; the app calls
-        // `submit_password` with the answer.
         self.pending_nonce.lock().insert(from.clone(), nonce);
+
+        // A second challenge from a host we just auto-submitted to means the
+        // saved password is no longer valid. Forget it and prompt normally,
+        // rather than retrying a dead credential forever.
+        let stale = self.auto_attempted.lock().as_deref() == Some(from.as_str());
+        if stale {
+            *self.auto_attempted.lock() = None;
+            self.update_config(|c| {
+                c.saved_logins.remove(&from);
+            });
+            let _ = self
+                .ui
+                .send(UiEvent::Toast("Saved password no longer works".into()));
+            let _ = self.ui.send(UiEvent::PasswordRequired { from });
+            return;
+        }
+
+        // Auto-login: replay a password this host has already accepted.
+        if let Some(plain) = self.saved_login(&from) {
+            *self.auto_attempted.lock() = Some(from.clone());
+            tracing::info!("auto-login: submitting saved password for {from}");
+            self.submit_password(from, plain, false);
+            return;
+        }
         let _ = self.ui.send(UiEvent::PasswordRequired { from });
     }
 
-    /// UI action: answer a `password-required` prompt (viewer side).
-    pub fn submit_password(&self, host: String, plaintext: String) {
+    /// The stored password for `host`, if auto-login is on and we can decrypt it.
+    fn saved_login(&self, host: &str) -> Option<String> {
+        let cfg = self.config.lock();
+        if !cfg.auto_login {
+            return None;
+        }
+        let sealed = cfg.saved_logins.get(host)?.clone();
+        drop(cfg);
+        secret::unprotect(&sealed)
+    }
+
+    /// UI action: answer a `password-required` prompt (viewer side). `remember`
+    /// asks to save the password for auto-login — but only once the host has
+    /// actually accepted it (see `on_connect_response`).
+    pub fn submit_password(&self, host: String, plaintext: String, remember: bool) {
         let nonce = self.pending_nonce.lock().remove(&host).unwrap_or_default();
         // proof = SHA256( SHA256(plaintext) + ":" + nonce ).
         let proof = handshake::compute_proof(&plaintext, &nonce);
+        *self.pending_login.lock() = Some((host.clone(), plaintext, remember));
         let _ = self.signaling.send(SignalMsg::ConnectRequest {
             to: Some(host),
             from: None,
             password: Some(proof),
             caps: None,
         });
+    }
+
+    /// UI action: forget every saved auto-login password.
+    pub fn clear_saved_logins(&self) {
+        self.update_config(|c| c.saved_logins.clear());
     }
 
     async fn on_connect_response(
@@ -422,9 +474,48 @@ impl Engine {
         codec: Option<String>,
     ) {
         if !accepted {
+            *self.pending_login.lock() = None;
+            let auto = self.auto_attempted.lock().take();
             let r = reason.unwrap_or_else(|| "denied".into());
+            // A rejected password is reported as a plain refusal, not a second
+            // challenge — so this is the ONLY place a stale saved credential can
+            // be detected. Without dropping it here, auto-login would keep
+            // replaying a password the host no longer accepts and the prompt
+            // would never reappear: a permanent lockout from that host.
+            if r == "bad-password" && auto.as_deref() == Some(from.as_str()) {
+                self.update_config(|c| {
+                    c.saved_logins.remove(&from);
+                });
+                let _ = self.ui.send(UiEvent::Toast(
+                    "Saved password was rejected — forgotten, please connect again".into(),
+                ));
+                return;
+            }
             let _ = self.ui.send(UiEvent::Toast(format!("connection {r}")));
             return;
+        }
+        // The host accepted us, so any password we just sent is known-good — this
+        // is the only point at which it's worth saving. Sealed with DPAPI; if
+        // that fails we simply don't save (never fall back to plaintext).
+        *self.auto_attempted.lock() = None;
+        if let Some((host, plaintext, remember)) = self.pending_login.lock().take() {
+            if remember && host == from {
+                match secret::protect(&plaintext) {
+                    Some(sealed) => {
+                        self.update_config(|c| {
+                            c.auto_login = true;
+                            c.saved_logins.insert(host, sealed);
+                        });
+                        tracing::info!("auto-login: saved password for {from}");
+                    }
+                    None => {
+                        tracing::warn!("auto-login: could not encrypt password — not saving");
+                        let _ = self.ui.send(UiEvent::Toast(
+                            "Could not save the password securely".into(),
+                        ));
+                    }
+                }
+            }
         }
         // The host told us which codec it will stream; decode with the same (§3).
         #[cfg(windows)]

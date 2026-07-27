@@ -129,7 +129,19 @@
       <div class="modal-box">
         <h3>Password required</h3>
         <p class="hint">This machine is protected by a password.</p>
-        <input id="password-input" class="input" type="password" placeholder="Password" />
+        <label class="field">
+          <input
+            id="password-input"
+            class="input"
+            type="password"
+            placeholder="Password"
+            autocomplete="current-password"
+          />
+        </label>
+        <label class="radio">
+          <input type="checkbox" id="password-remember" />
+          Log in automatically next time
+        </label>
         <div class="modal-actions">
           <button id="btn-password-cancel" class="btn">Cancel</button>
           <button id="btn-password-ok" class="btn btn-primary">OK</button>
@@ -196,6 +208,22 @@
           <input type="checkbox" id="set-share-audio" />
           Share this machine's system audio when hosting
         </label>
+
+        <fieldset class="field">
+          <legend>Connecting out</legend>
+          <label class="radio">
+            <input type="checkbox" id="set-auto-login" />
+            Log in automatically with a saved password
+          </label>
+          <div class="hint">
+            Saved passwords are encrypted for this Windows account. A saved
+            password is only kept after it has actually worked.
+          </div>
+          <label class="radio">
+            <input type="checkbox" id="set-clear-logins" />
+            Forget all saved passwords
+          </label>
+        </fieldset>
 
         <div class="hint">
           While a session window is focused, Alt+Tab and the Win key act on the

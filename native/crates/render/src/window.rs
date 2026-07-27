@@ -75,9 +75,15 @@ fn video_dims() -> (f64, f64) {
 
 /// Hover-reveal state for the session menu bar (§7): the native video surface
 /// covers the whole client area *including* the web UI's session bar, so pushing
-/// the cursor to the top edge slides the video down to reveal the bar (with its
-/// Disconnect/settings buttons), and moving back into the video slides it up.
-/// 0 = bar hidden (video at y=0); >0 = revealed by that many physical px.
+/// the cursor to the top edge reveals the bar (with its Disconnect/settings
+/// buttons), and moving back into the video hides it again.
+///
+/// The bar OVERLAYS the video: we clip the top strip out of the video window with
+/// a window region rather than moving/resizing the window. The window rect is
+/// therefore constant, which matters twice over — the picture doesn't jump, and
+/// the viewer's reported display size (which drives the host's encode resolution)
+/// doesn't change every time the cursor brushes the top edge.
+/// 0 = bar hidden (video unclipped); >0 = top strip clipped by that many px.
 static REVEAL_OFFSET: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 /// Session menu bar height in CSS px (the web `.view-bar`); scaled by DPI.
 const BAR_CSS_PX: i32 = 40;
@@ -92,22 +98,41 @@ fn bar_phys(hwnd: HWND) -> i32 {
     BAR_CSS_PX * dpi / 96
 }
 
-/// Slide the video down (reveal the web session bar) or back up.
+/// Reveal the web session bar over the video, or hide it again.
 fn set_reveal(hwnd: HWND, reveal: bool) {
     use std::sync::atomic::Ordering;
     let bar = if reveal { bar_phys(hwnd) } else { 0 };
     if REVEAL_OFFSET.swap(bar, Ordering::SeqCst) == bar {
         return; // no change
     }
-    // SAFETY: valid child HWND; parent lookup + move on the UI thread (wndproc).
+    apply_reveal_clip(hwnd, bar);
+}
+
+/// Clip the top `bar` physical pixels out of the video window so the WebView2
+/// sibling underneath shows through there — the bar appears ON TOP of the video
+/// without the video moving or resizing. `bar == 0` restores the full window.
+///
+/// Mouse messages over a clipped area go to the window below, so the bar's
+/// buttons are clickable; moving back down into the video re-hides it
+/// (`UNREVEAL_DEPTH_PX` is deeper than the bar, so the video still sees it).
+fn apply_reveal_clip(hwnd: HWND, bar: i32) {
+    use windows::Win32::Graphics::Gdi::{CreateRectRgn, DeleteObject, SetWindowRgn, HGDIOBJ};
+    // SAFETY: valid child HWND. On success the window OWNS the region and must
+    // not be deleted by us; on failure we free it ourselves.
     unsafe {
-        if let Ok(parent) = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd) {
-            let mut rc = RECT::default();
-            if GetClientRect(parent, &mut rc).is_ok() {
-                let w = (rc.right - rc.left).max(1);
-                let h = (rc.bottom - rc.top).max(1);
-                let _ = MoveWindow(hwnd, 0, bar, w, (h - bar).max(1), true);
-            }
+        if bar <= 0 {
+            let _ = SetWindowRgn(hwnd, None, true);
+            return;
+        }
+        let mut rc = RECT::default();
+        if GetClientRect(hwnd, &mut rc).is_err() {
+            return;
+        }
+        let w = (rc.right - rc.left).max(1);
+        let h = (rc.bottom - rc.top).max(1);
+        let rgn = CreateRectRgn(0, bar.min(h), w, h);
+        if SetWindowRgn(hwnd, Some(rgn), true) == 0 {
+            let _ = DeleteObject(HGDIOBJ(rgn.0));
         }
     }
 }
@@ -259,7 +284,8 @@ pub fn show(hwnd_raw: isize) {
         }
         tracing::info!("video window: show {w}x{h} (raise to top)");
         let _ = MoveWindow(hwnd, 0, 0, w, h, true);
-        // Raise above the WebView2 sibling AND show in one call.
+        apply_reveal_clip(hwnd, 0); // drop any clip left over from a past session
+                                    // Raise above the WebView2 sibling AND show in one call.
         let _ = SetWindowPos(hwnd, Some(HWND_TOP), 0, 0, w, h, SWP_SHOWWINDOW);
         let _ = ShowWindow(hwnd, SW_SHOW);
     }
@@ -272,7 +298,6 @@ pub fn show(hwnd_raw: isize) {
 pub fn fit(hwnd_raw: isize) {
     use std::sync::atomic::Ordering;
     let hwnd = HWND(hwnd_raw as *mut _);
-    let offset = REVEAL_OFFSET.load(Ordering::SeqCst);
     // SAFETY: valid child HWND; reads two client rects and conditionally moves.
     unsafe {
         let Ok(parent) = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd) else {
@@ -283,12 +308,18 @@ pub fn fit(hwnd_raw: isize) {
         if GetClientRect(parent, &mut prc).is_err() || GetClientRect(hwnd, &mut crc).is_err() {
             return;
         }
+        // Always the FULL client area — the revealed bar is a clip, not an offset.
         let want_w = (prc.right - prc.left).max(1);
-        let want_h = ((prc.bottom - prc.top) - offset).max(1);
+        let want_h = (prc.bottom - prc.top).max(1);
         let cur_w = crc.right - crc.left;
         let cur_h = crc.bottom - crc.top;
         if cur_w != want_w || cur_h != want_h {
-            let _ = MoveWindow(hwnd, 0, offset, want_w, want_h, true);
+            let _ = MoveWindow(hwnd, 0, 0, want_w, want_h, true);
+            // A resize invalidates the old region — re-clip if the bar is up.
+            let offset = REVEAL_OFFSET.load(Ordering::SeqCst);
+            if offset > 0 {
+                apply_reveal_clip(hwnd, offset);
+            }
         }
     }
 }

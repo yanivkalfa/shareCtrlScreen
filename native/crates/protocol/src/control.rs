@@ -39,6 +39,15 @@ pub enum ControlMsg {
     /// spent on pixels the viewer never shows.
     #[serde(rename = "vsize")]
     ViewSize { width: u32, height: u32 },
+    /// Liveness probe, sent by BOTH sides on the reliable channel. The peer
+    /// echoes it back as [`ControlMsg::Pong`]. Silence for the grace period means
+    /// the session is dead even when the socket never reported an error — the
+    /// case where a controller sat on a frozen picture believing it was live.
+    #[serde(rename = "ping")]
+    Ping { seq: u32 },
+    /// Reply to [`ControlMsg::Ping`], echoing its `seq`.
+    #[serde(rename = "pong")]
+    Pong { seq: u32 },
 }
 
 fn default_visible() -> bool {

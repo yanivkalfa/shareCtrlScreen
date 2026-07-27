@@ -81,6 +81,9 @@ fn get_config(state: tauri::State<'_, AppState>) -> serde_json::Value {
         "shareDisplayId": c.share_display_id,
         "recentIds": c.recent_ids,
         "captureShortcuts": c.capture_shortcuts,
+        "autoLogin": c.auto_login,
+        // Count only — the saved passwords themselves never reach the WebView.
+        "savedLoginCount": c.saved_logins.len(),
     })
 }
 
@@ -116,8 +119,15 @@ fn connect_to(state: tauri::State<'_, AppState>, id: String) {
 }
 
 #[tauri::command]
-fn submit_password(state: tauri::State<'_, AppState>, host: String, password: String) {
-    state.engine.submit_password(host, password);
+fn submit_password(
+    state: tauri::State<'_, AppState>,
+    host: String,
+    password: String,
+    remember: Option<bool>,
+) {
+    state
+        .engine
+        .submit_password(host, password, remember.unwrap_or(false));
 }
 
 #[tauri::command]
@@ -201,6 +211,17 @@ fn save_settings(state: tauri::State<'_, AppState>, patch: serde_json::Value) {
         }
         if let Some(v) = patch.get("shareDisplayId") {
             cfg.share_display_id = v.as_str().filter(|s| !s.is_empty()).map(String::from);
+        }
+        if let Some(b) = patch.get("autoLogin").and_then(|v| v.as_bool()) {
+            cfg.auto_login = b;
+        }
+        // Explicit "forget everything" from the settings modal.
+        if patch
+            .get("clearSavedLogins")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            cfg.saved_logins.clear();
         }
     });
 }

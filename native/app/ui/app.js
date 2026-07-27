@@ -171,6 +171,15 @@ function openSettings() {
   $('set-password-perm').value = config.passwordPermission;
   $('set-share-audio').checked = config.shareAudio !== false;
   $('set-share-display').value = config.shareDisplayId || '';
+  $('set-auto-login').checked = !!config.autoLogin;
+  const saved = config.savedLoginCount || 0;
+  const clear = $('set-clear-logins');
+  clear.checked = false;
+  clear.parentElement.lastChild.textContent =
+    saved > 0
+      ? ` Forget ${saved} saved password${saved === 1 ? '' : 's'}`
+      : ' Forget all saved passwords';
+  clear.disabled = saved === 0;
   $('modal-settings').classList.remove('hidden');
 }
 
@@ -187,7 +196,9 @@ async function saveSettings() {
     mode: $('set-mode-password').checked ? 'password' : 'approve',
     passwordPermission: $('set-password-perm').value,
     shareAudio: $('set-share-audio').checked,
-    shareDisplayId: $('set-share-display').value || null
+    shareDisplayId: $('set-share-display').value || null,
+    autoLogin: $('set-auto-login').checked,
+    clearSavedLogins: $('set-clear-logins').checked
   };
 
   // Only touch the password when the user actually asked to.
@@ -261,13 +272,19 @@ $('btn-cancel-request').addEventListener('click', () => {
 });
 
 // password prompt (viewer)
-$('btn-password-cancel').addEventListener('click', () => {
+function cancelPassword() {
   passwordFrom = null;
+  $('password-input').value = '';
   setState('READY');
-});
-$('btn-password-ok').addEventListener('click', () => {
+}
+function submitPassword() {
   const pw = $('password-input').value;
-  if (passwordFrom) invoke('submit_password', { host: passwordFrom, password: pw });
+  if (!passwordFrom) return;
+  invoke('submit_password', {
+    host: passwordFrom,
+    password: pw,
+    remember: $('password-remember').checked
+  });
   $('password-input').value = '';
   setState('REQUESTING');
   stopCountdown();
@@ -275,6 +292,18 @@ $('btn-password-ok').addEventListener('click', () => {
     toast('No answer — timed out', 'error');
     setState('READY');
   });
+}
+$('btn-password-cancel').addEventListener('click', cancelPassword);
+$('btn-password-ok').addEventListener('click', submitPassword);
+// Enter submits, Escape cancels — no reaching for the mouse.
+$('password-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    submitPassword();
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    cancelPassword();
+  }
 });
 
 // incoming approval (host)
@@ -329,6 +358,9 @@ listen('password-required', (e) => {
   passwordFrom = e.payload.from;
   stopCountdown();
   $('password-input').value = '';
+  // Default the checkbox to whatever auto-login is currently set to, so ticking
+  // it once in Settings makes every later prompt remember by default.
+  $('password-remember').checked = !!(config && config.autoLogin);
   setState('PASSWORD_PROMPT');
   $('password-input').focus();
 });

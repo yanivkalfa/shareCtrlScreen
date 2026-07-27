@@ -165,6 +165,21 @@
       </div>
     </div>
 
+    <!-- LINK TROUBLE (either role) — the native video is hidden while this is
+         up, so the user sees this instead of a frozen last frame. -->
+    <div id="modal-link" class="modal hidden">
+      <div class="modal-box">
+        <h3>Connection lost</h3>
+        <p class="hint">
+          The other machine stopped responding. Still trying &mdash;
+          disconnecting in <b id="link-count">15</b> s.
+        </p>
+        <div class="modal-actions">
+          <button id="btn-link-end" class="btn btn-danger">Disconnect now</button>
+        </div>
+      </div>
+    </div>
+
     <!-- SETTINGS -->
     <div id="modal-settings" class="modal hidden">
       <div class="modal-box modal-wide">

@@ -343,6 +343,10 @@ fn main() {
                             },
                         ),
                         UiEvent::Toast(msg) => ("toast", serde_json::json!({ "message": msg })),
+                        UiEvent::LinkTrouble { secs_left } => {
+                            ("link-trouble", serde_json::json!({ "secsLeft": secs_left }))
+                        }
+                        UiEvent::LinkRestored => ("link-restored", serde_json::json!({})),
                     };
                     let _ = handle.emit(name, payload);
                 }

@@ -61,6 +61,15 @@ pub enum UiEvent {
     RoleChanged(Role),
     /// A transient user-facing message.
     Toast(String),
+    /// The peer has gone quiet but the session is not given up on yet.
+    /// `secs_left` counts down to the point where it is dropped. Emitted about
+    /// once a second so the UI can show a live countdown instead of leaving the
+    /// user staring at a frozen picture wondering whether it is still alive.
+    LinkTrouble {
+        secs_left: u32,
+    },
+    /// The peer answered again — the session continues normally.
+    LinkRestored,
 }
 
 /// The engine. Owns config + the signaling client and the current role.

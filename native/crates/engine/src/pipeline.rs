@@ -1092,6 +1092,14 @@ fn transport_driver(d: Driver) {
             let was_active = !matches!(&*role.lock(), crate::Role::Idle);
             if was_active {
                 *role.lock() = crate::Role::Idle;
+                // Take the native video surface down FIRST. It sits on top of the
+                // web UI, so leaving it up means the user keeps staring at the
+                // last decoded frame while the app thinks it is idle — the
+                // "it just froze instead of disconnecting" report. Input capture
+                // goes with it so a dead session can't still grab keystrokes.
+                set_video_visible(false);
+                render::window::clear_input_sink();
+                render::window::clear_file_drop_sink();
                 let _ = ui.send(crate::UiEvent::Toast(format!("Disconnected: {reason}")));
                 let _ = ui.send(crate::UiEvent::RoleChanged(crate::Role::Idle));
             }
@@ -1140,7 +1148,10 @@ fn transport_driver(d: Driver) {
     // Liveness watchdog: if NOTHING arrives from the peer for this long, the
     // connection is dead even if ICE hasn't declared it yet. str0m's ICE consent
     // checks also emit Disconnected within a few seconds; this is the backstop.
-    const DEAD_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+    /// Backstop only. It must sit ABOVE the ping/pong grace below, or it would
+    /// kill the session before the user ever sees the countdown — the app-level
+    /// keepalive owns that decision because it can explain itself to the user.
+    const DEAD_AFTER: std::time::Duration = std::time::Duration::from_secs(20);
     let mut last_rx = std::time::Instant::now();
     let mut connected = false; // becomes true on the first Connected event
 
@@ -1149,10 +1160,17 @@ fn transport_driver(d: Driver) {
     // Both sides ping; both sides enforce the grace period, so a dead link tears
     // BOTH ends down rather than leaving one staring at a frozen picture.
     const PING_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
-    const PONG_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+    /// How long the peer may stay silent before the session is given up on.
+    const PONG_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+    /// Silence beyond this is reported to the user (with a countdown) while we
+    /// keep waiting. Long enough not to fire on ordinary jitter, short enough
+    /// that a frozen picture is explained rather than left a mystery.
+    const TROUBLE_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
     let mut last_ping_sent = std::time::Instant::now();
     let mut last_pong = std::time::Instant::now();
     let mut ping_seq: u32 = 0;
+    let mut link_trouble = false;
+    let mut last_trouble_tick = std::time::Instant::now();
 
     // Viewer: NEVER hand the decoder a delta whose reference chain is broken.
     // str0m NACK-repairs most loss; when a gap survives its reorder window it
@@ -1191,11 +1209,39 @@ fn transport_driver(d: Driver) {
                 ping_seq = ping_seq.wrapping_add(1);
                 let _ = tp.send_ctl(&serialize(&protocol::ControlMsg::Ping { seq: ping_seq }));
             }
-            if last_pong.elapsed() > PONG_GRACE {
+            let silent = last_pong.elapsed();
+            if silent > PONG_GRACE {
                 tracing::warn!("transport: no pong for {PONG_GRACE:?} — declaring dead");
                 let _ = tp.send_ctl(&serialize(&protocol::ControlMsg::Bye));
                 notify_dead("the peer stopped responding");
                 break;
+            } else if silent >= TROUBLE_AFTER {
+                if !link_trouble {
+                    link_trouble = true;
+                    tracing::warn!("transport: peer quiet — {PONG_GRACE:?} grace started");
+                    // Stop presenting a stale frame while we wait. Without this
+                    // the viewer sees a frozen picture that is indistinguishable
+                    // from a working session, which is the whole complaint.
+                    if !host_side {
+                        set_video_visible(false);
+                    }
+                }
+                // Re-emit ~1/s so the UI can count down.
+                if last_trouble_tick.elapsed() >= std::time::Duration::from_millis(900) {
+                    last_trouble_tick = std::time::Instant::now();
+                    let left = PONG_GRACE.saturating_sub(silent).as_secs() as u32;
+                    let _ = ui.send(crate::UiEvent::LinkTrouble { secs_left: left });
+                }
+            } else if link_trouble {
+                // Answered again within the grace period — carry on.
+                link_trouble = false;
+                tracing::info!("transport: peer responded again — session continues");
+                if !host_side {
+                    set_video_visible(true);
+                    // The stream may have advanced without us; get a clean start.
+                    let _ = tp.send_ctl(&serialize(&protocol::ControlMsg::KeyframeRequest));
+                }
+                let _ = ui.send(crate::UiEvent::LinkRestored);
             }
         }
         // Field-test telemetry: one INFO line per 5s per side.
@@ -1695,6 +1741,33 @@ fn transport_driver(d: Driver) {
                 tracing::warn!("transport poll error: {e}");
                 notify_dead("transport error");
                 break;
+            }
+        }
+    }
+
+    // Local teardown (the user hit Disconnect): say goodbye on the DATA channel
+    // as well. `Engine::end_session` announces over signaling, which is useless
+    // when the signaling socket is itself the thing that broke — the peer would
+    // then sit out the full grace period instead of dropping immediately.
+    if stop.load(Ordering::SeqCst) && ctl_open && connected {
+        let _ = tp.send_ctl(&serialize(&protocol::ControlMsg::Bye));
+        // The loop is over, so nothing else will flush str0m's queue — pump it
+        // briefly by hand, bounded so teardown can't hang on a dead socket.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        while std::time::Instant::now() < deadline {
+            match tp.poll_output() {
+                Ok(str0m::Output::Transmit(t)) => {
+                    let via_relay = turn.as_ref().is_some_and(|a| t.source == a.relayed);
+                    if via_relay {
+                        if let Some(alloc) = turn.as_mut() {
+                            alloc.send_via_relay(&socket, t.destination, &t.contents);
+                        }
+                    } else {
+                        let _ = socket.send_to(&t.contents, t.destination);
+                    }
+                }
+                // Nothing queued right now — the Bye is on the wire.
+                _ => break,
             }
         }
     }

@@ -51,6 +51,12 @@ function render() {
   $('modal-password').classList.toggle('hidden', state !== 'PASSWORD_PROMPT');
   $('modal-incoming').classList.toggle('hidden', state !== 'INCOMING');
 
+  // The "connection lost" panel only belongs to a live session — never leave it
+  // up on the home screen. (Only ever hides; showing it is the engine's call.)
+  if (state !== 'VIEW_ACTIVE' && state !== 'HOST_ACTIVE') {
+    $('modal-link').classList.add('hidden');
+  }
+
   // Connect is only possible from a fully idle, registered app.
   $('btn-connect').disabled = state !== 'READY' || !validUuid($('remote-id').value.trim());
 }
@@ -327,6 +333,11 @@ $('host-perm').addEventListener('change', () => {
 });
 $('btn-host-end').addEventListener('click', () => invoke('end_session'));
 $('btn-view-end').addEventListener('click', () => invoke('end_session'));
+// Don't wait out the grace period — give up now.
+$('btn-link-end').addEventListener('click', () => {
+  $('modal-link').classList.add('hidden');
+  invoke('end_session');
+});
 
 // ---- engine events ---------------------------------------------------------
 listen('server-status', (e) => {
@@ -372,6 +383,9 @@ listen('password-required', (e) => {
 listen('role-changed', (e) => {
   const p = e.payload;
   stopCountdown();
+  // Whatever happens next (reconnected, or dropped back to the home screen),
+  // the "connection lost" panel is stale.
+  $('modal-link').classList.add('hidden');
   if (p.role === 'host') {
     $('host-peer').textContent = p.peer;
     $('host-perm').value = p.permission;
@@ -390,6 +404,20 @@ listen('role-changed', (e) => {
 });
 
 listen('toast', (e) => toast(e.payload.message || '', 'error'));
+
+// The peer went quiet. The engine has already hidden the native video (a frozen
+// frame is indistinguishable from a live one), so this panel is what the user
+// sees while the grace period runs.
+listen('link-trouble', (e) => {
+  if (state !== 'VIEW_ACTIVE' && state !== 'HOST_ACTIVE') return;
+  $('link-count').textContent = String(e.payload.secsLeft ?? 0);
+  $('modal-link').classList.remove('hidden');
+});
+
+listen('link-restored', () => {
+  $('modal-link').classList.add('hidden');
+  toast('Connection restored');
+});
 
 // ---- boot ------------------------------------------------------------------
 (async () => {

@@ -82,6 +82,7 @@ fn get_config(state: tauri::State<'_, AppState>) -> serde_json::Value {
         "recentIds": c.recent_ids,
         "captureShortcuts": c.capture_shortcuts,
         "autoLogin": c.auto_login,
+        "clipboardSync": c.clipboard_sync,
         // Count only — the saved passwords themselves never reach the WebView.
         "savedLoginCount": c.saved_logins.len(),
     })
@@ -214,6 +215,9 @@ fn save_settings(state: tauri::State<'_, AppState>, patch: serde_json::Value) {
         }
         if let Some(b) = patch.get("autoLogin").and_then(|v| v.as_bool()) {
             cfg.auto_login = b;
+        }
+        if let Some(b) = patch.get("clipboardSync").and_then(|v| v.as_bool()) {
+            cfg.clipboard_sync = b;
         }
         // Explicit "forget everything" from the settings modal.
         if patch

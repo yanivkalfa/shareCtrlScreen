@@ -73,6 +73,9 @@ pub struct Config {
     pub recent_ids: Vec<String>,
     /// Viewer-side: capture OS-reserved shortcuts (Alt+Tab/Win) locally.
     pub capture_shortcuts: bool,
+    /// Mirror clipboard TEXT between the two machines during a session. Host
+    /// side additionally requires the live control permission.
+    pub clipboard_sync: bool,
     /// Viewer-side: when a host asks for a password we already have working
     /// credentials for, submit them without prompting.
     pub auto_login: bool,
@@ -102,6 +105,7 @@ impl Default for Config {
             share_display_id: None,
             recent_ids: Vec::new(),
             capture_shortcuts: false,
+            clipboard_sync: true,
             auto_login: false,
             saved_logins: BTreeMap::new(),
         }

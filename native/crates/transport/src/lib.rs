@@ -40,19 +40,20 @@ pub enum Error {
     ChannelClosed(&'static str),
 }
 
-/// The two data-channel ids once opened (§6). Video is an RTP media track (see
+/// The data-channel ids once opened (§6). Video is an RTP media track (see
 /// [`Transport::set_video_mid`]), negotiated via the engine's SDP API, so it is
 /// not a channel here.
 #[derive(Debug, Clone, Copy)]
 pub struct Channels {
     pub ctl: ChannelId,
     pub cursor: ChannelId,
+    pub bulk: ChannelId,
 }
 
-/// The two §6 data-channel configs. The host creates both when building the
-/// offer; the viewer matches them by label. Video is added separately as a media
-/// track in the SDP offer (see `begin_host` in the engine).
-pub fn channel_configs() -> [ChannelConfig; 2] {
+/// The §6 data-channel configs. The host creates them when building the offer;
+/// the viewer matches them by label. Video is added separately as a media track
+/// in the SDP offer (see `begin_host` in the engine).
+pub fn channel_configs() -> [ChannelConfig; 3] {
     [
         ChannelConfig {
             label: "ctl".to_string(),
@@ -66,6 +67,17 @@ pub fn channel_configs() -> [ChannelConfig; 2] {
             ordered: false,
             // Unreliable-latest: a stale cursor position is worthless.
             reliability: Reliability::MaxRetransmits { retransmits: 0 },
+            negotiated: None,
+            protocol: String::new(),
+        },
+        ChannelConfig {
+            // Bulk transfer (file contents, large clipboard payloads) on its OWN
+            // reliable channel. Sharing `ctl` would head-of-line block every
+            // keystroke and mouse click behind a multi-megabyte file — the
+            // session would feel frozen for the whole transfer.
+            label: "bulk".to_string(),
+            ordered: true,
+            reliability: Reliability::Reliable,
             negotiated: None,
             protocol: String::new(),
         },
@@ -95,7 +107,9 @@ pub enum Inbound {
     Ctl(Vec<u8>),
     /// A cursor position update.
     Cursor(Vec<u8>),
-    /// A data channel opened; once both are known the engine has [`Channels`].
+    /// One framed message on the bulk channel (file metadata/chunks).
+    Bulk(Vec<u8>),
+    /// A data channel opened; once all are known the engine has [`Channels`].
     ChannelOpen(ChannelId, String),
 }
 
@@ -104,6 +118,7 @@ pub struct Transport {
     rtc: Rtc,
     ctl: Option<ChannelId>,
     cursor: Option<ChannelId>,
+    bulk: Option<ChannelId>,
     /// The video RTP media track's mid. Host: set from `add_media` via
     /// [`Self::set_video_mid`]. Viewer: learned from `Event::MediaAdded`.
     video_mid: Option<Mid>,
@@ -123,6 +138,7 @@ impl Transport {
             rtc,
             ctl: None,
             cursor: None,
+            bulk: None,
             video_mid: None,
             video_pt: None,
             video_freq: None,
@@ -135,6 +151,7 @@ impl Transport {
     pub fn set_channels(&mut self, ch: Channels) {
         self.ctl = Some(ch.ctl);
         self.cursor = Some(ch.cursor);
+        self.bulk = Some(ch.bulk);
     }
 
     /// Host side: adopt the video media track's mid returned by `add_media`.
@@ -234,6 +251,29 @@ impl Transport {
         Ok(())
     }
 
+    /// Send one framed message on the reliable bulk channel (file transfer).
+    pub fn send_bulk(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        let id = self.bulk.ok_or(Error::ChannelClosed("bulk"))?;
+        if let Some(mut ch) = self.rtc.channel(id) {
+            ch.write(true, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Bytes still queued on the bulk channel. The file sender waits on this so a
+    /// transfer can't queue the whole file at once and starve the video stream of
+    /// bandwidth for the entire duration.
+    pub fn bulk_buffered(&mut self) -> usize {
+        match self.bulk {
+            Some(id) => self
+                .rtc
+                .channel(id)
+                .map(|mut ch| ch.buffered_amount())
+                .unwrap_or(0),
+            None => 0,
+        }
+    }
+
     /// Route a str0m [`Event`] into an [`Inbound`]. Returns `None` for events the
     /// engine does not need to act on.
     pub fn on_event(&mut self, event: Event) -> Option<Inbound> {
@@ -282,6 +322,7 @@ impl Transport {
                 match label.as_str() {
                     "ctl" => self.ctl = Some(id),
                     "cursor" => self.cursor = Some(id),
+                    "bulk" => self.bulk = Some(id),
                     _ => {}
                 }
                 Some(Inbound::ChannelOpen(id, label))
@@ -291,6 +332,8 @@ impl Transport {
                     Some(Inbound::Ctl(data.data))
                 } else if Some(data.id) == self.cursor {
                     Some(Inbound::Cursor(data.data))
+                } else if Some(data.id) == self.bulk {
+                    Some(Inbound::Bulk(data.data))
                 } else {
                     None
                 }

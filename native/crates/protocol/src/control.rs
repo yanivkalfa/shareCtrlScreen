@@ -48,6 +48,10 @@ pub enum ControlMsg {
     /// Reply to [`ControlMsg::Ping`], echoing its `seq`.
     #[serde(rename = "pong")]
     Pong { seq: u32 },
+    /// Clipboard text, synced in BOTH directions during a session. Text only —
+    /// never file lists or rendered formats. Size-capped by the sender.
+    #[serde(rename = "clip")]
+    Clipboard { text: String },
 }
 
 fn default_visible() -> bool {

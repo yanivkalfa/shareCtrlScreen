@@ -210,6 +210,20 @@
         </label>
 
         <fieldset class="field">
+          <legend>During a session</legend>
+          <label class="radio">
+            <input type="checkbox" id="set-clipboard-sync" />
+            Share clipboard text between the two machines
+          </label>
+          <div class="hint">
+            Text only, both directions. On the machine being controlled this
+            follows the control permission &mdash; a view-only session never
+            reads or writes its clipboard. Drag files onto the remote screen to
+            send them; they land in <b>Downloads\ShareCtrlScreen</b>.
+          </div>
+        </fieldset>
+
+        <fieldset class="field">
           <legend>Connecting out</legend>
           <label class="radio">
             <input type="checkbox" id="set-auto-login" />

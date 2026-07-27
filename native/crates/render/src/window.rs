@@ -19,10 +19,10 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetClientRect, MoveWindow, RegisterClassW, ShowWindow,
-    CS_HREDRAW, CS_VREDRAW, HMENU, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WM_KEYDOWN, WM_KEYUP,
-    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS,
+    CS_HREDRAW, CS_VREDRAW, HMENU, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WM_DROPFILES, WM_KEYDOWN,
+    WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS,
 };
 
 const CLASS_NAME: PCWSTR = w!("ShareCtrlVideoWindow");
@@ -55,6 +55,81 @@ pub enum VideoInput {
 /// wndproc forwards captured input to it. `None` ⇒ input is dropped (view-only
 /// or no session), so we never capture when we shouldn't.
 static INPUT_SINK: Mutex<Option<Sender<VideoInput>>> = Mutex::new(None);
+
+/// Files dropped onto the video surface, for push-to-host transfer. Installed by
+/// the viewer session; `None` ⇒ drops are ignored.
+static FILE_DROP_SINK: Mutex<Option<Sender<Vec<std::path::PathBuf>>>> = Mutex::new(None);
+
+/// Start accepting dropped files on the video window and route them to `tx`.
+pub fn set_file_drop_sink(tx: Sender<Vec<std::path::PathBuf>>) {
+    if let Ok(mut g) = FILE_DROP_SINK.lock() {
+        *g = Some(tx);
+    }
+    let hwnd_raw = crate::window::drop_target_hwnd();
+    if hwnd_raw != 0 {
+        // SAFETY: valid child HWND owned by this process.
+        unsafe {
+            windows::Win32::UI::Shell::DragAcceptFiles(HWND(hwnd_raw as *mut _), true);
+        }
+    }
+}
+
+/// Stop accepting dropped files (session end).
+pub fn clear_file_drop_sink() {
+    if let Ok(mut g) = FILE_DROP_SINK.lock() {
+        *g = None;
+    }
+    let hwnd_raw = drop_target_hwnd();
+    if hwnd_raw != 0 {
+        // SAFETY: valid child HWND owned by this process.
+        unsafe {
+            windows::Win32::UI::Shell::DragAcceptFiles(HWND(hwnd_raw as *mut _), false);
+        }
+    }
+}
+
+/// The video window that accepts drops — remembered at creation so the engine
+/// can enable drag-and-drop without threading the HWND through.
+static DROP_TARGET: AtomicU64 = AtomicU64::new(0);
+
+fn drop_target_hwnd() -> isize {
+    DROP_TARGET.load(Ordering::Relaxed) as isize
+}
+
+/// Pull the dropped paths out of a `WM_DROPFILES` handle and hand them to the
+/// sink. Always frees the drop handle, including when there is no sink.
+fn deliver_dropped_files(wparam: WPARAM) {
+    use windows::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP};
+    let hdrop = HDROP(wparam.0 as *mut _);
+    let mut paths = Vec::new();
+    // SAFETY: hdrop comes straight from WM_DROPFILES and is freed below.
+    unsafe {
+        // Passing u32::MAX as the index asks for the count.
+        let count = DragQueryFileW(hdrop, u32::MAX, None);
+        for i in 0..count {
+            let needed = DragQueryFileW(hdrop, i, None) as usize;
+            if needed == 0 {
+                continue;
+            }
+            let mut buf = vec![0u16; needed + 1];
+            let written = DragQueryFileW(hdrop, i, Some(&mut buf)) as usize;
+            if written > 0 {
+                paths.push(std::path::PathBuf::from(String::from_utf16_lossy(
+                    &buf[..written],
+                )));
+            }
+        }
+        DragFinish(hdrop);
+    }
+    if paths.is_empty() {
+        return;
+    }
+    if let Ok(guard) = FILE_DROP_SINK.lock() {
+        if let Some(tx) = guard.as_ref() {
+            let _ = tx.send(paths);
+        }
+    }
+}
 
 /// The rendered video's pixel size (`w<<32 | h`), published by the renderer each
 /// frame. Input normalization MUST use it: the video is drawn in an
@@ -241,6 +316,8 @@ impl VideoWindow {
                 None,
             )?
         };
+        // Remember the surface so the engine can toggle drag-and-drop on it.
+        DROP_TARGET.store(hwnd.0 as u64, Ordering::Relaxed);
         Ok(Self { hwnd, parent })
     }
 
@@ -497,6 +574,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // the host keeps a stuck modifier.
         WM_KILLFOCUS => {
             release_all_held();
+            return LRESULT(0);
+        }
+        // Files dropped on the video surface: the viewer pushes them to the host.
+        WM_DROPFILES => {
+            deliver_dropped_files(wparam);
             return LRESULT(0);
         }
         _ => {}

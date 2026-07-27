@@ -172,6 +172,7 @@ function openSettings() {
   $('set-share-audio').checked = config.shareAudio !== false;
   $('set-share-display').value = config.shareDisplayId || '';
   $('set-auto-login').checked = !!config.autoLogin;
+  $('set-clipboard-sync').checked = config.clipboardSync !== false;
   const saved = config.savedLoginCount || 0;
   const clear = $('set-clear-logins');
   clear.checked = false;
@@ -198,6 +199,7 @@ async function saveSettings() {
     shareAudio: $('set-share-audio').checked,
     shareDisplayId: $('set-share-display').value || null,
     autoLogin: $('set-auto-login').checked,
+    clipboardSync: $('set-clipboard-sync').checked,
     clearSavedLogins: $('set-clear-logins').checked
   };
 

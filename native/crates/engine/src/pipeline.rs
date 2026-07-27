@@ -31,6 +31,10 @@ static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 /// drawn by the render loop as a client-side sprite (§5a/§7).
 static CURSOR: Mutex<Option<(f64, f64, bool)>> = Mutex::new(None);
 
+/// The user's clipboard-sync setting, mirrored here so the permission flip can
+/// re-apply it without reaching for the config lock from the session path.
+static CLIPBOARD_SETTING: AtomicBool = AtomicBool::new(true);
+
 /// Host: the viewer's reported display size (`width<<32 | height`, 0 = unknown).
 /// The capture/encode loop scales to this so the viewer presents 1:1 instead of
 /// resampling every frame. One session at a time, so a global is fine.
@@ -61,6 +65,9 @@ struct Session {
     /// Host side: whether injecting remote input is currently allowed (the live
     /// `control` permission). Flipping to `false` releases any held keys/buttons.
     control: Arc<AtomicBool>,
+    /// Whether clipboard sync is live. Follows the control permission (and the
+    /// user setting), so revoking control also stops clipboard exchange.
+    clip_on: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -78,6 +85,12 @@ struct Driver {
     inject: Option<Arc<AtomicBool>>,
     /// Host: serialized cursor updates to send on the cursor channel.
     cursor_rx: Option<Receiver<Vec<u8>>>,
+    /// Viewer: encoded [`protocol::BulkFrame`]s for an outgoing file transfer.
+    /// Drained with backpressure so a large file can't monopolise the link.
+    bulk_rx: Option<Receiver<Vec<u8>>>,
+    /// Clipboard text received from the peer, handed to the clipboard thread
+    /// (which owns the OS clipboard and the echo guard).
+    clip_tx: Sender<String>,
     /// Host: the §6 data-channel ids created on the Rtc in `begin_host`.
     channels: Option<transport::Channels>,
     /// Host: the video RTP media track's mid (from `add_media`). Viewer learns
@@ -617,11 +630,12 @@ pub fn begin_host(engine: &Engine, peer: String, permission: Permission) {
     // exactly once via the direct API. Video is NOT a data channel — it is added
     // as an RTP media track below.
     let channels = {
-        let [c, cur] = transport::channel_configs();
+        let [c, cur, blk] = transport::channel_configs();
         let mut dapi = rtc.direct_api();
         let ctl = dapi.create_data_channel(c);
         let cursor = dapi.create_data_channel(cur);
-        transport::Channels { ctl, cursor }
+        let bulk = dapi.create_data_channel(blk);
+        transport::Channels { ctl, cursor, bulk }
     };
 
     let mut api = rtc.sdp_api();
@@ -657,6 +671,22 @@ pub fn begin_host(engine: &Engine, peer: String, permission: Permission) {
     let link = Arc::new(std::sync::atomic::AtomicU32::new(TARGET_BITRATE));
     let force_key = Arc::new(AtomicBool::new(false));
 
+    // Clipboard sync mirrors text both ways. Gated on the SAME live permission
+    // as input: a view-only peer must not be able to read this machine's
+    // clipboard (which can hold a password that was never on screen) or write to
+    // it. Flipping to view-only mid-session stops it immediately.
+    CLIPBOARD_SETTING.store(engine.config().clipboard_sync, Ordering::SeqCst);
+    let clip_on = Arc::new(AtomicBool::new(
+        engine.config().clipboard_sync && permission == Permission::Control,
+    ));
+    let (clip_tx, clip_rx) = std::sync::mpsc::channel::<String>();
+    let clip_ctl = ctl_tx.clone();
+    let clip_stop = stop.clone();
+    let clip_gate = clip_on.clone();
+    let cb = std::thread::spawn(move || {
+        clipboard_loop(clip_ctl, clip_rx, clip_gate, clip_stop);
+    });
+
     // Transport driver thread (owns the Rtc + UDP socket).
     let driver = Driver {
         rtc,
@@ -667,6 +697,9 @@ pub fn begin_host(engine: &Engine, peer: String, permission: Permission) {
         video_tx: None, // host does not render video
         inject: Some(control.clone()),
         cursor_rx: Some(cursor_rx),
+        bulk_rx: None, // host does not push files
+        clip_tx: clip_tx.clone(),
+
         channels: Some(channels),
         video_mid: Some(video_mid),
         force_key: Some(force_key.clone()),
@@ -698,7 +731,8 @@ pub fn begin_host(engine: &Engine, peer: String, permission: Permission) {
         signal_tx,
         ctl_tx,
         control,
-        threads: vec![t, m],
+        clip_on,
+        threads: vec![t, m, cb],
     });
     let _ = peer;
 }
@@ -759,12 +793,36 @@ fn start_viewer_transport(engine: &Engine, peer: String, offer_sdp: String) {
         }
     }
 
+    // Viewer file push: dropping files on the video window queues them here, and
+    // this thread streams each one as bulk frames. Reading/chunking on its own
+    // thread keeps a slow disk off the transport loop.
+    let (bulk_tx, bulk_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (drop_tx, drop_rx) = std::sync::mpsc::channel::<Vec<std::path::PathBuf>>();
+    render::window::set_file_drop_sink(drop_tx);
+    let stop_f = stop.clone();
+    let ui_f = engine.ui_sender();
+    let f = std::thread::spawn(move || {
+        file_send_loop(drop_rx, bulk_tx, ui_f, stop_f);
+    });
+
     // Viewer input capture (§7): the video window's wndproc pushes VideoInput to
     // us; we translate to protocol InputMsg and relay on the ctl channel. Gated
     // by the sink being installed, so we only capture during control sessions —
     // and the host also enforces its own permission (defence in depth).
     let (input_tx, input_rx) = std::sync::mpsc::channel::<render::window::VideoInput>();
     render::window::set_input_sink(input_tx);
+
+    // Clipboard sync (viewer side). The host applies its own permission gate; on
+    // this side the user's setting is what governs.
+    CLIPBOARD_SETTING.store(engine.config().clipboard_sync, Ordering::SeqCst);
+    let clip_on = Arc::new(AtomicBool::new(engine.config().clipboard_sync));
+    let (clip_tx, clip_rx) = std::sync::mpsc::channel::<String>();
+    let clip_ctl = ctl_tx.clone();
+    let clip_stop = stop.clone();
+    let clip_gate = clip_on.clone();
+    let cb = std::thread::spawn(move || {
+        clipboard_loop(clip_ctl, clip_rx, clip_gate, clip_stop);
+    });
     let ctl_for_input = ctl_tx.clone();
     let stop_i = stop.clone();
     let i = std::thread::spawn(move || {
@@ -823,6 +881,8 @@ fn start_viewer_transport(engine: &Engine, peer: String, offer_sdp: String) {
         video_tx: Some(video_tx),
         inject: None, // viewer never injects
         cursor_rx: None,
+        bulk_rx: Some(bulk_rx),
+        clip_tx: clip_tx.clone(),
         channels: None,  // learned from ChannelOpen by label
         video_mid: None, // learned from Event::MediaAdded
         force_key: None,
@@ -846,7 +906,7 @@ fn start_viewer_transport(engine: &Engine, peer: String, offer_sdp: String) {
         }
     });
 
-    let mut threads = vec![t, r, i];
+    let mut threads = vec![t, r, i, f, cb];
 
     // Shortcut capture (§8a): grab OS-reserved combos (Alt+Tab, Win) via
     // WH_KEYBOARD_LL while the session window is foreground and forward them to
@@ -890,6 +950,7 @@ fn start_viewer_transport(engine: &Engine, peer: String, offer_sdp: String) {
         signal_tx,
         ctl_tx,
         control: Arc::new(AtomicBool::new(false)),
+        clip_on,
         threads,
     });
 }
@@ -957,6 +1018,12 @@ pub fn set_video_visible(visible: bool) {
 pub fn set_control(allow: bool) {
     if let Some(s) = SESSION.lock().as_ref() {
         s.control.store(allow, Ordering::SeqCst);
+        // Clipboard exchange is part of "control" — revoking it must stop the
+        // peer reading this machine's clipboard too, not just its input.
+        s.clip_on.store(
+            allow && CLIPBOARD_SETTING.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
     }
 }
 
@@ -964,6 +1031,7 @@ pub fn set_control(allow: bool) {
 pub fn teardown(_engine: &Engine) {
     // Stop capturing viewer input before threads join (idempotent).
     render::window::clear_input_sink();
+    render::window::clear_file_drop_sink();
     let session = SESSION.lock().take();
     if let Some(session) = session {
         session.stop.store(true, Ordering::SeqCst);
@@ -994,6 +1062,8 @@ fn transport_driver(d: Driver) {
         video_tx,
         inject,
         cursor_rx,
+        bulk_rx,
+        clip_tx,
         channels,
         video_mid,
         force_key,
@@ -1055,6 +1125,9 @@ fn transport_driver(d: Driver) {
     // keyframe is forced on connect so the first delivered frame is decodable.
     let mut ctl_open = false;
     let mut cursor_open = false;
+    let mut bulk_open = false;
+    // Host: the file transfer currently being received, if any.
+    let mut incoming: Option<crate::transfer::Incoming> = None;
     let mut ctl_backlog: Vec<Vec<u8>> = Vec::new();
 
     // Liveness watchdog: if NOTHING arrives from the peer for this long, the
@@ -1208,6 +1281,23 @@ fn transport_driver(d: Driver) {
                 }
             }
         }
+        // Viewer: outbound file bytes, WITH BACKPRESSURE. Queueing a whole file
+        // at once would hand SCTP megabytes to push as fast as it can, starving
+        // the video stream for the entire transfer; stopping while the channel
+        // already holds a backlog keeps the session usable while files move.
+        if let Some(bulk_rx) = &bulk_rx {
+            if bulk_open {
+                const BULK_QUEUE_LIMIT: usize = 256 * 1024;
+                while tp.bulk_buffered() < BULK_QUEUE_LIMIT {
+                    match bulk_rx.try_recv() {
+                        Ok(frame) => {
+                            let _ = tp.send_bulk(&frame);
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
 
         // 2.5) TURN housekeeping: refresh the allocation before it expires.
         if let Some(alloc) = turn.as_mut() {
@@ -1316,6 +1406,7 @@ fn transport_driver(d: Driver) {
                                     }
                                 }
                                 "cursor" => cursor_open = true,
+                                "bulk" => bulk_open = true,
                                 _ => {} // "init" — SDP bootstrap channel, unused
                             }
                         }
@@ -1437,6 +1528,19 @@ fn transport_driver(d: Driver) {
                                     );
                                     continue;
                                 }
+                                // Clipboard text from the peer. On the host this
+                                // is gated on the live control permission, same
+                                // as input and file receipt.
+                                Ok(protocol::ControlMsg::Clipboard { text }) => {
+                                    let allowed = inject
+                                        .as_ref()
+                                        .map(|gate| gate.load(Ordering::SeqCst))
+                                        .unwrap_or(true); // viewer: no gate
+                                    if allowed && text.len() <= crate::clipboard::MAX_TEXT_BYTES {
+                                        let _ = clip_tx.send(text);
+                                    }
+                                    continue;
+                                }
                                 // A clean goodbye from either end.
                                 Ok(protocol::ControlMsg::Bye) => {
                                     notify_dead("the other side ended the session");
@@ -1458,6 +1562,98 @@ fn transport_driver(d: Driver) {
                                     {
                                         inj.dispatch(&msg);
                                     }
+                                }
+                            }
+                        }
+                        Inbound::Bulk(bytes) => {
+                            // Host: an inbound file. Writing to this machine's
+                            // disk is at least as privileged as injecting input,
+                            // so it needs the SAME live control permission — a
+                            // view-only peer cannot drop files here.
+                            let allowed = inject
+                                .as_ref()
+                                .is_some_and(|gate| gate.load(Ordering::SeqCst));
+                            if !allowed {
+                                if incoming.take().is_some() {
+                                    tracing::warn!("file transfer aborted: control revoked");
+                                }
+                                continue;
+                            }
+                            let Some(frame) = protocol::BulkFrame::decode(&bytes) else {
+                                continue; // malformed — ignore, never trust it
+                            };
+                            match frame {
+                                protocol::BulkFrame::Begin(meta) => {
+                                    // A new Begin supersedes any transfer in
+                                    // flight; drop that partial file first.
+                                    if let Some(prev) = incoming.take() {
+                                        prev.abort();
+                                    }
+                                    let dir = crate::transfer::receive_dir();
+                                    match crate::transfer::Incoming::begin(&meta, &dir) {
+                                        Ok(inc) => {
+                                            tracing::info!(
+                                                "receiving {} ({} bytes)",
+                                                meta.name,
+                                                meta.size
+                                            );
+                                            let _ = ui.send(crate::UiEvent::Toast(format!(
+                                                "Receiving {}…",
+                                                meta.name
+                                            )));
+                                            incoming = Some(inc);
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("refused file {}: {e}", meta.name);
+                                            let _ = ui.send(crate::UiEvent::Toast(format!(
+                                                "Refused file: {e}"
+                                            )));
+                                        }
+                                    }
+                                }
+                                protocol::BulkFrame::Chunk(data) => {
+                                    if let Some(inc) = incoming.as_mut() {
+                                        if let Err(e) = inc.write(&data) {
+                                            tracing::warn!("file transfer failed: {e}");
+                                            let _ = ui.send(crate::UiEvent::Toast(format!(
+                                                "Transfer failed: {e}"
+                                            )));
+                                            if let Some(bad) = incoming.take() {
+                                                bad.abort();
+                                            }
+                                        }
+                                    }
+                                }
+                                protocol::BulkFrame::End => {
+                                    if let Some(inc) = incoming.take() {
+                                        match inc.finish() {
+                                            Ok(path) => {
+                                                tracing::info!("received file {path:?}");
+                                                let name = path
+                                                    .file_name()
+                                                    .unwrap_or_default()
+                                                    .to_string_lossy()
+                                                    .into_owned();
+                                                let _ = ui.send(crate::UiEvent::Toast(format!(
+                                                    "Saved {name} to Downloads\\ShareCtrlScreen"
+                                                )));
+                                            }
+                                            Err(e) => {
+                                                let _ = ui.send(crate::UiEvent::Toast(format!(
+                                                    "Transfer failed: {e}"
+                                                )));
+                                            }
+                                        }
+                                    }
+                                }
+                                protocol::BulkFrame::Abort(reason) => {
+                                    if let Some(inc) = incoming.take() {
+                                        inc.abort();
+                                    }
+                                    tracing::warn!("sender aborted transfer: {reason}");
+                                    let _ = ui.send(crate::UiEvent::Toast(
+                                        "Transfer cancelled by sender".into(),
+                                    ));
                                 }
                             }
                         }
@@ -1513,6 +1709,154 @@ fn fit_within(want: (u32, u32), src: (u32, u32)) -> (u32, u32) {
     let w = ((src.0 as f64 * s).round() as u32) & !1;
     let h = ((src.1 as f64 * s).round() as u32) & !1;
     (w.max(2), h.max(2))
+}
+
+// ---- File push (viewer → host) ----------------------------------------------
+
+/// Read each dropped file and emit it as bulk frames. One file at a time: the
+/// bulk channel is ordered and a transfer has no id, so overlapping them would
+/// interleave two files into one.
+fn file_send_loop(
+    drops: Receiver<Vec<std::path::PathBuf>>,
+    out: Sender<Vec<u8>>,
+    ui: tokio::sync::mpsc::UnboundedSender<crate::UiEvent>,
+    stop: Arc<AtomicBool>,
+) {
+    use protocol::transfer::{BulkFrame, FileMeta, CHUNK_BYTES, MAX_FILE_BYTES};
+    use std::io::Read;
+
+    while !stop.load(Ordering::SeqCst) {
+        let Ok(paths) = drops.recv_timeout(std::time::Duration::from_millis(200)) else {
+            continue;
+        };
+        for path in paths {
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let Ok(meta) = std::fs::metadata(&path) else {
+                let _ = ui.send(crate::UiEvent::Toast(format!("Cannot read {name}")));
+                continue;
+            };
+            if meta.is_dir() {
+                // Folders would need a manifest and per-entry paths — exactly the
+                // shape that invites traversal bugs. Files only, for now.
+                let _ = ui.send(crate::UiEvent::Toast(format!(
+                    "{name} is a folder — send files instead"
+                )));
+                continue;
+            }
+            let size = meta.len();
+            if size > MAX_FILE_BYTES {
+                let _ = ui.send(crate::UiEvent::Toast(format!("{name} is too large")));
+                continue;
+            }
+            let Ok(mut file) = std::fs::File::open(&path) else {
+                let _ = ui.send(crate::UiEvent::Toast(format!("Cannot open {name}")));
+                continue;
+            };
+
+            let _ = ui.send(crate::UiEvent::Toast(format!("Sending {name}…")));
+            let _ = out.send(
+                BulkFrame::Begin(FileMeta {
+                    name: name.clone(),
+                    size,
+                })
+                .encode(),
+            );
+
+            let mut buf = vec![0u8; CHUNK_BYTES];
+            let mut sent: u64 = 0;
+            let mut failed = false;
+            loop {
+                match file.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if out
+                            .send(BulkFrame::Chunk(buf[..n].to_vec()).encode())
+                            .is_err()
+                        {
+                            failed = true; // session ended under us
+                            break;
+                        }
+                        sent += n as u64;
+                    }
+                    Err(e) => {
+                        let _ = out.send(BulkFrame::Abort(format!("read error: {e}")).encode());
+                        let _ = ui.send(crate::UiEvent::Toast(format!("Failed sending {name}")));
+                        failed = true;
+                        break;
+                    }
+                }
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+            }
+            if failed {
+                continue;
+            }
+            if sent != size {
+                // The file changed while we read it — tell the peer rather than
+                // let it write a file that doesn't match what was announced.
+                let _ = out.send(BulkFrame::Abort("file changed while sending".into()).encode());
+                let _ = ui.send(crate::UiEvent::Toast(format!(
+                    "{name} changed while sending"
+                )));
+                continue;
+            }
+            let _ = out.send(BulkFrame::End.encode());
+        }
+    }
+}
+
+// ---- Clipboard sync (both directions) ---------------------------------------
+
+/// Mirror clipboard TEXT between the two machines. Polls the OS change counter
+/// (cheap, no window needed) and sends on change. Applying a value received from
+/// the peer bumps that same counter, so the resulting sequence number is
+/// remembered and skipped — otherwise each side would echo the other forever.
+fn clipboard_loop(
+    ctl_tx: Sender<Vec<u8>>,
+    inbound: Receiver<String>,
+    enabled: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut last_seq = crate::clipboard::sequence();
+    let mut last_text: Option<String> = None;
+    while !stop.load(Ordering::SeqCst) {
+        // Apply anything the peer sent first, so our own poll below sees the
+        // resulting sequence number and treats it as ours.
+        while let Ok(text) = inbound.try_recv() {
+            if !enabled.load(Ordering::SeqCst) {
+                continue;
+            }
+            if last_text.as_deref() == Some(text.as_str()) {
+                continue; // already have it — don't touch the clipboard at all
+            }
+            if let Some(seq) = crate::clipboard::set_text(&text) {
+                last_seq = seq;
+                last_text = Some(text);
+            }
+        }
+
+        if enabled.load(Ordering::SeqCst) {
+            let seq = crate::clipboard::sequence();
+            if seq != last_seq {
+                last_seq = seq;
+                if let Some(text) = crate::clipboard::get_text() {
+                    let changed = last_text.as_deref() != Some(text.as_str());
+                    if changed && text.len() <= crate::clipboard::MAX_TEXT_BYTES {
+                        last_text = Some(text.clone());
+                        let _ = ctl_tx.send(serialize(&ControlMsg::Clipboard { text }));
+                    }
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
 }
 
 // ---- Host capture → encode --------------------------------------------------

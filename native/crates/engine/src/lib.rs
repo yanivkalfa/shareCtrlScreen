@@ -8,10 +8,13 @@
 //! The control plane here is portable and unit-tested; the media pipeline
 //! ([`pipeline`]) is Windows-only and wires `capture`/`codec`/`render`/`input`.
 
+#[cfg(windows)]
+pub mod clipboard;
 pub mod handshake;
 #[cfg(windows)]
 pub mod pipeline;
 pub mod secret;
+pub mod transfer;
 pub mod turn;
 
 use std::path::PathBuf;

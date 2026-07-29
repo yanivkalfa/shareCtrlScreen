@@ -79,6 +79,9 @@ pub struct Config {
     /// Host-side: paste a received file into the window it was dropped on. Off
     /// leaves it on the clipboard so the user chooses where it lands.
     pub paste_dropped_files: bool,
+    /// Launch the app when the user logs in (per-user Run key). See
+    /// `engine::autostart` — this is logon, not boot.
+    pub start_with_windows: bool,
     /// Viewer-side: when a host asks for a password we already have working
     /// credentials for, submit them without prompting.
     pub auto_login: bool,
@@ -110,6 +113,7 @@ impl Default for Config {
             capture_shortcuts: false,
             clipboard_sync: true,
             paste_dropped_files: true,
+            start_with_windows: false,
             auto_login: false,
             saved_logins: BTreeMap::new(),
         }

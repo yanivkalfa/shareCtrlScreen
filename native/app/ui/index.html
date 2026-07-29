@@ -225,6 +225,20 @@
         </label>
 
         <fieldset class="field">
+          <legend>This machine</legend>
+          <label class="radio">
+            <input type="checkbox" id="set-start-with-windows" />
+            Start ShareCtrlScreen when I sign in to Windows
+          </label>
+          <div class="hint">
+            Starts minimized, so this machine is reachable after a restart
+            without anyone opening the app. This runs at <b>sign-in</b>, not at
+            boot &mdash; a machine that has restarted but not been signed into
+            cannot be reached.
+          </div>
+        </fieldset>
+
+        <fieldset class="field">
           <legend>During a session</legend>
           <label class="radio">
             <input type="checkbox" id="set-clipboard-sync" />

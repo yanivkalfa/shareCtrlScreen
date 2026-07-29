@@ -9,6 +9,8 @@
 //! ([`pipeline`]) is Windows-only and wires `capture`/`codec`/`render`/`input`.
 
 #[cfg(windows)]
+pub mod autostart;
+#[cfg(windows)]
 pub mod clipboard;
 pub mod handshake;
 #[cfg(windows)]

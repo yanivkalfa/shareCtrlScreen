@@ -180,6 +180,7 @@ function openSettings() {
   $('set-auto-login').checked = !!config.autoLogin;
   $('set-clipboard-sync').checked = config.clipboardSync !== false;
   $('set-paste-dropped').checked = config.pasteDroppedFiles !== false;
+  $('set-start-with-windows').checked = !!config.startWithWindows;
   const saved = config.savedLoginCount || 0;
   const clear = $('set-clear-logins');
   clear.checked = false;
@@ -208,6 +209,7 @@ async function saveSettings() {
     autoLogin: $('set-auto-login').checked,
     clipboardSync: $('set-clipboard-sync').checked,
     pasteDroppedFiles: $('set-paste-dropped').checked,
+    startWithWindows: $('set-start-with-windows').checked,
     clearSavedLogins: $('set-clear-logins').checked
   };
 
@@ -240,9 +242,15 @@ $('btn-view-refresh').addEventListener('click', () => {
   invoke('request_refresh');
   toast('Requested a fresh frame');
 });
-$('btn-view-settings').addEventListener('click', () => {
-  // Hide the native video so the settings modal (web UI) is visible above it.
-  invoke('set_video_visible', { visible: false });
+$('btn-view-settings').addEventListener('click', async () => {
+  // Take the native video down BEFORE painting the modal — it sits above the web
+  // UI, so opening the dialog first means it appears underneath the video (and,
+  // if the hover bar was open, sliced to that strip).
+  try {
+    await invoke('set_video_visible', { visible: false });
+  } catch (_) {
+    /* fall through — the dialog is still better than nothing */
+  }
   openSettings();
 });
 

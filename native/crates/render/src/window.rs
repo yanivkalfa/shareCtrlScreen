@@ -464,9 +464,34 @@ pub fn hide(hwnd_raw: isize) {
     let hwnd = HWND(hwnd_raw as *mut _);
     REVEAL_OFFSET.store(0, std::sync::atomic::Ordering::SeqCst);
     VIDEO_DIMS.store(0, Ordering::Relaxed); // avoid stale mapping next session
-                                            // SAFETY: valid child HWND.
+
+    // Clip the surface to NOTHING as well as hiding it.
+    //
+    // `ShowWindow` is called from whatever thread the UI command lands on, while
+    // this window belongs to the UI thread, so it can be deferred. If the bar was
+    // revealed when the user opened Settings, a deferred hide left the clip in
+    // place — and the clip is honoured immediately — so the web page was visible
+    // only through the 40px bar strip and the Settings dialog appeared sliced.
+    // An empty region is applied by the same mechanism that reveals the bar, so
+    // whatever happens to ShowWindow the surface covers nothing.
+    clip_to_nothing(hwnd);
+
+    // SAFETY: valid child HWND.
     unsafe {
         let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+}
+
+/// Reduce the window's visible region to an empty rect — it stops painting over
+/// anything without depending on `ShowWindow` having been processed yet.
+fn clip_to_nothing(hwnd: HWND) {
+    use windows::Win32::Graphics::Gdi::{CreateRectRgn, DeleteObject, SetWindowRgn, HGDIOBJ};
+    // SAFETY: on success the window owns the region; on failure we free it.
+    unsafe {
+        let rgn = CreateRectRgn(0, 0, 0, 0);
+        if SetWindowRgn(hwnd, Some(rgn), true) == 0 {
+            let _ = DeleteObject(HGDIOBJ(rgn.0));
+        }
     }
 }
 

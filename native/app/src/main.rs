@@ -84,6 +84,7 @@ fn get_config(state: tauri::State<'_, AppState>) -> serde_json::Value {
         "autoLogin": c.auto_login,
         "clipboardSync": c.clipboard_sync,
         "pasteDroppedFiles": c.paste_dropped_files,
+        "startWithWindows": c.start_with_windows,
         // Count only — the saved passwords themselves never reach the WebView.
         "savedLoginCount": c.saved_logins.len(),
     })
@@ -179,7 +180,10 @@ async fn approve(
 }
 
 #[tauri::command]
-fn save_settings(state: tauri::State<'_, AppState>, patch: serde_json::Value) {
+fn save_settings(
+    state: tauri::State<'_, AppState>,
+    patch: serde_json::Value,
+) -> Result<(), String> {
     state.engine.update_config(|cfg| {
         if let Some(mode) = patch.get("mode").and_then(|v| v.as_str()) {
             cfg.mode = if mode == "password" {
@@ -231,7 +235,22 @@ fn save_settings(state: tauri::State<'_, AppState>, patch: serde_json::Value) {
         {
             cfg.saved_logins.clear();
         }
+        if let Some(b) = patch.get("startWithWindows").and_then(|v| v.as_bool()) {
+            cfg.start_with_windows = b;
+        }
     });
+
+    // Apply the startup registration AFTER the config is persisted, so the two
+    // can't disagree. A failure here is surfaced rather than swallowed — a
+    // startup toggle that silently does nothing is worse than one that says why.
+    #[cfg(windows)]
+    if let Some(b) = patch.get("startWithWindows").and_then(|v| v.as_bool()) {
+        if let Err(e) = engine::autostart::set_enabled(b) {
+            tracing::warn!("start-with-Windows: {e}");
+            return Err(e);
+        }
+    }
+    Ok(())
 }
 
 fn config_path() -> PathBuf {
@@ -286,6 +305,13 @@ fn main() {
     let decider = Arc::new(AppDecider::default());
     let (engine, mut ui_rx, mut sig_rx) =
         Engine::start(config_path(), decider.clone() as Arc<dyn Decider>);
+
+    // Keep the Run entry honest. It records an absolute path, which goes stale
+    // whenever the app is updated, reinstalled or run from a different build —
+    // and a stale entry fails silently at logon, so the user would simply find
+    // the app never started despite the setting being on.
+    #[cfg(windows)]
+    engine::autostart::reconcile(engine.config().start_with_windows);
 
     let state = AppState {
         engine: engine.clone(),
@@ -366,6 +392,12 @@ fn main() {
             if let Some(win) = app.get_webview_window("main") {
                 if let Ok(hwnd) = win.hwnd() {
                     engine::pipeline::create_video_window(hwnd.0 as isize);
+                }
+                // Launched by Windows at logon: come up minimized rather than
+                // throwing a window in the user's face on every boot. The app is
+                // useful purely by being reachable, so it does not need focus.
+                if std::env::args().any(|a| a == engine::autostart::AUTOSTART_FLAG) {
+                    let _ = win.minimize();
                 }
             }
             Ok(())

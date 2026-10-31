@@ -182,8 +182,13 @@ APPROVE.
    harmless, tell the owner once.
 6. Merge: `git merge --ff-only task/<ID>` into `port/multi-os`; re-run step 4 on
    `port/multi-os`; update the Status table (state, commit, "device-pending"
-   if applicable, tier used); commit the plan update; `git worktree remove`,
-   `git branch -d task/<ID>`; retire the builder.
+   if applicable, tier used); commit the plan update; retire the builder; then
+   **reclaim the disk** — each worktree carries a 3–5 GB `target/` and the WSL
+   build another 2–4 GB: `git worktree remove --force <path>`,
+   `git branch -d task/<ID> worktree-agent-<id>`, and in WSL
+   `rm -rf /tmp/sct-<ID>`. At session end, `git worktree prune`, check
+   `.claude/worktrees` holds only live tasks, and `wsl -e bash -lc 'du -sh /tmp/sct-*'`
+   for strays.
 
 Findings always go to the original builder. After two rejected rounds on the
 same point, escalate the task one tier up with the full history attached.

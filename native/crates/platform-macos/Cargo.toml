@@ -14,3 +14,6 @@ workspace = true
 platform-api = { path = "../platform-api" }
 tracing.workspace = true
 dirs = "6"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSString", "NSURL"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard"] }

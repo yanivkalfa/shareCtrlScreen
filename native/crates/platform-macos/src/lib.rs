@@ -10,13 +10,15 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use platform_api::unavailable::{NoAutostart, NoClipboard, NoCodecs, NoSecretStore};
+use platform_api::unavailable::{NoAutostart, NoCodecs, NoSecretStore};
 use platform_api::{
     Autostart, CaptureError, Clipboard, CodecFactory, DisplayInfo, InputError, InputInjector,
     OsPermission, Paths, PermissionReport, PermissionState, Platform, PlatformInfo,
     RawDisplayHandle, RawWindowHandle, ScreenCapture, SecretStore, ShortcutHook, SurfaceError,
     VideoSurface,
 };
+
+mod clipboard;
 
 const NOT_YET: &str = "not available on macOS in this version";
 
@@ -110,7 +112,7 @@ impl Platform for MacPlatform {
     }
 
     fn create_clipboard(&self) -> Box<dyn Clipboard> {
-        Box::new(NoClipboard)
+        Box::new(clipboard::MacClipboard)
     }
 
     fn secrets(&self) -> Arc<dyn SecretStore> {

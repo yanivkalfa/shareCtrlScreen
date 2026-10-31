@@ -67,6 +67,38 @@ deliberately **not** used, so the app runs **unsigned** — the only cost is a f
 SmartScreen "Run anyway" prompt (§8b/§11.4). No code-signing certificate, no codec
 license, no cloud bill: `$0` to build and ship (§11.4).
 
+## macOS install
+
+Requires macOS 13 (Ventura) or later; the DMG is universal (Apple Silicon and Intel). The
+app is signed with a self-signed certificate, **not** notarized, so macOS blocks the first
+launch. This is expected and happens once per downloaded build:
+
+1. Open the DMG and drag `ShareCtrlScreen` onto `Applications`.
+2. Open it from `Applications`. macOS says *"Apple could not verify ShareCtrlScreen is free
+   of malware…"*. Click **Done** (not *Move to Trash*).
+3. System Settings → **Privacy & Security** → scroll to *Security* → **Open Anyway**
+   next to ShareCtrlScreen → enter your password → **Open Anyway**.
+   (macOS 15 Sequoia removed the Control-click → Open shortcut; this is the only GUI way.)
+4. Or in Terminal, instead of 2–3: `xattr -dr com.apple.quarantine /Applications/ShareCtrlScreen.app`
+5. Grant **Screen & System Audio Recording** and **Accessibility** when asked (the app
+   shows a checklist). Screen Recording needs a restart of the app after granting.
+
+*"ShareCtrlScreen is damaged and can't be opened"* means the quarantine flag is set on a
+bundle whose signature is missing or broken (an unsigned or re-zipped copy). Re-download
+the DMG; if it persists, run the `xattr` command above.
+
+Updating: replace `/Applications/ShareCtrlScreen.app` with the new build (same path).
+Permissions stay granted because every build is signed by the same certificate. If they
+vanish after an update, the certificate changed, see `../plans/checklists/M10.md`.
+macOS 15+ additionally asks about once a month to confirm screen recording; that prompt
+comes from macOS and cannot be turned off by the app.
+
+Maintainers: `scripts/macos-make-signing-cert.sh` creates the certificate (once),
+`scripts/macos-sign.sh` signs a `.app`, `.github/workflows/mac-build.yml` produces the DMG.
+The two repository secrets are `MAC_SIGN_P12_B64` and `MAC_SIGN_P12_PASS`; without them
+the workflow falls back to an ad-hoc signature (permissions are lost on every update).
+`app/icons/icon.icns` is regenerated with `cargo tauri icon` (command in `../plans/checklists/M10.md`).
+
 ## Licensing (§11 — CI-enforced)
 
 - `deny.toml` — `cargo deny check` allowlist + banned-crate list (AGPL capture crates,

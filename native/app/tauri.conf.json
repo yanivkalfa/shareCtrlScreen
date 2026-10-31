@@ -25,8 +25,13 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
-    "icon": ["icons/icon.ico"],
+    "targets": ["nsis", "app", "dmg"],
+    "icon": ["icons/icon.ico", "icons/icon.icns"],
+    "macOS": {
+      "minimumSystemVersion": "13.0",
+      "signingIdentity": "-",
+      "hardenedRuntime": false
+    },
     "windows": {
       "nsis": {
         "installMode": "perMachine"

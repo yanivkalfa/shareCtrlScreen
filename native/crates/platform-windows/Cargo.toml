@@ -15,6 +15,7 @@ platform-api = { path = "../platform-api" }
 protocol = { path = "../protocol" }
 capture = { path = "../capture" }
 codec = { path = "../codec" }
+codec-openh264 = { path = "../codec-openh264" }
 render = { path = "../render" }
 input = { path = "../input" }
 elevation = { path = "../elevation" }

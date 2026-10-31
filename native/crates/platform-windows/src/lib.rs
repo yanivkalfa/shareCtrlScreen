@@ -16,12 +16,14 @@ pub mod clipboard;
 pub mod secret;
 
 mod adapters;
+mod cpu;
 mod displays;
 pub mod gpu;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use codec_openh264::{OpenH264, WithSoftwareH264};
 use platform_api::{
     Autostart, CaptureError, Clipboard, CodecFactory, DisplayInfo, InputError, InputInjector,
     OsPermission, Paths, PermissionReport, Platform, PlatformInfo, RawDisplayHandle,
@@ -30,18 +32,29 @@ use platform_api::{
 
 /// The Windows platform. Cheap to construct; holds no OS resources itself.
 pub struct WindowsPlatform {
-    codecs: adapters::MfCodecFactory,
+    /// Media Foundation first; Cisco OpenH264 when MF has no usable H.264
+    /// (e.g. Windows "N" editions without the Media Feature Pack). Desktop
+    /// Duplication frames live on the GPU, so the software encoder reads them
+    /// back through a staging texture.
+    codecs: WithSoftwareH264<adapters::MfCodecFactory>,
     secrets: Arc<adapters::DpapiSecretStore>,
     autostart: Arc<adapters::RunKeyAutostart>,
 }
 
 impl WindowsPlatform {
     pub fn new() -> Self {
+        let openh264 = Arc::new(OpenH264::new(app_dir().join("codecs")));
         Self {
-            codecs: adapters::MfCodecFactory,
+            codecs: WithSoftwareH264::new(adapters::MfCodecFactory, openh264)
+                .with_readback(Box::new(cpu::D3d11Readback)),
             secrets: Arc::new(adapters::DpapiSecretStore),
             autostart: Arc::new(adapters::RunKeyAutostart),
         }
+    }
+
+    /// The Cisco OpenH264 handle behind the Settings → Advanced toggle.
+    pub fn openh264(&self) -> Arc<OpenH264> {
+        self.codecs.openh264().clone()
     }
 }
 

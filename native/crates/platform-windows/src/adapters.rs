@@ -405,6 +405,7 @@ impl VideoSurface for ChildWindowSurface {
         Ok(Box::new(D3dPresenter {
             renderer,
             device: D3d11Device(dev),
+            upload: crate::cpu::Nv12Upload::default(),
         }))
     }
     fn as_any(&self) -> &dyn Any {
@@ -415,6 +416,8 @@ impl VideoSurface for ChildWindowSurface {
 struct D3dPresenter {
     renderer: render::Renderer,
     device: D3d11Device,
+    /// CPU NV12 frames (the Cisco OpenH264 software decoder) go through this.
+    upload: crate::cpu::Nv12Upload,
 }
 
 impl Presenter for D3dPresenter {
@@ -423,17 +426,22 @@ impl Presenter for D3dPresenter {
         frame: &Frame<'_>,
         cursor: Option<(f64, f64)>,
     ) -> Result<(), SurfaceError> {
-        let FrameData::Native(any) = frame.data else {
-            return Err(SurfaceError::Backend(
-                "the D3D11 presenter takes D3D11 frames".into(),
-            ));
+        let render = |r: &mut render::Renderer, tex: &_, slice| {
+            r.render_frame(tex, slice, cursor)
+                .map_err(|e| SurfaceError::Backend(e.to_string()))
         };
-        let tex = any
-            .downcast_ref::<D3d11Texture>()
-            .ok_or_else(|| SurfaceError::Backend("not a D3D11 texture".into()))?;
-        self.renderer
-            .render_frame(&tex.texture, tex.array_index, cursor)
-            .map_err(|e| SurfaceError::Backend(e.to_string()))
+        match frame.data {
+            FrameData::Native(any) => {
+                let tex = any
+                    .downcast_ref::<D3d11Texture>()
+                    .ok_or_else(|| SurfaceError::Backend("not a D3D11 texture".into()))?;
+                render(&mut self.renderer, &tex.texture, tex.array_index)
+            }
+            FrameData::Cpu { .. } => {
+                let tex = self.upload.upload(&self.device.0, frame)?;
+                render(&mut self.renderer, &tex, 0)
+            }
+        }
     }
 
     fn device(&self) -> Option<&dyn Any> {

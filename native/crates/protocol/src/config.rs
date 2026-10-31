@@ -82,6 +82,11 @@ pub struct Config {
     /// Launch the app when the user logs in (per-user Run key). See
     /// `engine::autostart` — this is logon, not boot.
     pub start_with_windows: bool,
+    /// Allow Cisco's OpenH264 binary as the software H.264 codec when this
+    /// machine has no hardware one (Settings → Advanced). Cisco's licence
+    /// requires the user to be able to turn it off and on again; default on.
+    #[serde(rename = "useOpenH264")]
+    pub use_openh264: bool,
     /// Viewer-side: when a host asks for a password we already have working
     /// credentials for, submit them without prompting.
     pub auto_login: bool,
@@ -114,6 +119,7 @@ impl Default for Config {
             clipboard_sync: true,
             paste_dropped_files: true,
             start_with_windows: false,
+            use_openh264: true,
             auto_login: false,
             saved_logins: BTreeMap::new(),
         }
@@ -289,5 +295,17 @@ mod tests {
         cfg.add_recent("id-14"); // dup moves to front, no growth
         assert_eq!(cfg.recent_ids.len(), MAX_RECENTS);
         assert_eq!(cfg.recent_ids[0], "id-14");
+    }
+
+    #[test]
+    fn openh264_is_on_by_default_including_for_older_files() {
+        assert!(Config::default().use_openh264);
+        // A config written before the setting existed keeps the default.
+        let old: Config = serde_json::from_str(r#"{"uuid":"u"}"#).unwrap();
+        assert!(old.use_openh264);
+        let off: Config = serde_json::from_str(r#"{"useOpenH264":false}"#).unwrap();
+        assert!(!off.use_openh264);
+        let json = serde_json::to_string(&off).unwrap();
+        assert!(json.contains(r#""useOpenH264":false"#), "{json}");
     }
 }

@@ -11,6 +11,7 @@ members = [
     "crates/platform-linux",
     "crates/capture",
     "crates/codec",
+    "crates/codec-openh264",
     "crates/transport",
     "crates/signaling",
     "crates/input",

@@ -12,6 +12,7 @@ workspace = true
 # Linux implementation of `platform-api` (plan lane L). Empty on other targets.
 [target.'cfg(target_os = "linux")'.dependencies]
 platform-api = { path = "../platform-api" }
+codec-openh264 = { path = "../codec-openh264" }
 tracing.workspace = true
 dirs = "6"
 # Portal D-Bus client. No `pipewire` feature: it pins an older pipewire-rs than the

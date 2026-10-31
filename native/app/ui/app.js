@@ -207,6 +207,9 @@ function openSettings() {
   $('set-clipboard-sync').checked = config.clipboardSync !== false;
   $('set-paste-dropped').checked = config.pasteDroppedFiles !== false;
   $('set-start-with-windows').checked = !!config.startWithWindows;
+  $('set-openh264').checked = config.useOpenH264 !== false;
+  $('openh264-license').classList.add('hidden');
+  refreshOpenH264();
   const saved = config.savedLoginCount || 0;
   const clear = $('set-clear-logins');
   clear.checked = false;
@@ -236,6 +239,7 @@ async function saveSettings() {
     clipboardSync: $('set-clipboard-sync').checked,
     pasteDroppedFiles: $('set-paste-dropped').checked,
     startWithWindows: $('set-start-with-windows').checked,
+    useOpenH264: $('set-openh264').checked,
     clearSavedLogins: $('set-clear-logins').checked
   };
 
@@ -424,6 +428,41 @@ async function preflight(keys, intro) {
   await openPermissions(intro);
   return true;
 }
+
+// Settings → Advanced: the Cisco OpenH264 software codec. The notice and the
+// licence text come from the backend (Cisco's licence requires both to be
+// shown where the user controls the codec).
+async function refreshOpenH264() {
+  try {
+    const info = await invoke('openh264_info');
+    $('openh264-notice').textContent = info.notice;
+    $('openh264-license').textContent = info.license;
+    $('openh264-status').textContent = info.status;
+    $('btn-openh264-download').disabled = !!info.ready;
+  } catch (err) {
+    $('openh264-status').textContent = String((err && err.message) || err);
+  }
+}
+
+$('btn-openh264-download').addEventListener('click', async () => {
+  const btn = $('btn-openh264-download');
+  if (!$('set-openh264').checked) {
+    toast('Turn on "Use Cisco OpenH264" and save first.', 'error');
+    return;
+  }
+  btn.disabled = true;
+  $('openh264-status').textContent = 'Downloading from Cisco…';
+  try {
+    await invoke('openh264_download');
+  } catch (err) {
+    toast(String((err && err.message) || err), 'error');
+  }
+  await refreshOpenH264();
+});
+
+$('btn-openh264-license').addEventListener('click', () => {
+  $('openh264-license').classList.toggle('hidden');
+});
 
 // ---- wiring ----------------------------------------------------------------
 $('btn-settings-permissions').addEventListener('click', () => openPermissions(''));

@@ -26,6 +26,7 @@ tokio = { workspace = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 platform-api = { path = "../crates/platform-api" }
+codec-openh264 = { path = "../crates/codec-openh264" }
 raw-window-handle = "0.6"
 
 [dev-dependencies]

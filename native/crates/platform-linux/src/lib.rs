@@ -16,6 +16,7 @@ use std::sync::Arc;
 mod autostart;
 mod clipboard;
 
+use codec_openh264::{OpenH264, WithSoftwareH264};
 use platform_api::unavailable::{NoAutostart, NoCodecs, NoSecretStore};
 use platform_api::{
     Autostart, CaptureError, Clipboard, CodecFactory, DisplayInfo, InputError, InputInjector,
@@ -58,19 +59,27 @@ impl SessionType {
 
 pub struct LinuxPlatform {
     session: SessionType,
-    codecs: NoCodecs,
+    /// VA-API/NVENC land in lane L; until then — and wherever they are missing
+    /// (libva < 2.20, decision #7) — Cisco OpenH264 is the codec.
+    codecs: WithSoftwareH264<NoCodecs>,
 }
 
 impl LinuxPlatform {
     pub fn new() -> Self {
+        let openh264 = Arc::new(OpenH264::new(config_dir().join("codecs")));
         Self {
             session: SessionType::detect(),
-            codecs: NoCodecs { reason: NOT_YET },
+            codecs: WithSoftwareH264::new(NoCodecs { reason: NOT_YET }, openh264),
         }
     }
 
     pub fn session_type(&self) -> SessionType {
         self.session
+    }
+
+    /// The Cisco OpenH264 handle behind the Settings → Advanced toggle.
+    pub fn openh264(&self) -> Arc<OpenH264> {
+        self.codecs.openh264().clone()
     }
 }
 
@@ -82,6 +91,13 @@ impl Default for LinuxPlatform {
 
 fn home() -> PathBuf {
     dirs::home_dir().unwrap_or_else(std::env::temp_dir)
+}
+
+/// `$XDG_CONFIG_HOME/sharectrl` (default `~/.config/sharectrl`).
+fn config_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| home().join(".config"))
+        .join("sharectrl")
 }
 
 impl Platform for LinuxPlatform {
@@ -100,9 +116,7 @@ impl Platform for LinuxPlatform {
 
     fn paths(&self) -> Paths {
         Paths {
-            config_dir: dirs::config_dir()
-                .unwrap_or_else(|| home().join(".config"))
-                .join("sharectrl"),
+            config_dir: config_dir(),
             log_dir: dirs::state_dir()
                 .unwrap_or_else(|| home().join(".local/state"))
                 .join("sharectrl"),

@@ -38,3 +38,11 @@ Thumbs.db
 native/target/
 native/third-party-licenses.html
 native/app/gen/schemas/
+
+# Cisco's OpenH264 binary must reach users only as a separate download from
+# Cisco (licence condition 1, plan 04 §5) — never commit a copy.
+*openh264*.dll
+*openh264*.so
+*openh264*.so.*
+*openh264*.dylib
+*openh264*.bz2

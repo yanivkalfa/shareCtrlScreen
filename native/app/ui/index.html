@@ -292,6 +292,26 @@
           </select>
         </label>
 
+        <fieldset class="field">
+          <legend>Advanced</legend>
+          <label class="radio">
+            <input type="checkbox" id="set-openh264" />
+            Use Cisco OpenH264 (downloaded separately)
+          </label>
+          <div class="hint">
+            <b id="openh264-notice"></b><br />
+            A software video codec, used only when this computer has no hardware
+            H.264 codec. It is downloaded from Cisco the first time it is needed
+            and never ships with ShareCtrlScreen.
+            <span id="openh264-status"></span>
+          </div>
+          <div class="row">
+            <button id="btn-openh264-download" type="button" class="btn btn-sm">Download now</button>
+            <button id="btn-openh264-license" type="button" class="btn btn-ghost btn-sm">Cisco licence</button>
+          </div>
+          <pre id="openh264-license" class="hint mono licence-text hidden"></pre>
+        </fieldset>
+
         <div class="modal-actions">
           <button id="btn-settings-permissions" class="btn btn-leading">Permissions&hellip;</button>
           <button id="btn-settings-cancel" class="btn">Cancel</button>

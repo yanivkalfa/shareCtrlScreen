@@ -12,6 +12,7 @@ workspace = true
 # macOS implementation of `platform-api` (plan lane M). Empty on other targets.
 [target.'cfg(target_os = "macos")'.dependencies]
 platform-api = { path = "../platform-api" }
+codec-openh264 = { path = "../codec-openh264" }
 tracing.workspace = true
 dirs = "6"
 objc2 = "0.6"

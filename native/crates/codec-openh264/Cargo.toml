@@ -1,0 +1,34 @@
+[package]
+name = "codec-openh264"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# Software H.264 on every OS (plan 04 §5, decision #1): Cisco's prebuilt
+# OpenH264 binary, downloaded from Cisco at first use and loaded at runtime.
+#
+# `default-features = false` is a licence condition, not a size optimisation:
+# the crates' default `source` feature compiles OpenH264 into our binary, which
+# Cisco's patent coverage does not extend to. Only `libloading` is allowed.
+[dependencies]
+platform-api = { path = "../platform-api" }
+openh264 = { version = "0.9.9", default-features = false, features = ["libloading"] }
+openh264-sys2 = { version = "0.9.9", default-features = false, features = ["libloading"] }
+thiserror.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+hex.workspace = true
+# Blocking HTTPS for the one-off download (rustls + webpki roots, already in the
+# tree via tokio-tungstenite); no gzip — the payload is already bzip2.
+ureq = { version = "3.5", default-features = false, features = ["rustls"] }
+# Pure-Rust bzip2 *decoder* (Cisco serves `.bz2`); avoids the C libbz2 and its
+# non-SPDX-standard licence.
+bzip2-rs = "0.1.2"
+
+[dev-dependencies]
+platform-api = { path = "../platform-api", features = ["mock"] }

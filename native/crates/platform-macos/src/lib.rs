@@ -24,6 +24,7 @@ pub use capture::SckCapture;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use codec_openh264::{OpenH264, WithSoftwareH264};
 use platform_api::unavailable::{NoAutostart, NoCodecs};
 use platform_api::{
     Autostart, CaptureError, Clipboard, CodecFactory, DisplayInfo, InputError, InputInjector,
@@ -37,14 +38,22 @@ mod secret;
 const NOT_YET: &str = "not available on macOS in this version";
 
 pub struct MacPlatform {
-    codecs: NoCodecs,
+    /// VideoToolbox lands in lane M; until then (and on any Mac whose
+    /// VideoToolbox refuses H.264) Cisco OpenH264 is the codec.
+    codecs: WithSoftwareH264<NoCodecs>,
 }
 
 impl MacPlatform {
     pub fn new() -> Self {
+        let openh264 = Arc::new(OpenH264::new(config_dir().join("codecs")));
         Self {
-            codecs: NoCodecs { reason: NOT_YET },
+            codecs: WithSoftwareH264::new(NoCodecs { reason: NOT_YET }, openh264),
         }
+    }
+
+    /// The Cisco OpenH264 handle behind the Settings → Advanced toggle.
+    pub fn openh264(&self) -> Arc<OpenH264> {
+        self.codecs.openh264().clone()
     }
 }
 
@@ -56,6 +65,13 @@ impl Default for MacPlatform {
 
 fn home() -> PathBuf {
     dirs::home_dir().unwrap_or_else(std::env::temp_dir)
+}
+
+/// `~/Library/Application Support/ShareCtrlScreen`.
+fn config_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| home().join("Library/Application Support"))
+        .join("ShareCtrlScreen")
 }
 
 impl Platform for MacPlatform {
@@ -71,11 +87,8 @@ impl Platform for MacPlatform {
     }
 
     fn paths(&self) -> Paths {
-        let support = dirs::config_dir()
-            .unwrap_or_else(|| home().join("Library/Application Support"))
-            .join("ShareCtrlScreen");
         Paths {
-            config_dir: support,
+            config_dir: config_dir(),
             log_dir: home().join("Library/Logs/ShareCtrlScreen"),
             downloads_dir: dirs::download_dir()
                 .unwrap_or_else(|| home().join("Downloads"))

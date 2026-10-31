@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use codec_openh264::{Availability, OpenH264};
 use engine::handshake::{ApprovalDecision, Decider};
 use engine::{Engine, Role, UiEvent};
 use platform_api::{OsPermission, PermissionReport, PermissionState, Platform, AUTOSTART_FLAG};
@@ -64,6 +65,8 @@ impl AppDecider {
 struct AppState {
     engine: Arc<Engine>,
     decider: Arc<AppDecider>,
+    /// The Cisco OpenH264 software codec (Settings → Advanced).
+    openh264: Arc<OpenH264>,
 }
 
 // ---- commands (one per old ipcMain.handle) ----------------------------------
@@ -88,6 +91,7 @@ fn get_config(state: tauri::State<'_, AppState>) -> serde_json::Value {
         "clipboardSync": c.clipboard_sync,
         "pasteDroppedFiles": c.paste_dropped_files,
         "startWithWindows": c.start_with_windows,
+        "useOpenH264": c.use_openh264,
         // Count only — the saved passwords themselves never reach the WebView.
         "savedLoginCount": c.saved_logins.len(),
     })
@@ -273,7 +277,15 @@ fn save_settings(
         if let Some(b) = patch.get("startWithWindows").and_then(|v| v.as_bool()) {
             cfg.start_with_windows = b;
         }
+        if let Some(b) = patch.get("useOpenH264").and_then(|v| v.as_bool()) {
+            cfg.use_openh264 = b;
+        }
     });
+    // Takes effect for the next codec the engine creates (Cisco's licence: the
+    // user can disable and re-enable the binary at any time).
+    if let Some(b) = patch.get("useOpenH264").and_then(|v| v.as_bool()) {
+        state.openh264.set_enabled(b);
+    }
 
     // Apply the startup registration AFTER the config is persisted. A failure is
     // surfaced rather than swallowed (a startup toggle that silently does nothing
@@ -337,6 +349,32 @@ fn request_permission(state: tauri::State<'_, AppState>, name: String) -> Result
     Ok(())
 }
 
+/// What Settings → Advanced shows about the software codec: Cisco's required
+/// notice and licence text, and where the download stands.
+#[tauri::command]
+fn openh264_info(state: tauri::State<'_, AppState>) -> serde_json::Value {
+    let availability = state.openh264.availability();
+    serde_json::json!({
+        "notice": codec_openh264::NOTICE,
+        "license": codec_openh264::LICENSE_TEXT,
+        "version": codec_openh264::VERSION,
+        "ready": availability == Availability::Ready,
+        "status": availability.describe(),
+    })
+}
+
+/// "Download now": fetch the Cisco binary ahead of need (or retry after an
+/// offline first run). Blocking network I/O, so off the async runtime.
+#[tauri::command]
+async fn openh264_download(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let openh264 = state.openh264.clone();
+    tauri::async_runtime::spawn_blocking(move || openh264.ensure())
+        .await
+        .map_err(|e| format!("download task failed: {e}"))?
+        .map_err(|e| e.to_string())?;
+    Ok(state.openh264.availability().describe())
+}
+
 /// Log to `app.log` in the platform's log directory, since release builds have
 /// no console. `RUST_LOG` still overrides the level.
 fn init_logging(log_dir: &Path) {
@@ -347,7 +385,8 @@ fn init_logging(log_dir: &Path) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         tracing_subscriber::EnvFilter::new(
             "info,engine=debug,transport=debug,signaling=debug,platform_windows=debug,\
-             platform_macos=debug,platform_linux=debug,codec=debug,capture=debug,str0m=warn",
+             platform_macos=debug,platform_linux=debug,codec=debug,codec_openh264=debug,\
+             capture=debug,str0m=warn",
         )
     });
     match std::fs::File::create(&path) {
@@ -366,14 +405,18 @@ fn init_logging(log_dir: &Path) {
     }
 }
 
-/// The OS backend for this build.
-fn make_platform() -> Arc<dyn Platform> {
+/// The OS backend for this build, and its Cisco OpenH264 handle (the one
+/// setting that reaches into the codec layer, so it is kept before the
+/// platform is type-erased).
+fn make_platform() -> (Arc<dyn Platform>, Arc<OpenH264>) {
     #[cfg(windows)]
-    return Arc::new(platform_windows::WindowsPlatform::new());
+    let platform = platform_windows::WindowsPlatform::new();
     #[cfg(target_os = "macos")]
-    return Arc::new(platform_macos::MacPlatform::new());
+    let platform = platform_macos::MacPlatform::new();
     #[cfg(target_os = "linux")]
-    return Arc::new(platform_linux::LinuxPlatform::new());
+    let platform = platform_linux::LinuxPlatform::new();
+    let openh264 = platform.openh264();
+    (Arc::new(platform), openh264)
 }
 
 /// Create the native video surface under the main window and hand it to the
@@ -399,7 +442,7 @@ fn attach_video_surface(engine: &Engine, win: &tauri::WebviewWindow) {
 }
 
 fn main() {
-    let platform = make_platform();
+    let (platform, openh264) = make_platform();
     init_logging(&platform.paths().log_dir);
     tracing::info!("platform: {}", platform.info().name);
 
@@ -421,10 +464,13 @@ fn main() {
     platform
         .autostart()
         .reconcile(engine.config().start_with_windows);
+    // The saved choice, before any session can create a codec.
+    openh264.set_enabled(engine.config().use_openh264);
 
     let state = AppState {
         engine: engine.clone(),
         decider,
+        openh264,
     };
 
     tauri::Builder::default()
@@ -445,6 +491,8 @@ fn main() {
             save_settings,
             get_permissions,
             request_permission,
+            openh264_info,
+            openh264_download,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();

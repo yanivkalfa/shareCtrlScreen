@@ -91,6 +91,8 @@ html, body {
 .row label { color: var(--muted); min-width: 84px; }
 
 .hint { color: var(--muted); font-size: 12px; margin-top: 10px; }
+/* Cisco's licence text: long paragraphs, so wrap and scroll inside the modal. */
+.licence-text { white-space: pre-wrap; max-height: 180px; overflow: auto; font-size: 11px; }
 
 /* recent-connections chips */
 .recents { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-top: 12px; }

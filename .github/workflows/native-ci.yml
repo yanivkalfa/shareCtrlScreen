@@ -1,8 +1,9 @@
-# CI for the native Rust rewrite (Plan 04 §10). Build + test + the license gate.
-# `cargo-deny` enforces the §11 allowlist / banned-crate list — the one piece
-# that actually keeps the product proprietary + legal (no AGPL/GPL crate can slip
-# in). The `third-party-licenses.html` page (cargo-about) is a docs artifact, not
-# a gate, so it's generated on demand, not in CI. Runs on Windows (the only target).
+# CI for the native Rust app: format, lint, build and test on every shipped OS,
+# plus the license gate. `cargo-deny` enforces the allowlist / banned-crate list
+# for every target triple (see native/deny.toml) — the piece that keeps the
+# product proprietary and legal. The loopback test runs a full two-engine session
+# over real WebRTC with mock OS backends, so it needs no GPU, display or
+# permissions on the runners.
 name: native-ci
 
 on:
@@ -21,9 +22,21 @@ defaults:
 
 jobs:
   build-test:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-22.04: the oldest supported Linux (glibc 2.35, WebKitGTK 4.1).
+        os: [windows-latest, macos-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Linux build dependencies (Tauri / WebKitGTK)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev libdbus-1-dev libgtk-3-dev \
+            libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -32,20 +45,30 @@ jobs:
           workspaces: native
       - name: Format check
         run: cargo fmt --all --check
-      - name: Build
-        run: cargo build --workspace --release
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
-      - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+
+  release-build:
+    # The optimized Windows build the dev/test pipelines ship.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+      - name: Build (release)
+        run: cargo build --workspace --release
 
   license-gate:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       # Prebuilt binary — no 8-minute source compile.
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
-      - name: cargo-deny (license + banned-crate enforcement, §11)
+      - name: cargo-deny (license + banned-crate enforcement, all targets)
         run: cargo deny check

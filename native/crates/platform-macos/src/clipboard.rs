@@ -105,6 +105,12 @@ impl Clipboard for MacClipboard {
         }
         let mut urls = Vec::with_capacity(paths.len());
         for path in paths {
+            // `fileURLWithPath` resolves a relative path against the process cwd,
+            // which would paste a different file than the one received.
+            if !path.is_absolute() {
+                tracing::warn!("clipboard file path is not absolute; not copied");
+                return None;
+            }
             // A lossy conversion would paste a different file than the one meant.
             let Some(path) = path.to_str() else {
                 tracing::warn!("clipboard file path is not valid UTF-8; not copied");

@@ -366,7 +366,7 @@ async function openPermissions(intro) {
   } catch (err) {
     toast(String((err && err.message) || err), 'error');
     if (state === 'VIEW_ACTIVE' && $('modal-settings').classList.contains('hidden')) {
-      invoke('set_video_visible', { visible: true });
+      invoke('set_video_visible', { visible: true }).catch(() => {});
     }
     return;
   }
@@ -381,7 +381,7 @@ function closePermissions() {
   $('modal-permissions').classList.add('hidden');
   // Settings (if it is what opened us) restores the video when it closes.
   if (state === 'VIEW_ACTIVE' && $('modal-settings').classList.contains('hidden')) {
-    invoke('set_video_visible', { visible: true });
+    invoke('set_video_visible', { visible: true }).catch(() => {});
   }
 }
 
@@ -441,11 +441,13 @@ $('remote-id').addEventListener('input', () => {
 $('btn-connect').addEventListener('click', async () => {
   const id = $('remote-id').value.trim();
   if (!validUuid(id)) return;
-  // First time controlling another computer: sort out the OS permission for
-  // forwarding shortcuts before connecting. The user presses Connect again.
-  if (!viewerPreflightDone) {
+  // Input monitoring only matters for the optional shortcut capture, so a plain
+  // connection is never held up by it. When capture is on, sort the grant out
+  // once before connecting; the user presses Connect again.
+  if (config && config.captureShortcuts && !viewerPreflightDone) {
     viewerPreflightDone = true;
-    const intro = 'To control another computer with your keyboard shortcuts, grant this first.';
+    const intro =
+      'Shortcut capture is on in Settings; it needs this permission to forward shortcuts to the other computer.';
     if (await preflight(['inputMonitoring'], intro)) return;
   }
   $('requesting-peer').textContent = id;
@@ -626,8 +628,8 @@ listen('link-restored', () => {
   if (!hostPreflightDone) {
     hostPreflightDone = true;
     await preflight(
-      ['screenCapture'],
-      'Grant screen recording so other people can see this computer when you let them in.'
+      ['screenCapture', 'inputInjection'],
+      'Grant these so others can see and control this computer when you let them in.'
     );
   }
 })();

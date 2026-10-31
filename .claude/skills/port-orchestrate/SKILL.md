@@ -48,6 +48,16 @@ in `plans/`; `plans/00-DECISIONS.md` overrides everything, including this file.
 4. Verify `rustup target list --installed` includes `aarch64-apple-darwin` and
    `x86_64-unknown-linux-gnu` (macOS code is type-checked with
    `cargo check -p platform-macos --target aarch64-apple-darwin`).
+5. **Warm the build caches before launching builders** (lesson from wave 1:
+   19 cold worktrees each recompiled ~400 dependencies, 15–30 min apiece under
+   contention). On `port/multi-os` run the full gate once so `native/target`
+   holds debug + test artifacts, and in WSL build once into
+   `/tmp/sct-base`. Then, right after the harness creates a builder's worktree
+   (its path is in the launch result), copy the caches in before the builder
+   gets far: `robocopy native\target <worktree>\native\target /E /NFL /NDL /NJH /NJS`
+   on Windows and `cp -r /tmp/sct-base /tmp/sct-<ID>` in WSL (tell the builder
+   to use that `CARGO_TARGET_DIR`). Cargo reuses the artifacts; a warm
+   worktree builds in under a minute.
 
 ## 1. Picking tasks
 

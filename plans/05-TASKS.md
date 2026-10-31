@@ -11,6 +11,11 @@
 | D1 loopback harness | **done** `7f91371` | `engine/tests/loopback.rs` — ~4 s, all OSes, security assertions mutation-checked. |
 | T1 CI matrix | **done** `dc47c95` | Windows / macOS / Ubuntu 22.04 + license gate on all 4 triples. **The macOS job is unverified until the branch is pushed.** |
 | platform-macos / platform-linux | **scaffold** `f1b961c` | Real paths (+ Linux session-type detection); every other capability fails safely. Lanes M and L replace these stubs in place. |
+| L5-spike, M4, D2, M1, L3 | **in progress** (Opus) | branches `task/<ID>`, started 2026-11-01 |
+| D3, D4, D5, M7, M10, M11, L8, L11, L12, T5 | **in progress** (Sonnet) | branches `task/<ID>` |
+| D6, M8, M9, L9, L10 | **in progress** (Haiku → Opus review) | branches `task/<ID>` |
+| M2, M3, L1, L2, L4, M6, L7 | queued (Opus cap) | start as Opus slots free |
+| W2, W3, M5, L6, L5, D7, T2, T3, T4 | blocked on dependencies | see graph |
 | everything else | open | as below. |
 
 Interfaces the remaining tasks must use: `Platform::create_capture / create_surface / create_injector / create_shortcut_hook / create_clipboard` (call on the thread that uses the object), `Engine::start(platform, decider)`, `Engine::attach_surface`, `IcePolicy::LoopbackOnly` for tests, mocks in `platform_api::mock`.

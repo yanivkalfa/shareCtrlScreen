@@ -3,8 +3,9 @@
 //! Wayland subsurface, XTest / portal-libei / uinput injection, Secret Service,
 //! XDG autostart).
 //!
-//! Status: scaffold. Paths and session-type detection are real; every other
-//! capability fails safely with a clear message until its task lands (see
+//! Status: scaffold plus the clipboard (text and file lists). Paths and
+//! session-type detection are real; every other capability fails safely with a
+//! clear message until its task lands (see
 //! `plans/05-TASKS.md`, lane L).
 
 #![cfg(target_os = "linux")]
@@ -13,8 +14,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 mod autostart;
+mod clipboard;
 
-use platform_api::unavailable::{NoAutostart, NoClipboard, NoCodecs, NoSecretStore};
+use platform_api::unavailable::{NoAutostart, NoCodecs, NoSecretStore};
 use platform_api::{
     Autostart, CaptureError, Clipboard, CodecFactory, DisplayInfo, InputError, InputInjector,
     OsPermission, Paths, PermissionReport, Platform, PlatformInfo, RawDisplayHandle,
@@ -150,7 +152,9 @@ impl Platform for LinuxPlatform {
     }
 
     fn create_clipboard(&self) -> Box<dyn Clipboard> {
-        Box::new(NoClipboard)
+        Box::new(clipboard::LinuxClipboard::new(
+            self.session == SessionType::Wayland,
+        ))
     }
 
     fn secrets(&self) -> Arc<dyn SecretStore> {

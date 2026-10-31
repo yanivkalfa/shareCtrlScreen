@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "platform-linux"
 version.workspace = true
 edition.workspace = true
@@ -20,6 +20,13 @@ ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "s
 tokio = { workspace = true }
 # Runtime probe for libva (decision #7: libva is dlopen'd, never linked).
 libloading = "0.8"
+# Clipboard text (X11 + Wayland). No `image-data`: images are out of scope and the
+# default feature drags in the `image` decoder stack.
+arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
+# X11 selection owner for file lists (pure-Rust connection, no libxcb).
+x11rb = "0.14"
+# Wayland selection owner for file lists (data-control protocols).
+wl-clipboard-rs = "0.9"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 tempfile = "3"

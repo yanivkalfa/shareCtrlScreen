@@ -232,7 +232,176 @@ async function saveSettings() {
   await reloadConfig();
 }
 
+// ---- permissions modal -----------------------------------------------------
+// What each OS permission is for, in words that hold on every OS. Order is the
+// order shown.
+const PERMISSIONS = [
+  {
+    key: 'screenCapture',
+    title: 'Screen recording',
+    desc: 'Lets this computer share its screen with someone who connects.'
+  },
+  {
+    key: 'inputInjection',
+    title: 'Remote control',
+    desc: 'Lets a connected person move the mouse and type on this computer.'
+  },
+  {
+    key: 'inputMonitoring',
+    title: 'Keyboard shortcuts',
+    desc: 'Lets shortcuts you press while controlling another computer reach it.'
+  }
+];
+
+const PERM_POLL_MS = 2000;
+let permPoll = null;
+// Each automatic prompt is shown at most once per run: a user who closed the
+// modal on purpose should not be nagged on every later connection.
+let hostPreflightDone = false;
+let viewerPreflightDone = false;
+
+const permNeedsGrant = (s) => s === 'denied' || s === 'notDetermined';
+
+function renderPermissions(report) {
+  const list = $('perm-list');
+  list.innerHTML = '';
+  let listed = 0;
+  for (const p of PERMISSIONS) {
+    const st = report[p.key];
+    // This OS has no such permission (e.g. everything on Windows) — say nothing.
+    if (st === 'notApplicable') continue;
+    listed += 1;
+
+    const row = document.createElement('li');
+    row.className = 'perm-row';
+
+    const text = document.createElement('div');
+    text.className = 'perm-text';
+    const title = document.createElement('div');
+    title.className = 'perm-title';
+    title.textContent = p.title;
+    const desc = document.createElement('div');
+    desc.className = 'perm-desc';
+    desc.textContent = p.desc;
+    text.append(title, desc);
+
+    const badge = document.createElement('span');
+    const granted = st === 'granted';
+    badge.className = 'badge ' + (granted ? 'badge-granted' : st === 'denied' ? 'badge-denied' : 'badge-pending');
+    badge.textContent = granted ? 'GRANTED' : st === 'denied' ? 'DENIED' : 'NOT ASKED';
+
+    row.append(text, badge);
+    if (!granted) {
+      const grant = document.createElement('button');
+      grant.type = 'button';
+      grant.className = 'btn btn-sm';
+      grant.textContent = 'Grant';
+      grant.addEventListener('click', () => grantPermission(p.key));
+      row.appendChild(grant);
+    }
+    list.appendChild(row);
+  }
+  $('perm-none').classList.toggle('hidden', listed !== 0);
+
+  const notes = $('perm-notes');
+  notes.innerHTML = '';
+  for (const n of report.notes || []) {
+    const li = document.createElement('li');
+    li.textContent = n;
+    notes.appendChild(li);
+  }
+}
+
+function stopPermPoll() {
+  if (permPoll) clearInterval(permPoll);
+  permPoll = null;
+}
+
+// Refresh the rows; stop polling once nothing is left to grant, so an idle
+// modal does not keep asking the OS.
+async function refreshPermissions() {
+  let report;
+  try {
+    report = await invoke('get_permissions');
+  } catch (_) {
+    return null;
+  }
+  // The modal may have been closed while the call was in flight.
+  if ($('modal-permissions').classList.contains('hidden')) return null;
+  renderPermissions(report);
+  if (!PERMISSIONS.some((p) => permNeedsGrant(report[p.key]))) stopPermPoll();
+  return report;
+}
+
+function startPermPoll() {
+  stopPermPoll();
+  permPoll = setInterval(refreshPermissions, PERM_POLL_MS);
+}
+
+async function grantPermission(key) {
+  try {
+    await invoke('request_permission', { name: key });
+  } catch (err) {
+    toast(String((err && err.message) || err), 'error');
+    return;
+  }
+  // The user answers in an OS dialog or settings pane; watch for the result.
+  startPermPoll();
+  refreshPermissions();
+}
+
+async function openPermissions(intro) {
+  // Same ordering rule as Settings: the native video must be down before the
+  // modal paints, or the modal appears underneath it.
+  if (state === 'VIEW_ACTIVE') {
+    try {
+      await invoke('set_video_visible', { visible: false });
+    } catch (_) {
+      /* fall through — the dialog is still better than nothing */
+    }
+  }
+  let report;
+  try {
+    report = await invoke('get_permissions');
+  } catch (err) {
+    toast(String((err && err.message) || err), 'error');
+    if (state === 'VIEW_ACTIVE' && $('modal-settings').classList.contains('hidden')) {
+      invoke('set_video_visible', { visible: true });
+    }
+    return;
+  }
+  $('perm-intro').textContent = intro || '';
+  renderPermissions(report);
+  $('modal-permissions').classList.remove('hidden');
+  if (PERMISSIONS.some((p) => permNeedsGrant(report[p.key]))) startPermPoll();
+}
+
+function closePermissions() {
+  stopPermPoll();
+  $('modal-permissions').classList.add('hidden');
+  // Settings (if it is what opened us) restores the video when it closes.
+  if (state === 'VIEW_ACTIVE' && $('modal-settings').classList.contains('hidden')) {
+    invoke('set_video_visible', { visible: true });
+  }
+}
+
+// Show the modal on its own when `keys` still need granting. Returns whether it
+// was shown, so a caller can hold back the action the permission is for.
+async function preflight(keys, intro) {
+  let report;
+  try {
+    report = await invoke('get_permissions');
+  } catch (_) {
+    return false;
+  }
+  if (!keys.some((k) => permNeedsGrant(report[k]))) return false;
+  await openPermissions(intro);
+  return true;
+}
+
 // ---- wiring ----------------------------------------------------------------
+$('btn-settings-permissions').addEventListener('click', () => openPermissions(''));
+$('btn-permissions-close').addEventListener('click', closePermissions);
 $('btn-settings').addEventListener('click', openSettings);
 $('btn-settings-cancel').addEventListener('click', closeSettings);
 $('btn-settings-save').addEventListener('click', saveSettings);
@@ -269,9 +438,16 @@ $('remote-id').addEventListener('input', () => {
   render();
 });
 
-$('btn-connect').addEventListener('click', () => {
+$('btn-connect').addEventListener('click', async () => {
   const id = $('remote-id').value.trim();
   if (!validUuid(id)) return;
+  // First time controlling another computer: sort out the OS permission for
+  // forwarding shortcuts before connecting. The user presses Connect again.
+  if (!viewerPreflightDone) {
+    viewerPreflightDone = true;
+    const intro = 'To control another computer with your keyboard shortcuts, grant this first.';
+    if (await preflight(['inputMonitoring'], intro)) return;
+  }
   $('requesting-peer').textContent = id;
   setState('REQUESTING');
   stopCountdown();
@@ -444,5 +620,14 @@ listen('link-restored', () => {
     }
   } catch (_) {
     /* command unavailable (older engine) — the event path still covers it */
+  }
+  // Before the first host session: sharing the screen needs the OS grant, and
+  // a connection arriving later is better met with it already in place.
+  if (!hostPreflightDone) {
+    hostPreflightDone = true;
+    await preflight(
+      ['screenCapture'],
+      'Grant screen recording so other people can see this computer when you let them in.'
+    );
   }
 })();

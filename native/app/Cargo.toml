@@ -28,6 +28,10 @@ tracing-subscriber.workspace = true
 platform-api = { path = "../crates/platform-api" }
 raw-window-handle = "0.6"
 
+[dev-dependencies]
+# The mock platform lets the permission commands be tested with scripted states.
+platform-api = { path = "../crates/platform-api", features = ["mock"] }
+
 [target.'cfg(windows)'.dependencies]
 platform-windows = { path = "../crates/platform-windows" }
 

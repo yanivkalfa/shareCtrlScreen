@@ -295,8 +295,25 @@
         </label>
 
         <div class="modal-actions">
+          <button id="btn-settings-permissions" class="btn btn-leading">Permissions&hellip;</button>
           <button id="btn-settings-cancel" class="btn">Cancel</button>
           <button id="btn-settings-save" class="btn btn-primary">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- PERMISSIONS — OS grants the app needs (screen recording, remote control,
+         shortcut capture). Rows are filled in by app.js from get_permissions;
+         a permission this OS does not have is simply not listed. -->
+    <div id="modal-permissions" class="modal hidden">
+      <div class="modal-box modal-wide">
+        <h3>Permissions</h3>
+        <p id="perm-intro" class="hint"></p>
+        <ul id="perm-list" class="perm-list"></ul>
+        <p id="perm-none" class="hint hidden">Nothing to grant on this system.</p>
+        <ul id="perm-notes" class="perm-notes"></ul>
+        <div class="modal-actions">
+          <button id="btn-permissions-close" class="btn btn-primary">Close</button>
         </div>
       </div>
     </div>

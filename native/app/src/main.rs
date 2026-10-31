@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use engine::handshake::{ApprovalDecision, Decider};
 use engine::{Engine, Role, UiEvent};
-use platform_api::{Platform, AUTOSTART_FLAG};
+use platform_api::{OsPermission, PermissionReport, PermissionState, Platform, AUTOSTART_FLAG};
 use protocol::Permission;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use tauri::{Emitter, Manager};
@@ -256,6 +256,52 @@ fn save_settings(
     Ok(())
 }
 
+/// Wire name of a permission state. Spelled out (not `{:?}`) so the UI contract
+/// cannot drift if the enum's Debug output ever changes.
+fn permission_state_name(s: PermissionState) -> &'static str {
+    match s {
+        PermissionState::Granted => "granted",
+        PermissionState::Denied => "denied",
+        PermissionState::NotDetermined => "notDetermined",
+        PermissionState::NotApplicable => "notApplicable",
+    }
+}
+
+fn permissions_json(report: &PermissionReport) -> serde_json::Value {
+    serde_json::json!({
+        "screenCapture": permission_state_name(report.screen_capture),
+        "inputInjection": permission_state_name(report.input_injection),
+        "inputMonitoring": permission_state_name(report.input_monitoring),
+        "notes": report.notes,
+    })
+}
+
+fn parse_os_permission(name: &str) -> Result<OsPermission, String> {
+    match name {
+        "screenCapture" => Ok(OsPermission::ScreenCapture),
+        "inputInjection" => Ok(OsPermission::InputInjection),
+        "inputMonitoring" => Ok(OsPermission::InputMonitoring),
+        other => Err(format!("unknown permission '{other}'")),
+    }
+}
+
+/// OS permissions the preflight modal lists. The UI polls this while the modal
+/// is open, so it only reads state — it never prompts.
+#[tauri::command]
+fn get_permissions(state: tauri::State<'_, AppState>) -> serde_json::Value {
+    permissions_json(&state.engine.platform().permissions())
+}
+
+/// Show the OS prompt (or open the matching settings pane) for one permission.
+/// The outcome is not returned: the user answers out of band and the UI
+/// re-polls `get_permissions`.
+#[tauri::command]
+fn request_permission(state: tauri::State<'_, AppState>, name: String) -> Result<(), String> {
+    let permission = parse_os_permission(&name)?;
+    state.engine.platform().request_permission(permission);
+    Ok(())
+}
+
 /// Log to `app.log` in the platform's log directory, since release builds have
 /// no console. `RUST_LOG` still overrides the level.
 fn init_logging(log_dir: &Path) {
@@ -361,6 +407,8 @@ fn main() {
             set_video_visible,
             approve,
             save_settings,
+            get_permissions,
+            request_permission,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -427,4 +475,82 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("error while running ShareCtrlScreen");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use platform_api::mock::MockPlatform;
+
+    fn platform_with(report: PermissionReport) -> MockPlatform {
+        let platform = MockPlatform::new(&std::env::temp_dir());
+        *platform.permissions.lock().expect("mock lock") = report;
+        platform
+    }
+
+    #[test]
+    fn denied_report_serialises_to_the_ui_shape() {
+        let platform = platform_with(PermissionReport {
+            screen_capture: PermissionState::Denied,
+            input_injection: PermissionState::NotDetermined,
+            input_monitoring: PermissionState::NotApplicable,
+            notes: vec!["a caveat".into()],
+        });
+        assert_eq!(
+            permissions_json(&platform.permissions()),
+            serde_json::json!({
+                "screenCapture": "denied",
+                "inputInjection": "notDetermined",
+                "inputMonitoring": "notApplicable",
+                "notes": ["a caveat"],
+            })
+        );
+    }
+
+    #[test]
+    fn granted_report_serialises_to_the_ui_shape() {
+        let platform = platform_with(PermissionReport {
+            screen_capture: PermissionState::Granted,
+            input_injection: PermissionState::Granted,
+            input_monitoring: PermissionState::Granted,
+            notes: Vec::new(),
+        });
+        assert_eq!(
+            permissions_json(&platform.permissions()),
+            serde_json::json!({
+                "screenCapture": "granted",
+                "inputInjection": "granted",
+                "inputMonitoring": "granted",
+                "notes": [],
+            })
+        );
+    }
+
+    #[test]
+    fn request_names_map_to_permissions_and_unknown_is_an_error() {
+        assert_eq!(
+            parse_os_permission("screenCapture"),
+            Ok(OsPermission::ScreenCapture)
+        );
+        assert_eq!(
+            parse_os_permission("inputInjection"),
+            Ok(OsPermission::InputInjection)
+        );
+        assert_eq!(
+            parse_os_permission("inputMonitoring"),
+            Ok(OsPermission::InputMonitoring)
+        );
+        assert!(parse_os_permission("camera").is_err());
+    }
+
+    #[test]
+    fn a_parsed_request_reaches_the_platform() {
+        let platform = platform_with(PermissionReport::all_not_applicable());
+        let p = parse_os_permission("inputInjection").expect("known name");
+        platform.request_permission(p);
+        assert_eq!(
+            *platform.permission_requests.lock().expect("mock lock"),
+            vec![OsPermission::InputInjection]
+        );
+    }
 }

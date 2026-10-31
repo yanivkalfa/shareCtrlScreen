@@ -18,6 +18,9 @@ Tauri UI contract (commands/events) — those were verified portable by the code
 
 ## 2. The `platform-api` crate (the contract every lane codes against)
 
+> **Implemented** in `native/crates/platform-api` — read the crate, not this
+> sketch, for exact signatures. Differences are listed in 05-TASKS § Status.
+
 Create `native/crates/platform-api` first (task **F1**). It has **no OS dependencies**, only
 `protocol`, `thiserror`, `std`. Everything below is derived from the call sites the sweep
 found; line references are in [07-CODEBASE-SEAMS.md](07-CODEBASE-SEAMS.md).

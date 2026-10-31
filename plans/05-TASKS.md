@@ -1,5 +1,22 @@
 # 05 — Tasks (one shot, parallel lanes)
 
+## Status (2026-11-01, branch `port/multi-os`)
+
+| Task | State | Notes |
+|---|---|---|
+| F1 platform-api | **done** `dfe14f3` | The crate is the source of truth for every trait; 04 §2 is design rationale only. Changes vs the plan: `OsPermission` (not `Permission`, which clashes with view/control); `VideoInput::Key` carries the DOM code (`&'static str`) and backends map native keys; `set_top_clip` removed — toolbar reveal is the surface's own job (thresholds in the trait doc); GPU handles are `&dyn Any`; media objects are created on their own thread so need not be `Send`; `platform_api::unavailable` holds fail-safe impls. |
+| F2 pipeline split | **done** `f1b961c` | `engine/src/session/{mod,ice,driver,files,clipboard}.rs`, `media/{host,viewer}.rs`, `tuning.rs`. No statics; the engine has no OS deps. 13 bugs fixed (see commit). |
+| F3 secret/autostart/clipboard | **done** `f1b961c` | now in `platform-windows`. |
+| W1 Windows backend | **done** `f1b961c` | `platform-windows` (adapters.rs, displays.rs, gpu.rs). App verified live: surface created, signaling registered. Display selection (`shareDisplayId` = `dxgi:<n>`) is now wired. |
+| D1 loopback harness | **done** `7f91371` | `engine/tests/loopback.rs` — ~4 s, all OSes, security assertions mutation-checked. |
+| T1 CI matrix | **done** `dc47c95` | Windows / macOS / Ubuntu 22.04 + license gate on all 4 triples. **The macOS job is unverified until the branch is pushed.** |
+| platform-macos / platform-linux | **scaffold** `f1b961c` | Real paths (+ Linux session-type detection); every other capability fails safely. Lanes M and L replace these stubs in place. |
+| everything else | open | as below. |
+
+Interfaces the remaining tasks must use: `Platform::create_capture / create_surface / create_injector / create_shortcut_hook / create_clipboard` (call on the thread that uses the object), `Engine::start(platform, decider)`, `Engine::attach_surface`, `IcePolicy::LoopbackOnly` for tests, mocks in `platform_api::mock`.
+
+---
+
 Everything ships together; the tasks are cut so that **up to ~12 agents/people work at the
 same time** after a short foundation phase. Each task lists: lane, depends-on, machine
 needed, size (S ≤ 1 day, M 2–3 days, L ~1 week, XL 2 weeks for one person), deliverable,

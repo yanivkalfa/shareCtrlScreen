@@ -93,6 +93,41 @@ fn get_config(state: tauri::State<'_, AppState>) -> serde_json::Value {
     })
 }
 
+/// What the UI needs to word itself for this OS and to list the monitors.
+/// Built from the platform alone so it can be tested against the mock.
+fn platform_info_json(platform: &dyn Platform) -> serde_json::Value {
+    let info = platform.info();
+    let displays: Vec<_> = platform
+        .displays()
+        .into_iter()
+        .map(|d| {
+            serde_json::json!({
+                "id": d.id,
+                "name": d.name,
+                "x": d.x,
+                "y": d.y,
+                "width": d.width,
+                "height": d.height,
+                "scale": d.scale,
+                "primary": d.primary,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "name": info.name,
+        "startAtLoginLabel": info.start_at_login_label,
+        "shortcutCaptureHint": info.shortcut_capture_hint,
+        "loginScreenSupported": info.login_screen_supported,
+        "downloadsDir": platform.paths().downloads_dir.display().to_string(),
+        "displays": displays,
+    })
+}
+
+#[tauri::command]
+fn get_platform_info(state: tauri::State<'_, AppState>) -> serde_json::Value {
+    platform_info_json(state.engine.platform().as_ref())
+}
+
 #[tauri::command]
 fn clear_recents(state: tauri::State<'_, AppState>) -> Vec<String> {
     state.engine.clear_recents()
@@ -396,6 +431,7 @@ fn main() {
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             get_config,
+            get_platform_info,
             clear_recents,
             get_server_status,
             get_role,
@@ -552,5 +588,31 @@ mod tests {
             *platform.permission_requests.lock().expect("mock lock"),
             vec![OsPermission::InputInjection]
         );
+    }
+
+    #[test]
+    fn platform_info_has_the_shape_the_ui_reads() {
+        let root = std::env::temp_dir().join("sct-app-platform-info");
+        let platform = MockPlatform::new(&root);
+        let v = platform_info_json(&platform);
+
+        assert_eq!(v["name"], "mock");
+        assert_eq!(v["startAtLoginLabel"], "Start at sign-in");
+        assert!(v["shortcutCaptureHint"].is_string());
+        assert_eq!(v["loginScreenSupported"], false);
+        assert_eq!(
+            v["downloadsDir"],
+            root.join("downloads").display().to_string()
+        );
+
+        let displays = v["displays"].as_array().expect("displays is an array");
+        assert_eq!(displays.len(), 1);
+        let d = &displays[0];
+        assert_eq!(d["id"], "mock-0");
+        assert_eq!(d["name"], "Mock display");
+        assert_eq!((d["x"].as_i64(), d["y"].as_i64()), (Some(0), Some(0)));
+        assert!(d["width"].is_u64() && d["height"].is_u64());
+        assert_eq!(d["scale"], 1.0);
+        assert_eq!(d["primary"], true);
     }
 }

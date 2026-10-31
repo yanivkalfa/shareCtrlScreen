@@ -166,6 +166,32 @@ function renderRecents() {
   row.appendChild(clear);
 }
 
+// ---- platform wording + displays -------------------------------------------
+// The OS facts the UI words itself around (see `get_platform_info`). The HTML
+// ships neutral defaults, so a failed call leaves a correct, if generic, page.
+async function applyPlatformInfo() {
+  let info;
+  try {
+    info = await invoke('get_platform_info');
+  } catch (_) {
+    return;
+  }
+  $('start-at-login-label').textContent = info.startAtLoginLabel;
+  $('shortcut-capture-hint').textContent = info.shortcutCaptureHint;
+  $('downloads-path').textContent = info.downloadsDir;
+  $('login-screen-note').classList.toggle('hidden', info.loginScreenSupported);
+
+  // Keep the first entry ("Primary monitor", empty id) and list the rest.
+  const select = $('set-share-display');
+  while (select.options.length > 1) select.remove(1);
+  for (const d of info.displays) {
+    const o = document.createElement('option');
+    o.value = d.id;
+    o.textContent = `${d.name} (${d.width}×${d.height})${d.primary ? ' – primary' : ''}`;
+    select.appendChild(o);
+  }
+}
+
 // ---- settings modal --------------------------------------------------------
 function openSettings() {
   $('set-server').value = config.serverUrl;
@@ -608,6 +634,7 @@ listen('link-restored', () => {
 // ---- boot ------------------------------------------------------------------
 (async () => {
   await reloadConfig();
+  await applyPlatformInfo();
   render();
   // Back-fill the server status: the engine registers ~0.5 s after launch and
   // emits a one-shot 'server-status' event that can fire before this WebView

@@ -28,39 +28,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const CLASS_NAME: PCWSTR = w!("ShareCtrlVideoWindow");
 static REGISTER: std::sync::Once = std::sync::Once::new();
 
-/// A captured input event from the video window, normalized but not yet mapped
-/// to DOM codes (the engine maps `scancode`→`KeyboardEvent.code`, §7/§8a).
-#[derive(Debug, Clone, Copy)]
-pub enum VideoInput {
-    /// Mouse move, normalized `[0,1]` over the video area.
-    Move { nx: f64, ny: f64 },
-    /// Mouse button (0=left,1=middle,2=right) at a normalized position.
-    Button {
-        button: u8,
-        down: bool,
-        nx: f64,
-        ny: f64,
-    },
-    /// Wheel in Windows units (multiples of ±120).
-    Wheel { dx: i32, dy: i32 },
-    /// Keyboard: Set-1 scan code + extended flag + up/down.
-    Key {
-        scancode: u16,
-        extended: bool,
-        down: bool,
-    },
-}
+pub use platform_api::{FileDrop, VideoInput};
 
 /// The engine installs a sink while a viewer session with control is active; the
 /// wndproc forwards captured input to it. `None` ⇒ input is dropped (view-only
 /// or no session), so we never capture when we shouldn't.
 static INPUT_SINK: Mutex<Option<Sender<VideoInput>>> = Mutex::new(None);
-
-/// A file drop on the video surface: the paths, plus WHERE on the remote screen
-/// they landed (normalized over the letterbox rect, exactly like a click). The
-/// host focuses the window under that point before pasting, so the file goes
-/// where it was aimed.
-pub type FileDrop = (Vec<std::path::PathBuf>, f64, f64);
 
 /// Files dropped onto the video surface, for push-to-host transfer. Installed by
 /// the viewer session; `None` ⇒ drops are ignored.
@@ -141,7 +114,11 @@ fn deliver_dropped_files(hwnd: HWND, wparam: WPARAM) {
     }
     if let Ok(guard) = FILE_DROP_SINK.lock() {
         if let Some(tx) = guard.as_ref() {
-            let _ = tx.send((paths, drop_at.0, drop_at.1));
+            let _ = tx.send(FileDrop {
+                paths,
+                nx: drop_at.0,
+                ny: drop_at.1,
+            });
         }
     }
 }
@@ -283,11 +260,9 @@ fn release_all_held() {
         buttons.len()
     );
     for (scancode, extended) in keys {
-        emit(VideoInput::Key {
-            scancode,
-            extended,
-            down: false,
-        });
+        if let Some(code) = input::scancode::code_for(scancode, extended) {
+            emit(VideoInput::Key { code, down: false });
+        }
     }
     for button in buttons {
         emit(VideoInput::Button {
@@ -301,18 +276,19 @@ fn release_all_held() {
 
 /// Install the input sink (viewer session start).
 pub fn set_input_sink(tx: Sender<VideoInput>) {
-    *INPUT_SINK.lock().unwrap() = Some(tx);
+    if let Ok(mut g) = INPUT_SINK.lock() {
+        *g = Some(tx);
+    }
 }
 
 /// Remove the input sink (session end / view-only).
 pub fn clear_input_sink() {
-    *INPUT_SINK.lock().unwrap() = None;
-    // Stale held state must not leak into the next session.
-    if let Ok(mut k) = HELD_KEYS.lock() {
-        k.clear();
-    }
-    if let Ok(mut b) = HELD_BUTTONS.lock() {
-        b.clear();
+    // Release everything still held BEFORE dropping the sink, so the host never
+    // keeps a key or button down after the session (or control) ends. This also
+    // empties the held state, so nothing leaks into the next session.
+    release_all_held();
+    if let Ok(mut g) = INPUT_SINK.lock() {
+        *g = None;
     }
 }
 
@@ -610,11 +586,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     held.retain(|&k| k != (scancode, extended));
                 }
             }
-            emit(VideoInput::Key {
-                scancode,
-                extended,
-                down,
-            });
+            // Unmapped keys (media keys, Pause, Fn) are deliberately not sent.
+            if let Some(code) = input::scancode::code_for(scancode, extended) {
+                emit(VideoInput::Key { code, down });
+            }
             return LRESULT(0);
         }
         // Focus left the video window mid-combo (Alt+Tab away, Win key, app

@@ -519,7 +519,6 @@ pub struct Presented {
 #[derive(Debug, Default)]
 pub struct SurfaceState {
     pub visible: bool,
-    pub top_clip_css_px: u32,
     pub client_size: (u32, u32),
     pub fits: u64,
     pub presented: Vec<Presented>,
@@ -603,16 +602,12 @@ impl VideoSurface for MockSurface {
     fn hide(&self) {
         let mut s = lock(&self.state);
         s.visible = false;
-        s.top_clip_css_px = 0;
     }
     fn fit(&self) {
         lock(&self.state).fits += 1;
     }
     fn client_size(&self) -> (u32, u32) {
         lock(&self.state).client_size
-    }
-    fn set_top_clip(&self, css_px: u32) {
-        lock(&self.state).top_clip_css_px = css_px;
     }
     fn set_input_sink(&self, sink: Option<Sender<VideoInput>>) {
         let mut s = lock(&self.state);
@@ -1134,15 +1129,13 @@ mod tests {
     }
 
     #[test]
-    fn hide_clears_the_toolbar_clip_but_not_client_size() {
+    fn show_hide_toggle_visibility_only() {
         let s = MockSurface::new((800, 600));
         s.show();
-        s.set_top_clip(40);
-        assert_eq!(s.client_size(), (800, 600));
+        assert!(s.state().visible);
         s.hide();
-        let st = s.state();
-        assert!(!st.visible);
-        assert_eq!(st.top_clip_css_px, 0);
+        assert!(!s.state().visible);
+        assert_eq!(s.client_size(), (800, 600));
     }
 
     #[test]

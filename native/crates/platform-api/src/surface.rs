@@ -55,11 +55,19 @@ pub enum SurfaceError {
 ///   hidden; hiding never destroys it and never stops the stream.
 /// * [`hide`](Self::hide) must take effect before the UI paints a modal (the UI
 ///   awaits `set_video_visible(false)` then opens the dialog).
-/// * [`client_size`](Self::client_size) is unaffected by
-///   [`set_top_clip`](Self::set_top_clip) — the host's encode size must not
-///   change while the toolbar is revealed.
-/// * Clearing the input sink (`None`) first emits key-up / button-up for
-///   everything still held, so the host never ends up with stuck input.
+/// * **Toolbar reveal is the surface's own job** (no engine/UI call drives it):
+///   when the pointer reaches the top 2 px of the surface, remove the top
+///   40 CSS px (scaled to physical pixels) from paint and hit-testing so the web
+///   toolbar underneath shows and is clickable; restore when the pointer goes
+///   deeper than 56 px. Reset on `hide`.
+/// * [`client_size`](Self::client_size) is unaffected by the reveal — the host's
+///   encode size must not change while the toolbar is shown.
+/// * Input is normalized over the letterboxed video rectangle, using the size of
+///   the last presented frame (so clicks on black bars clamp or are dropped).
+/// * When the surface loses keyboard focus mid-combo, synthesize key-up /
+///   button-up for everything held (the real releases land in another window).
+/// * Clearing the input sink (`None`) also first emits those releases, so the
+///   host never ends up with stuck input.
 pub trait VideoSurface: Send + Sync {
     fn show(&self);
     fn hide(&self);
@@ -68,9 +76,6 @@ pub trait VideoSurface: Send + Sync {
     fn fit(&self);
     /// Surface size in physical pixels (what the viewer reports as `ViewSize`).
     fn client_size(&self) -> (u32, u32);
-    /// Remove the top `css_px` (CSS pixels, scaled by the backend) from paint
-    /// and hit-testing so the web toolbar shows through. 0 = no clip.
-    fn set_top_clip(&self, css_px: u32);
     /// Install or clear the input sink. `None` releases held input first.
     fn set_input_sink(&self, sink: Option<Sender<VideoInput>>);
     /// Install or clear the file-drop sink. `None` refuses drops.

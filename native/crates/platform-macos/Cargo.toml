@@ -1,0 +1,16 @@
+[package]
+name = "platform-macos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# macOS implementation of `platform-api` (plan lane M). Empty on other targets.
+[target.'cfg(target_os = "macos")'.dependencies]
+platform-api = { path = "../platform-api" }
+tracing.workspace = true
+dirs = "6"

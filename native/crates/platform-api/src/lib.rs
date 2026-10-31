@@ -32,6 +32,7 @@ pub mod input;
 pub mod os;
 pub mod platform;
 pub mod surface;
+pub mod unavailable;
 
 #[cfg(feature = "mock")]
 pub mod mock;

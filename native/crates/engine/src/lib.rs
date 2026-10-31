@@ -5,24 +5,22 @@
 //! switch), and owns the media session (capture→encode→transport on the host,
 //! transport→decode→render on the viewer).
 //!
-//! The control plane here is portable and unit-tested; the media pipeline
-//! ([`pipeline`]) is Windows-only and wires `capture`/`codec`/`render`/`input`.
+//! Everything here is OS-independent: every OS service (capture, codecs, the
+//! video surface, input injection, clipboard, secrets) comes from the
+//! [`platform_api::Platform`] the app passes to [`Engine::start`].
 
-#[cfg(windows)]
-pub mod autostart;
-#[cfg(windows)]
-pub mod clipboard;
 pub mod handshake;
-#[cfg(windows)]
-pub mod pipeline;
-pub mod secret;
+mod media;
+mod session;
 pub mod transfer;
+mod tuning;
 pub mod turn;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
+use platform_api::{Codec, Platform, VideoSurface};
 use protocol::{Config, ControlMsg, Mode, Permission, SignalData, SignalMsg};
 use signaling::{Event as SigEvent, SignalingClient};
 use std::sync::Arc;
@@ -74,7 +72,18 @@ pub enum UiEvent {
     LinkRestored,
 }
 
-/// The engine. Owns config + the signaling client and the current role.
+/// How a session finds a network path to the peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IcePolicy {
+    /// Host, STUN server-reflexive and TURN relay candidates (normal use).
+    #[default]
+    Full,
+    /// Bind to 127.0.0.1, no STUN/TURN: both peers on this machine. For the
+    /// loopback test harness and diagnostics.
+    LoopbackOnly,
+}
+
+/// The engine. Owns config, the signaling client, the current role and session.
 pub struct Engine {
     config_path: PathBuf,
     config: Arc<Mutex<Config>>,
@@ -102,20 +111,37 @@ pub struct Engine {
     /// challenges us again, the saved credential is stale — drop it and fall back
     /// to prompting, instead of looping on a password that no longer works.
     auto_attempted: Arc<Mutex<Option<String>>>,
+    /// Viewer: the host we sent a connect-request to and are waiting on. A
+    /// connect-response from anyone else is ignored — otherwise any peer that
+    /// knows our id could make us start a viewer session with it.
+    outbound: Mutex<Option<String>>,
+    /// OS services.
+    platform: Arc<dyn Platform>,
+    /// The viewer's native video surface, attached by the app once its window
+    /// exists (`None` until then, and on platforms without one).
+    surface: Mutex<Option<Arc<dyn VideoSurface>>>,
+    /// The codec of the current/next session: chosen by the host at accept time,
+    /// adopted by the viewer from the connect-response.
+    negotiated: Mutex<Codec>,
+    /// The live session, if any (one at a time).
+    pub(crate) session: Mutex<Option<session::Session>>,
+    ice_policy: Mutex<IcePolicy>,
 }
 
 impl Engine {
-    /// Load config, spawn signaling for our UUID, and return the engine plus the
-    /// UI event stream. `decider` answers approve-mode popups (the app wires it
-    /// to the WebView2 modal).
+    /// Load config from the platform's config dir, spawn signaling for our UUID,
+    /// and return the engine plus the UI and signaling event streams. `decider`
+    /// answers approve-mode popups (the app wires it to its modal). Must be called
+    /// inside an entered Tokio runtime.
     pub fn start(
-        config_path: PathBuf,
+        platform: Arc<dyn Platform>,
         decider: Arc<dyn Decider>,
     ) -> (
         Arc<Self>,
         tokio::sync::mpsc::UnboundedReceiver<UiEvent>,
         tokio::sync::mpsc::UnboundedReceiver<SigEvent>,
     ) {
+        let config_path = platform.paths().config_dir.join("config.json");
         let config = Config::load(&config_path);
         let (signaling, sig_rx) =
             SignalingClient::spawn(config.server_url.clone(), config.uuid.clone());
@@ -133,6 +159,12 @@ impl Engine {
             turn_servers: Arc::new(Mutex::new(Vec::new())),
             pending_login: Arc::new(Mutex::new(None)),
             auto_attempted: Arc::new(Mutex::new(None)),
+            outbound: Mutex::new(None),
+            platform,
+            surface: Mutex::new(None),
+            negotiated: Mutex::new(Codec::H264),
+            session: Mutex::new(None),
+            ice_policy: Mutex::new(IcePolicy::Full),
         });
         (engine, ui_rx, sig_rx)
     }
@@ -225,9 +257,16 @@ impl Engine {
                 self.on_remote_end(from);
             }
             SignalMsg::RelayError { reason, to } if reason == "peer-offline" => {
-                let _ = self.ui.send(UiEvent::Toast("Peer offline".into()));
-                let _ = to;
-                self.end_session_local();
+                // Only react when the offline peer is the one we are in (or
+                // trying to start) a session with — not any id the relay reports.
+                let ours = match to.as_deref() {
+                    Some(id) => self.is_session_peer(id),
+                    None => true, // older servers omit `to`
+                };
+                if ours {
+                    let _ = self.ui.send(UiEvent::Toast("Peer offline".into()));
+                    self.end_session_local();
+                }
             }
             SignalMsg::TurnCredentials { ice_servers, error } => {
                 self.on_turn_credentials(ice_servers, error);
@@ -365,13 +404,14 @@ impl Engine {
         // Codec negotiation from the viewer's advertised caps (§3) — done before
         // the response so the viewer is told which codec to decode with.
         let decode = self.pending_caps.lock().remove(&peer).unwrap_or_default();
-        #[cfg(windows)]
-        let codec = pipeline::set_negotiated_codec_from_caps(&decode);
-        #[cfg(not(windows))]
-        let codec = {
-            let _ = &decode;
-            "H264".to_string()
-        };
+        let viewer: Vec<Codec> = decode
+            .iter()
+            .filter_map(|s| Codec::from_caps_str(s))
+            .collect();
+        let chosen = Codec::negotiate(&self.platform.codecs().host_encodable(), &viewer);
+        *self.negotiated.lock() = chosen;
+        tracing::info!("negotiated codec: {}", chosen.as_caps_str());
+        let codec = chosen.as_caps_str().to_string();
 
         let _ = self.signaling.send(SignalMsg::ConnectResponse {
             to: Some(peer.clone()),
@@ -388,8 +428,7 @@ impl Engine {
         let _ = self.ui.send(UiEvent::RoleChanged(self.role.lock().clone()));
         // Persist, not just mutate in memory, so recents survive a restart.
         self.update_config(|c| c.add_recent(&peer));
-        #[cfg(windows)]
-        pipeline::begin_host(self, peer, permission);
+        session::begin_host(self, peer, permission);
     }
 
     // ---- Viewer side (contract §3.2) -------------------------------------
@@ -399,10 +438,14 @@ impl Engine {
         // Advertise only codecs this viewer can actually hardware-decode. A
         // hardcoded list (e.g. always claiming AV1) makes the host negotiate a
         // codec we cannot decode → the viewer media loop dies → black screen.
-        #[cfg(windows)]
-        let decode = pipeline::viewer_decode_caps();
-        #[cfg(not(windows))]
-        let decode = vec!["H264".to_string()];
+        let decode: Vec<String> = self
+            .platform
+            .codecs()
+            .viewer_decodable()
+            .iter()
+            .map(|c| c.as_caps_str().to_string())
+            .collect();
+        *self.outbound.lock() = Some(host_uuid.clone());
         let _ = self.signaling.send(SignalMsg::ConnectRequest {
             to: Some(host_uuid.clone()),
             from: None,
@@ -455,7 +498,7 @@ impl Engine {
         }
         let sealed = cfg.saved_logins.get(host)?.clone();
         drop(cfg);
-        secret::unprotect(&sealed)
+        self.platform.secrets().open(&sealed)
     }
 
     /// UI action: answer a `password-required` prompt (viewer side). `remember`
@@ -487,6 +530,15 @@ impl Engine {
         reason: Option<String>,
         codec: Option<String>,
     ) {
+        // Only the host we asked may answer, and only once.
+        {
+            let mut outbound = self.outbound.lock();
+            if outbound.as_deref() != Some(from.as_str()) {
+                tracing::warn!("ignoring a connect-response from {from}: we did not ask it");
+                return;
+            }
+            *outbound = None;
+        }
         if !accepted {
             *self.pending_login.lock() = None;
             let auto = self.auto_attempted.lock().take();
@@ -509,12 +561,12 @@ impl Engine {
             return;
         }
         // The host accepted us, so any password we just sent is known-good — this
-        // is the only point at which it's worth saving. Sealed with DPAPI; if
-        // that fails we simply don't save (never fall back to plaintext).
+        // is the only point at which it's worth saving. Sealed by the platform's
+        // secret store; if that fails we simply don't save (never plaintext).
         *self.auto_attempted.lock() = None;
         if let Some((host, plaintext, remember)) = self.pending_login.lock().take() {
             if remember && host == from {
-                match secret::protect(&plaintext) {
+                match self.platform.secrets().seal(&plaintext) {
                     Some(sealed) => {
                         self.update_config(|c| {
                             c.auto_login = true;
@@ -532,10 +584,10 @@ impl Engine {
             }
         }
         // The host told us which codec it will stream; decode with the same (§3).
-        #[cfg(windows)]
-        pipeline::set_codec_from_str(codec.as_deref().unwrap_or("H264"));
-        #[cfg(not(windows))]
-        let _ = &codec;
+        *self.negotiated.lock() = codec
+            .as_deref()
+            .and_then(Codec::from_caps_str)
+            .unwrap_or(Codec::H264);
         let perm = permission
             .as_deref()
             .map(|p| match p {
@@ -548,18 +600,12 @@ impl Engine {
             permission: perm,
         };
         let _ = self.ui.send(UiEvent::RoleChanged(self.role.lock().clone()));
-        #[cfg(windows)]
-        pipeline::begin_viewer(self, from, perm);
+        tracing::info!("viewer session with {from}; awaiting the host's offer");
     }
 
     /// WebRTC negotiation payloads (offer/answer/ICE) — routed to the transport.
     async fn on_signal(&self, from: String, data: SignalData) {
-        #[cfg(windows)]
-        pipeline::on_signal(self, &from, data);
-        #[cfg(not(windows))]
-        {
-            let _ = (from, data);
-        }
+        session::on_signal(self, &from, data);
     }
 
     // ---- Session lifecycle -----------------------------------------------
@@ -571,12 +617,9 @@ impl Engine {
             let peer = peer.clone();
             *role = Role::Host { peer, permission };
             drop(role);
-            #[cfg(windows)]
-            {
-                // Update the host injection gate, then notify the viewer (§4.2).
-                pipeline::set_control(permission == Permission::Control);
-                pipeline::send_ctl(self, &ControlMsg::Perm { value: permission });
-            }
+            // Update the host injection gate, then notify the viewer (§4.2).
+            session::set_control(self, permission == Permission::Control);
+            session::send_ctl(self, &ControlMsg::Perm { value: permission });
         }
     }
 
@@ -584,13 +627,14 @@ impl Engine {
     /// to clear residual smear after packet loss).
     pub fn request_refresh(&self) {
         if matches!(&*self.role.lock(), Role::Viewer { .. }) {
-            #[cfg(windows)]
-            pipeline::send_ctl(self, &ControlMsg::KeyframeRequest);
+            session::send_ctl(self, &ControlMsg::KeyframeRequest);
         }
     }
 
     /// End the session locally and tell the peer (best-effort, contract §3.2 s5).
     pub fn end_session(&self) {
+        // Also cancels a connect-request that has not been answered yet.
+        *self.outbound.lock() = None;
         let peer = match &*self.role.lock() {
             Role::Host { peer, .. } | Role::Viewer { peer, .. } => Some(peer.clone()),
             Role::Idle => None,
@@ -615,13 +659,72 @@ impl Engine {
     }
 
     fn end_session_local(&self) {
-        #[cfg(windows)]
-        pipeline::teardown(self);
+        *self.outbound.lock() = None;
+        session::teardown(self);
         *self.role.lock() = Role::Idle;
         let _ = self.ui.send(UiEvent::RoleChanged(Role::Idle));
     }
 
-    // Accessors used by the pipeline module.
+    /// Whether `id` is the peer of the current session or of our pending
+    /// connect-request.
+    fn is_session_peer(&self, id: &str) -> bool {
+        let in_session = matches!(
+            &*self.role.lock(),
+            Role::Host { peer, .. } | Role::Viewer { peer, .. } if peer == id
+        );
+        in_session || self.outbound.lock().as_deref() == Some(id)
+    }
+
+    /// End the current session because it could not be started or kept going,
+    /// telling the user why.
+    pub(crate) fn fail_session(&self, why: &str) {
+        let _ = self
+            .ui
+            .send(UiEvent::Toast(format!("Session ended: {why}")));
+        self.end_session();
+    }
+
+    // ---- platform & surface ------------------------------------------------
+
+    /// The OS services this engine runs on.
+    pub fn platform(&self) -> Arc<dyn Platform> {
+        self.platform.clone()
+    }
+
+    /// Attach the viewer's video surface (the app creates it under its window).
+    pub fn attach_surface(&self, surface: Arc<dyn VideoSurface>) {
+        *self.surface.lock() = Some(surface);
+    }
+
+    pub(crate) fn surface(&self) -> Option<Arc<dyn VideoSurface>> {
+        self.surface.lock().clone()
+    }
+
+    /// Viewer: hide/show the native video so web modals (settings) are visible
+    /// mid-session. The stream keeps running; only presentation is hidden.
+    pub fn set_video_visible(&self, visible: bool) {
+        if let Some(s) = self.surface() {
+            if visible {
+                s.show();
+            } else {
+                s.hide();
+            }
+        }
+    }
+
+    pub fn set_ice_policy(&self, policy: IcePolicy) {
+        *self.ice_policy.lock() = policy;
+    }
+
+    pub(crate) fn ice_policy(&self) -> IcePolicy {
+        *self.ice_policy.lock()
+    }
+
+    pub(crate) fn negotiated_codec(&self) -> Codec {
+        *self.negotiated.lock()
+    }
+
+    // Accessors used by the session module.
     pub(crate) fn signaling(&self) -> &SignalingClient {
         &self.signaling
     }

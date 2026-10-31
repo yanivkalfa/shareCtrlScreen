@@ -25,10 +25,18 @@ const BACKOFF_SECS: &[u64] = &[1, 2, 4, 8, 16, 30];
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Boxed: the tungstenite error is large and every `?` in the connection
+    /// loop would otherwise copy it around.
     #[error("websocket: {0}")]
-    Ws(#[from] tokio_tungstenite::tungstenite::Error),
+    Ws(Box<tokio_tungstenite::tungstenite::Error>),
     #[error("channel closed")]
     ChannelClosed,
+}
+
+impl From<tokio_tungstenite::tungstenite::Error> for Error {
+    fn from(e: tokio_tungstenite::tungstenite::Error) -> Self {
+        Error::Ws(Box::new(e))
+    }
 }
 
 /// Inbound events surfaced to the engine (mirrors signaling.js `route`).

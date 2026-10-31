@@ -18,15 +18,6 @@ use std::path::{Path, PathBuf};
 
 use protocol::transfer::{sanitize_file_name, FileMeta, MAX_FILE_BYTES};
 
-/// Where received files are written: `%USERPROFILE%\Downloads\ShareCtrlScreen`.
-/// A fixed, obvious location — the sender never influences it.
-pub fn receive_dir() -> PathBuf {
-    let base = std::env::var("USERPROFILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
-    base.join("Downloads").join("ShareCtrlScreen")
-}
-
 /// An in-progress inbound file.
 pub struct Incoming {
     file: File,

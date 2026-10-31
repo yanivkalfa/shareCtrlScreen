@@ -6,6 +6,9 @@ resolver = "2"
 members = [
     "crates/protocol",
     "crates/platform-api",
+    "crates/platform-windows",
+    "crates/platform-macos",
+    "crates/platform-linux",
     "crates/capture",
     "crates/codec",
     "crates/transport",

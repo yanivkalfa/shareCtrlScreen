@@ -14,14 +14,17 @@ The Cloudflare signaling server (`../server/`) and the JSON WebSocket protocol
 | Crate | Responsibility |
 |---|---|
 | `crates/protocol` | Shared types: config schema + challenge-response, signaling / input / control message enums. Pure, cross-platform, unit-tested. |
+| `crates/platform-api` | **The OS boundary**: traits for capture, codecs, video surface + presenter, input injection, shortcut hook, clipboard, secrets, autostart, paths, permissions. No OS dependencies. Feature `mock` = in-memory backends for tests. |
+| `crates/platform-windows` | Windows implementation of `platform-api`, wrapping `capture`/`codec`/`render`/`input`/`elevation` + DPAPI, Run key, Win32 clipboard. |
+| `crates/platform-macos`, `crates/platform-linux` | macOS / Linux implementations (scaffolds: real paths, every other capability fails safely until its task lands — see `../plans/05-TASKS.md`). |
 | `crates/capture` | DXGI Desktop Duplication (§5a): shared `ID3D11Texture2D` + dirty/move rects + out-of-band cursor; `ACCESS_LOST` re-init. |
 | `crates/codec` | Media Foundation HW H.264/HEVC encode (§5b, zero-copy, LTR, the low-latency `ICodecAPI` recipe) + D3D11-backed decode (§5c). |
-| `crates/transport` | str0m data channels (§6): video (unreliable) / ctl (reliable) / cursor; FEC (`reed-solomon-simd`) + app fragmentation. Unit-tested. |
+| `crates/transport` | str0m WebRTC (§6): video on an RTP media track with congestion control (BWE), ctl (reliable) / cursor (unreliable) / bulk (reliable) data channels. Unit-tested. |
 | `crates/signaling` | Async WebSocket client to the Cloudflare Worker: register, byte-exact ping/pong watchdog, backoff reconnect. |
 | `crates/input` | `SendInput` injection + Set-1 scancode table (§8a) + `WH_KEYBOARD_LL` shortcut hook. Ported from `input.js`/`keyhook.js`. Unit-tested. |
 | `crates/render` | D3D11 flip-model present (§7): waitable swapchain, `ALLOW_TEARING`, NV12→RGB BT.709 shader. |
 | `crates/elevation` | SYSTEM service primitives (§8b): session detection, `WTSQueryUserToken`, `CreateProcessAsUser`, input-desktop follow, service install/uninstall. |
-| `crates/engine` | Orchestration: handshake state machine (approve/password, live view↔control), and the Windows media pipeline wiring capture↔codec↔transport↔render↔input. |
+| `crates/engine` | OS-independent orchestration: handshake state machine (approve/password, live view↔control), and the session (ICE, transport driver, media threads, clipboard/file sync) — all OS access via `platform-api`. |
 | `app/` | Tauri 2 binary: `#[tauri::command]`s, WebView2 UI host, native D3D child-HWND video, ported vanilla UI in `app/ui/`. |
 | `service/` | Thin SYSTEM service binary: SCM dispatcher + session-follow launch loop. |
 
@@ -30,7 +33,7 @@ The Cloudflare signaling server (`../server/`) and the JSON WebSocket protocol
 ```sh
 cd native
 cargo build --workspace --release
-cargo test  --workspace          # 20 unit tests (protocol/input/codec/transport/engine)
+cargo test  --workspace          # all unit tests; runs on Windows, macOS and Linux
 ```
 
 Two shippable binaries: `sharectrl.exe` (the Tauri app/engine) and
@@ -44,7 +47,7 @@ Requires the Rust `x86_64-pc-windows-msvc` toolchain and the WebView2 runtime
 The single validation that the premise holds. On target hardware:
 
 ```sh
-cargo run -p engine --example latency_smoketest
+cargo run -p platform-windows --example latency_smoketest
 ```
 
 It wires `capture → encode → decode` on one machine and prints per-stage timings

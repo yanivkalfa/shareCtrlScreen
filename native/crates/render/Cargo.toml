@@ -11,6 +11,8 @@ workspace = true
 
 [dependencies]
 thiserror.workspace = true
+platform-api = { path = "../platform-api" }
+input = { path = "../input" }
 tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies.windows]

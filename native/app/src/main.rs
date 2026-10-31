@@ -1,12 +1,13 @@
-//! Tauri shell for ShareCtrlScreen (Plan 04 §7). Native WebView2 UI host, ~2.5 MB
-//! vs Electron ~85 MB. The Rust engine owns config, signaling, WebRTC, capture,
-//! encode/decode, input and elevation; this binary is the thin bridge:
+//! Tauri shell for ShareCtrlScreen. The Rust engine owns config, signaling,
+//! WebRTC and the session; the OS backend (`platform-windows`/`-macos`/`-linux`)
+//! owns capture, codecs, the video surface, input, clipboard and secrets. This
+//! binary is the thin bridge:
 //!   * `#[tauri::command]`s replace each Electron `ipcMain.handle` (config,
 //!     connect, permission, password, approval),
 //!   * engine `UiEvent`s are forwarded to the WebView2 UI via Tauri events,
 //!     replacing `ipcRenderer.on(...)`,
-//!   * the video is composited as a native D3D11 child HWND (Option A, §7); the
-//!     web UI frames it (chrome in the top bar, not over the pixels).
+//!   * the video is a native child surface the platform creates under this
+//!     window; the web UI frames it (the toolbar slides over it on hover).
 //!
 //! The old renderer's WebRTC/signaling JS is obsolete here — that logic moved to
 //! the Rust engine. `withGlobalTauri` lets the ported vanilla UI call
@@ -16,12 +17,14 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 
 use engine::handshake::{ApprovalDecision, Decider};
 use engine::{Engine, Role, UiEvent};
+use platform_api::{Platform, AUTOSTART_FLAG};
 use protocol::Permission;
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use tauri::{Emitter, Manager};
 use tokio::sync::{oneshot, Mutex};
 
@@ -155,13 +158,10 @@ fn request_refresh(state: tauri::State<'_, AppState>) {
 }
 
 /// Viewer: hide/show the native video surface so web modals (settings) are
-/// visible mid-session — the video child HWND otherwise covers them.
+/// visible mid-session — the native surface otherwise covers them.
 #[tauri::command]
-fn set_video_visible(visible: bool) {
-    #[cfg(windows)]
-    engine::pipeline::set_video_visible(visible);
-    #[cfg(not(windows))]
-    let _ = visible;
+fn set_video_visible(state: tauri::State<'_, AppState>, visible: bool) {
+    state.engine.set_video_visible(visible);
 }
 
 #[tauri::command]
@@ -240,39 +240,33 @@ fn save_settings(
         }
     });
 
-    // Apply the startup registration AFTER the config is persisted, so the two
-    // can't disagree. A failure here is surfaced rather than swallowed — a
-    // startup toggle that silently does nothing is worse than one that says why.
-    #[cfg(windows)]
+    // Apply the startup registration AFTER the config is persisted. A failure is
+    // surfaced rather than swallowed (a startup toggle that silently does nothing
+    // is worse than one that says why) — and the saved setting is rolled back, so
+    // the config never claims an autostart that is not registered.
     if let Some(b) = patch.get("startWithWindows").and_then(|v| v.as_bool()) {
-        if let Err(e) = engine::autostart::set_enabled(b) {
-            tracing::warn!("start-with-Windows: {e}");
+        if let Err(e) = state.engine.platform().autostart().set_enabled(b) {
+            tracing::warn!("start at sign-in: {e}");
+            state
+                .engine
+                .update_config(|cfg| cfg.start_with_windows = !b);
             return Err(e);
         }
     }
     Ok(())
 }
 
-fn config_path() -> PathBuf {
-    // %APPDATA%\ShareCtrlScreen\config.json (matches the old userData location).
-    let base = std::env::var("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
-    base.join("ShareCtrlScreen").join("config.json")
-}
-
-/// Log to a file next to the config, since the release build has no console.
-/// `%APPDATA%\ShareCtrlScreen\app.log`. `RUST_LOG` still overrides the level.
-fn init_logging() {
-    let path = config_path().with_file_name("app.log");
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
+/// Log to `app.log` in the platform's log directory, since release builds have
+/// no console. `RUST_LOG` still overrides the level.
+fn init_logging(log_dir: &Path) {
+    let path = log_dir.join("app.log");
+    let _ = std::fs::create_dir_all(log_dir);
     // Verbose for our own media/transport crates so a black screen leaves a
     // trail (encode/decode errors, ICE state); quiet for noisy dependencies.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         tracing_subscriber::EnvFilter::new(
-            "info,engine=debug,transport=debug,codec=debug,capture=debug,signaling=debug,str0m=warn",
+            "info,engine=debug,transport=debug,signaling=debug,platform_windows=debug,\
+             platform_macos=debug,platform_linux=debug,codec=debug,capture=debug,str0m=warn",
         )
     });
     match std::fs::File::create(&path) {
@@ -291,8 +285,42 @@ fn init_logging() {
     }
 }
 
+/// The OS backend for this build.
+fn make_platform() -> Arc<dyn Platform> {
+    #[cfg(windows)]
+    return Arc::new(platform_windows::WindowsPlatform::new());
+    #[cfg(target_os = "macos")]
+    return Arc::new(platform_macos::MacPlatform::new());
+    #[cfg(target_os = "linux")]
+    return Arc::new(platform_linux::LinuxPlatform::new());
+}
+
+/// Create the native video surface under the main window and hand it to the
+/// engine. Must run on the UI thread (it does, inside `setup`). Failure is not
+/// fatal: the app still works as a host, and a viewer session explains why it
+/// cannot show the screen.
+fn attach_video_surface(engine: &Engine, win: &tauri::WebviewWindow) {
+    let handles = win
+        .window_handle()
+        .map_err(|e| e.to_string())
+        .and_then(|w| {
+            win.display_handle()
+                .map(|d| (w.as_raw(), d.as_raw()))
+                .map_err(|e| e.to_string())
+        });
+    match handles {
+        Ok((window, display)) => match engine.platform().create_surface(window, display) {
+            Ok(surface) => engine.attach_surface(surface),
+            Err(e) => tracing::warn!("no native video surface: {e}"),
+        },
+        Err(e) => tracing::warn!("no window handle for the video surface: {e}"),
+    }
+}
+
 fn main() {
-    init_logging();
+    let platform = make_platform();
+    init_logging(&platform.paths().log_dir);
+    tracing::info!("platform: {}", platform.info().name);
 
     // The engine spawns its signaling task with `tokio::spawn`, so a Tokio
     // runtime must exist *and be entered* before `Engine::start`. Hand the same
@@ -304,14 +332,14 @@ fn main() {
 
     let decider = Arc::new(AppDecider::default());
     let (engine, mut ui_rx, mut sig_rx) =
-        Engine::start(config_path(), decider.clone() as Arc<dyn Decider>);
+        Engine::start(platform.clone(), decider.clone() as Arc<dyn Decider>);
 
-    // Keep the Run entry honest. It records an absolute path, which goes stale
-    // whenever the app is updated, reinstalled or run from a different build —
-    // and a stale entry fails silently at logon, so the user would simply find
-    // the app never started despite the setting being on.
-    #[cfg(windows)]
-    engine::autostart::reconcile(engine.config().start_with_windows);
+    // Keep the autostart entry honest. It records an absolute path, which goes
+    // stale whenever the app is updated, reinstalled or run from a different
+    // build — and a stale entry fails silently at sign-in.
+    platform
+        .autostart()
+        .reconcile(engine.config().start_with_windows);
 
     let state = AppState {
         engine: engine.clone(),
@@ -379,24 +407,19 @@ fn main() {
             });
 
             // Drive the signaling event loop into the engine.
-            let engine = engine.clone();
+            let sig_engine = engine.clone();
             tauri::async_runtime::spawn(async move {
                 while let Some(event) = sig_rx.recv().await {
-                    engine.handle_signaling(event).await;
+                    sig_engine.handle_signaling(event).await;
                 }
             });
 
-            // Create the native D3D11 video child window under the Tauri window
-            // (Option A, §7). Must run on the UI thread — it is, inside setup.
-            #[cfg(windows)]
             if let Some(win) = app.get_webview_window("main") {
-                if let Ok(hwnd) = win.hwnd() {
-                    engine::pipeline::create_video_window(hwnd.0 as isize);
-                }
-                // Launched by Windows at logon: come up minimized rather than
-                // throwing a window in the user's face on every boot. The app is
-                // useful purely by being reachable, so it does not need focus.
-                if std::env::args().any(|a| a == engine::autostart::AUTOSTART_FLAG) {
+                attach_video_surface(&engine, &win);
+                // Started at sign-in: come up minimized rather than throwing a
+                // window in the user's face on every boot. The app is useful
+                // purely by being reachable, so it does not need focus.
+                if std::env::args().any(|a| a == AUTOSTART_FLAG) {
                     let _ = win.minimize();
                 }
             }

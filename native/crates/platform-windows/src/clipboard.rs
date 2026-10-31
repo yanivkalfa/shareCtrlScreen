@@ -16,12 +16,15 @@ use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber, OpenClipboard,
     SetClipboardData,
 };
-use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::Memory::{
+    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
+};
 use windows::Win32::System::Ole::{CF_HDROP, CF_UNICODETEXT};
 
-/// Cap on synced text. Clipboards can hold megabytes (a whole document); this
-/// keeps a stray Ctrl+C from stalling the control channel.
-pub const MAX_TEXT_BYTES: usize = 256 * 1024;
+/// Cap on synced text (shared with the wire protocol). Clipboards can hold
+/// megabytes (a whole document); this keeps a stray Ctrl+C from stalling the
+/// control channel.
+pub use platform_api::MAX_TEXT_BYTES;
 
 /// RAII guard so every early return still closes the clipboard. Leaving it open
 /// blocks every other application on the machine from using it.
@@ -71,16 +74,21 @@ pub fn get_text() -> Option<String> {
         if ptr.is_null() {
             return None;
         }
-        // The buffer is NUL-terminated UTF-16; bound the scan so a malformed
-        // clipboard entry can't run away.
-        let max = MAX_TEXT_BYTES / 2;
+        // The buffer should be NUL-terminated UTF-16. Bound the scan by the real
+        // allocation (a malformed entry without a terminator must not read past
+        // it) and by the size cap: oversized text is refused, never truncated — a
+        // silently cut-off paste on the other machine is worse than none.
+        let units_in_alloc = GlobalSize(HGLOBAL(handle.0)) / 2;
+        let limit = units_in_alloc.min(MAX_TEXT_BYTES + 1);
         let mut len = 0usize;
-        while len < max && *ptr.add(len) != 0 {
+        while len < limit && *ptr.add(len) != 0 {
             len += 1;
         }
-        let text = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
+        let terminated = len < units_in_alloc;
+        let text = (terminated && len <= MAX_TEXT_BYTES)
+            .then(|| String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len)));
         let _ = GlobalUnlock(HGLOBAL(handle.0));
-        (!text.is_empty()).then_some(text)
+        text.filter(|t| !t.is_empty() && t.len() <= MAX_TEXT_BYTES)
     }
 }
 

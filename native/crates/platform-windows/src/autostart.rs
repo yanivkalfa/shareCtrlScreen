@@ -24,7 +24,7 @@ const RUN_KEY: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
 
 /// Marker passed to the auto-started instance so it can come up minimized
 /// instead of throwing a window in the user's face at every logon.
-pub const AUTOSTART_FLAG: &str = "--autostart";
+pub use platform_api::AUTOSTART_FLAG;
 
 /// The command we want registered: this executable, quoted (the path routinely
 /// contains spaces — `C:\Program Files\…`), plus the marker.

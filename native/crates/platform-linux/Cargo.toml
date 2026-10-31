@@ -14,3 +14,12 @@ workspace = true
 platform-api = { path = "../platform-api" }
 tracing.workspace = true
 dirs = "6"
+# Portal D-Bus client. No `pipewire` feature: it pins an older pipewire-rs than the
+# capture task (L1) uses and the permission flow only needs the D-Bus half.
+ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "screencast", "remote_desktop"] }
+tokio = { workspace = true }
+# Runtime probe for libva (decision #7: libva is dlopen'd, never linked).
+libloading = "0.8"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tempfile = "3"

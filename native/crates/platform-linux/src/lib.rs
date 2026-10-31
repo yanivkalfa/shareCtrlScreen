@@ -17,10 +17,12 @@ mod autostart;
 use platform_api::unavailable::{NoAutostart, NoClipboard, NoCodecs, NoSecretStore};
 use platform_api::{
     Autostart, CaptureError, Clipboard, CodecFactory, DisplayInfo, InputError, InputInjector,
-    OsPermission, Paths, PermissionReport, PermissionState, Platform, PlatformInfo,
-    RawDisplayHandle, RawWindowHandle, ScreenCapture, SecretStore, ShortcutHook, SurfaceError,
-    VideoSurface,
+    OsPermission, Paths, PermissionReport, Platform, PlatformInfo, RawDisplayHandle,
+    RawWindowHandle, ScreenCapture, SecretStore, ShortcutHook, SurfaceError, VideoSurface,
 };
+
+mod permissions;
+mod portal_token;
 
 const NOT_YET: &str = "not available on Linux in this version";
 
@@ -113,15 +115,12 @@ impl Platform for LinuxPlatform {
     }
 
     fn permissions(&self) -> PermissionReport {
-        PermissionReport {
-            screen_capture: PermissionState::NotDetermined,
-            input_injection: PermissionState::NotDetermined,
-            input_monitoring: PermissionState::NotApplicable,
-            notes: vec!["Screen sharing on Linux is not available in this version.".into()],
-        }
+        permissions::report(self.session, &self.paths().log_dir)
     }
 
-    fn request_permission(&self, _p: OsPermission) {}
+    fn request_permission(&self, p: OsPermission) {
+        permissions::request(self.session, &self.paths().log_dir, p);
+    }
 
     fn create_capture(
         &self,

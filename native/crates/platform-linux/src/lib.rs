@@ -12,6 +12,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod autostart;
+
 use platform_api::unavailable::{NoAutostart, NoClipboard, NoCodecs, NoSecretStore};
 use platform_api::{
     Autostart, CaptureError, Clipboard, CodecFactory, DisplayInfo, InputError, InputInjector,
@@ -157,9 +159,15 @@ impl Platform for LinuxPlatform {
     }
 
     fn autostart(&self) -> Arc<dyn Autostart> {
-        Arc::new(NoAutostart {
-            reason: "start at login is not available on Linux in this version",
-        })
+        match autostart::XdgAutostart::for_current_user() {
+            Ok(entry) => Arc::new(entry),
+            Err(e) => {
+                tracing::warn!("start at login unavailable: {e}");
+                Arc::new(NoAutostart {
+                    reason: "start at login is unavailable: the program path or config directory could not be determined",
+                })
+            }
+        }
     }
 }
 

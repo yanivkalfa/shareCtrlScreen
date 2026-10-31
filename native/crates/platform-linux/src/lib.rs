@@ -14,6 +14,7 @@
 
 mod codec;
 pub mod secret;
+mod uinput_access;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,6 +33,11 @@ use platform_api::{
 
 mod permissions;
 mod portal_token;
+
+pub use uinput_access::{
+    install_uinput_access, InstallMode, UinputInstallError, UinputInstallOutcome,
+    UinputInstallPlan, UINPUT_GROUP, UINPUT_MODULES_LOAD_PATH, UINPUT_RULE_PATH,
+};
 
 const NOT_YET: &str = "not available on Linux in this version";
 

@@ -107,6 +107,65 @@ The two repository secrets are `MAC_SIGN_P12_B64` and `MAC_SIGN_P12_PASS`; witho
 the workflow falls back to an ad-hoc signature (permissions are lost on every update).
 `app/icons/icon.icns` is regenerated with `cargo tauri icon` (command in `../plans/checklists/M10.md`).
 
+## Linux install
+
+Three packages are built on Ubuntu 22.04 (glibc 2.35, WebKitGTK 4.1) by the `linux-build`
+workflow, so they run on Ubuntu 22.04 and newer, Fedora 40 and comparable distributions:
+
+| Package | Install | Notes |
+|---|---|---|
+| `.deb` | `sudo apt install ./ShareCtrlScreen_*_amd64.deb` | Debian 12+, Ubuntu 22.04+. `apt` pulls the dependencies. |
+| `.rpm` | `sudo dnf install ./ShareCtrlScreen-*.x86_64.rpm` | Fedora 40+. |
+| `.AppImage` | `chmod +x ShareCtrlScreen_*.AppImage && ./ShareCtrlScreen_*.AppImage` | Needs FUSE 2 (`libfuse2` / `fuse-libs`), or run with `--appimage-extract-and-run`. |
+
+**Runtime dependencies.** Required (declared as package `Depends`): WebKitGTK 4.1, GTK 3,
+PipeWire 0.3 client library, libxkbcommon. Recommended (not required): `libva2` +
+`libva-drm2` (hardware H.264 through VA-API; loaded with `dlopen`, so the app starts and
+falls back to software encoding without them) and `xdg-desktop-portal` with a backend for
+your desktop (`-gnome`, `-kde`, `-wlr`, `-hyprland`), which Wayland screen sharing needs.
+
+**GPU video acceleration.** The driver comes from your distribution, not from this app:
+Intel `intel-media-va-driver-non-free` (or `intel-media-va-driver`), AMD `mesa-va-drivers`,
+NVIDIA proprietary driver. Check with `vainfo` (package `vainfo` / `libva-utils`): it must
+list `VAProfileH264Main` or `VAProfileH264High` with `VAEntrypointEncSlice` (or
+`VAEntrypointEncSliceLP`). `Failed to initialize display` or no H.264 encode entrypoint
+means the app uses software H.264.
+
+**AppImage caveats.** The AppImage bundles WebKitGTK, GTK and their data but not glibc,
+the GPU/VA drivers or the PipeWire daemon, which always come from the host. GStreamer media
+plugins are not bundled (`bundleMediaFramework` is off): the UI plays no media, and video
+is rendered natively. A host that is older than Ubuntu 22.04 cannot run it.
+
+**Remote control without the portal (uinput).** On Wayland, input is injected through the
+desktop's RemoteDesktop portal. Where the portal cannot do that, Settings offers
+"Enable uinput access", which asks for your password once (polkit) and runs
+`platform_linux::install_uinput_access`: it writes `/etc/udev/rules.d/70-sharectrl-uinput.rules`
+(`/dev/uinput` to group `input`, mode 0660), adds your user to `input`, loads the `uinput`
+module now and at boot, and reloads udev. Log out and back in afterwards. To do the same
+by hand, or to undo it:
+
+```sh
+sudo install -m 0644 /dev/stdin /etc/udev/rules.d/70-sharectrl-uinput.rules <<'EOF'
+KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"
+EOF
+echo uinput | sudo tee /etc/modules-load.d/sharectrl-uinput.conf
+sudo usermod -aG input "$USER" && sudo modprobe uinput && sudo udevadm control --reload-rules && sudo udevadm trigger
+# undo: sudo rm /etc/udev/rules.d/70-sharectrl-uinput.rules /etc/modules-load.d/sharectrl-uinput.conf; sudo gpasswd -d "$USER" input
+```
+
+Membership of `input` also allows reading every input device (keystrokes) of the machine,
+so enable it only on machines where you accept that.
+
+**Logs.** `~/.local/state/sharectrl/app.log` (`$XDG_STATE_HOME/sharectrl/app.log`).
+Config lives in `~/.config/sharectrl/`.
+
+**Building the packages.** On Ubuntu 22.04: install the packages listed in
+`.github/workflows/linux-build.yml`, then `cargo install tauri-cli --version '^2' --locked`
+and `cd native/app && cargo tauri build --bundles appimage,deb,rpm`. Outputs land in
+`native/target/release/bundle/`. The AppImage step needs FUSE or
+`APPIMAGE_EXTRACT_AND_RUN=1`; it does not work under WSL. The icon PNGs in `app/icons/` are
+regenerated with `python3 app/icons/generate-linux-icons.py`.
+
 ## Licensing (§11 — CI-enforced)
 
 - `deny.toml` — `cargo deny check` allowlist + banned-crate list (AGPL capture crates,

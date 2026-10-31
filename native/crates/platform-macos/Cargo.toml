@@ -21,3 +21,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = ["std", 
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFDictionary", "CFNumber", "CFString"] }
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGEvent", "CGWindow"] }
 objc2-application-services = { version = "0.3", default-features = false, features = ["std", "HIServices", "AXUIElement"] }
+# Keychain (generic passwords). keyring 4.2 has no `macos` feature: the Keychain
+# store is selected by its default `v1` feature on macOS.
+keyring = "4.2"
+uuid.workspace = true

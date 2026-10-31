@@ -13,7 +13,7 @@ mod permissions;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use platform_api::unavailable::{NoAutostart, NoCodecs, NoSecretStore};
+use platform_api::unavailable::{NoAutostart, NoCodecs};
 use platform_api::{
     Autostart, CaptureError, Clipboard, CodecFactory, DisplayInfo, InputError, InputInjector,
     OsPermission, Paths, PermissionReport, Platform, PlatformInfo, RawDisplayHandle,
@@ -21,6 +21,7 @@ use platform_api::{
 };
 
 mod clipboard;
+mod secret;
 
 const NOT_YET: &str = "not available on macOS in this version";
 
@@ -115,7 +116,7 @@ impl Platform for MacPlatform {
     }
 
     fn secrets(&self) -> Arc<dyn SecretStore> {
-        Arc::new(NoSecretStore)
+        Arc::new(secret::KeychainSecretStore)
     }
 
     fn autostart(&self) -> Arc<dyn Autostart> {

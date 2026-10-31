@@ -29,6 +29,7 @@ pub mod capture;
 pub mod codec;
 pub mod frame;
 pub mod input;
+pub mod keymap;
 pub mod os;
 pub mod platform;
 pub mod surface;
@@ -43,6 +44,7 @@ pub use codec::{
 };
 pub use frame::{CpuPlane, Frame, FrameData, MoveRect, PixelFormat, Point, Rect};
 pub use input::{InputError, InputInjector, KeyForwarder, ShortcutHook};
+pub use keymap::{KeyId, Set1};
 pub use os::{Autostart, Clipboard, Paths, SecretStore, AUTOSTART_FLAG, MAX_TEXT_BYTES};
 pub use platform::{
     DisplayInfo, OsPermission, PermissionReport, PermissionState, Platform, PlatformInfo,

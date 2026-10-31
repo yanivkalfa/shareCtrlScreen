@@ -17,6 +17,7 @@ members = [
     "crates/render",
     "crates/elevation",
     "crates/engine",
+    "tools/gen-keymap",
     "app",
     "service",
 ]

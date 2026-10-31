@@ -1312,6 +1312,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "gen-keymap"
+version = "2.0.0"
+dependencies = [
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1833,6 +1840,7 @@ name = "input"
 version = "2.0.0"
 dependencies = [
  "parking_lot",
+ "platform-api",
  "protocol",
  "tracing",
  "windows 0.62.2",

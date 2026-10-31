@@ -23,3 +23,6 @@ features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
 ]
+
+[dev-dependencies]
+platform-api = { path = "../platform-api" }

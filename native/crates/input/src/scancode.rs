@@ -319,3 +319,43 @@ mod tests {
         assert_eq!(lookup("Nonsense"), None);
     }
 }
+
+/// The generated keymap in `platform-api` must reproduce this table exactly,
+/// so the Windows input crate can switch to it (task W3) without any key
+/// changing its scancode. Remove with this module when W3 lands.
+#[cfg(test)]
+mod keymap_parity {
+    use super::*;
+    use platform_api::keymap::{dom_for, from_dom, KeyId, Set1};
+
+    #[test]
+    fn generated_table_matches_every_old_entry() {
+        assert_eq!(ALL_CODES.len(), 104);
+        for &code in ALL_CODES {
+            let old = lookup(code).unwrap_or_else(|| panic!("{code} lost from the old table"));
+            let key = from_dom(code).unwrap_or_else(|| panic!("{code} missing from keymap"));
+            let new = key
+                .to_set1()
+                .unwrap_or_else(|| panic!("{code} has no Set-1 code in keymap"));
+            assert_eq!(
+                (u16::from(new.code), new.extended),
+                (old.sc, old.ext),
+                "{code}"
+            );
+            // The reverse direction the viewer's capture relies on.
+            let back = KeyId::from_set1(Set1 {
+                code: new.code,
+                extended: new.extended,
+            });
+            assert_eq!(back.map(dom_for), Some(code));
+        }
+    }
+
+    #[test]
+    fn deliberate_exclusions_stay_excluded() {
+        for code in ["Pause", "MediaPlayPause", "AudioVolumeUp", "Fn"] {
+            assert_eq!(lookup(code), None);
+            assert_eq!(from_dom(code), None, "{code}");
+        }
+    }
+}

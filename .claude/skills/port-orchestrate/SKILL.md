@@ -1,190 +1,226 @@
 ---
 name: port-orchestrate
-description: Run the macOS/Linux port of ShareCtrlScreen as parallel agent tasks — how to pick tasks, brief agents, route models, verify, merge into port/multi-os, hand off to hardware testers, and report. Use when asked to orchestrate, continue, or check on the port work.
+description: Run the macOS/Linux port of ShareCtrlScreen as parallel agent tasks — task selection, worktrees, builder briefs, model tiers and caps, the review chain, the merge gate, hardware hand-off, reporting. Use when asked to orchestrate, continue, or check on the port work.
 ---
 
 # Orchestrating the macOS + Linux port
 
-You are the orchestrator. You do not implement tasks yourself; you hand out
-tasks from `plans/05-TASKS.md`, verify what comes back, merge it, and keep the
-plan's status table true. Everything below is the procedure; the design lives in
-`plans/` and the locked decisions in `plans/00-DECISIONS.md` (they override
-anything else, including this file).
+You are the **orchestrator**. You never write product code. You hand out tasks
+from `plans/05-TASKS.md`, keep the concurrency caps, review what comes back,
+run the merge gate, merge, and keep the plan's status table true. The design is
+in `plans/`; `plans/00-DECISIONS.md` overrides everything, including this file.
 
-## 0. Before the first task of a session
+## The process (agreed with the owner, 2026-11-01)
 
-1. `git -C C:\Yanivs\shareCtrlScreen status --short` must be clean and the branch
-   `port/multi-os`. Never work on `main`.
-2. Read `plans/05-TASKS.md` § Status — it is the single source of truth for what
-   is done, in progress (with branch name) and open. Update it as you go.
-3. Confirm the two local build environments still work (they take ~1 min each
-   when cached):
+1. Every task is **researched, developed, tested, bug-hunted, fixed and
+   committed** by one builder agent, in **its own git worktree on its own branch
+   `task/<ID>`**, created from the current tip of `port/multi-os`.
+2. **Production grade, long term.** No patches to "get it working", no
+   shortcuts, no stubs left behind. Definition of done is in §4.
+3. All **ready** tasks start at once; a task becomes ready the moment its last
+   dependency is merged. (Dependencies: the graph and "Depends on" lines in
+   `plans/05-TASKS.md`.)
+4. Builders stay alive until their work is merged. Fixes always go back to the
+   **same builder** (`SendMessage`). Only after the review passes and the gate
+   passes is the work merged and the builder retired.
+5. **Tiers and caps** (running builders; reviewers and the orchestrator never
+   count): at most **5 Opus 5.5**, at most **10 Sonnet 5.5**, **unlimited
+   Haiku 5.5**. Opus is the default. Easy tasks go to Sonnet or Haiku at the
+   orchestrator's discretion (§2 has the current split).
+6. **Review chain.**
+   - Built by **Haiku** → an independent **Opus reviewer** agent reviews it;
+     findings go back to the Haiku builder; repeat until the reviewer signs
+     off → orchestrator gate → merge.
+   - Built by **Opus or Sonnet** → the **orchestrator** reviews it (diff read +
+     gate); findings go back to the builder; repeat → merge.
+7. After merging, the orchestrator re-runs the full gate on `port/multi-os`.
+
+## 0. Session start
+
+1. `git status --short` clean, branch `port/multi-os`; `git worktree list` for
+   leftovers (a worktree with unmerged commits is an unfinished task — resume
+   it, §5, before starting new work).
+2. Read `plans/05-TASKS.md` § Status — the single source of truth. The
+   "in progress" rows name the branch, tier and agent.
+3. Prove the base is green on both local OSes before handing anything out:
    - Windows: `cd native && cargo test --workspace`
-   - Linux: `wsl -e bash -lc 'source $HOME/.cargo/env; cd /mnt/c/Yanivs/shareCtrlScreen/native && CARGO_TARGET_DIR=/tmp/sct-target cargo test --workspace'`
-   If either fails before you changed anything, stop and report; do not hand out
-   tasks on a broken base.
-4. Check `git worktree list` for leftovers from earlier sessions. A worktree with
-   commits not yet in `port/multi-os` is an unfinished task: resume it (§5)
-   before starting new ones.
+   - Linux: `wsl -e bash -lc 'source $HOME/.cargo/env; cd /mnt/c/Yanivs/shareCtrlScreen/native && CARGO_TARGET_DIR=/tmp/sct-base cargo test --workspace'`
+4. Verify `rustup target list --installed` includes `aarch64-apple-darwin` and
+   `x86_64-unknown-linux-gnu` (macOS code is type-checked with
+   `cargo check -p platform-macos --target aarch64-apple-darwin`).
 
-## 1. What can run now
+## 1. Picking tasks
 
-Dependencies are in `plans/05-TASKS.md` (the ASCII graph and each task's
-"Depends on"). Rules:
+- Ready = every dependency is marked done in the Status table.
+- Start design-risk tasks first inside a tier (L5-spike, M4, D2, M1, L3 before
+  M7, M9…): bad news early is cheaper.
+- Keep a running ledger (in your head and in the Status table): running Opus,
+  running Sonnet. Never launch a builder over the cap; queue it and launch when
+  a slot frees (a merge or a retirement).
 
-- A task is **ready** when every dependency is in the Status table as done.
-- Run up to **10 tasks at once**. More than that just queues on review.
-- Start the **spike before its lane**: L5-spike before L5; D2 (software codec)
-  and D3 (keymap) early, because W2/W3/L6/M5 wait on them.
-- Within a lane, prefer the task whose failure would change the design (M4, L5,
-  L3) over the easy ones; bad news early is cheaper.
+## 2. Tier split (orchestrator's discretion; revise if a task proves harder)
 
-## 2. Model routing (decision #12 — do not change on your own)
+| Tier | Tasks |
+|---|---|
+| Haiku | D6, M8, M9, L9, L10, T2, T3, T5 |
+| Sonnet | D3, D4, D5, M7, M10, M11, L8, L11, L12, W2, W3 |
+| Opus | everything else: D2, D7, L5-spike, L5, L1–L4, L6, L7, M1–M6, I-tasks' checklists, any `platform-api` change |
 
-| Tier | Tasks | Why |
-|---|---|---|
-| **Opus** | M4, L5 + L5-spike, M5, M6, L6, L7, D7, any change to `platform-api` | unsafe FFI with no hardware loop, or OS-input code that trips safety filters |
-| **Sonnet** | M1, M2, M3, L1, L2, L3, L4, D2, T4, I-tasks' checklists | FFI against documented APIs |
-| **Haiku** | D3, D4, D5, D6, M7, M8, M9, M10, M11, L8, L9, L10, L11, L12, T2, T3, T5, W2, W3 | well-specified, testable with mocks/CI |
+Haiku's safety filter refuses code that looks like input injection or screen
+capture; if a Haiku builder reports being blocked, re-run on Sonnet with the
+same brief. Never reword a brief to evade a filter.
 
-Haiku's safety filter blocks code that looks like input capture/injection or
-screen recording; if a Haiku agent reports being blocked, re-run the task on
-Sonnet with the same brief — do not reword to sneak past the filter.
+## 3. Launching a builder
 
-## 3. How to run an agent
-
-Use the `Agent` tool with `isolation: "worktree"` (one task = one worktree = one
-branch). Use the `Workflow` tool only if the user said "use a workflow" /
-"ultracode" in this session; then one `agent()` per task with `isolation:
-'worktree'` and the same brief. Either way the agent runs in the background;
-keep handing out tasks while it works.
-
-### The brief (every agent gets exactly this shape)
+`Agent` tool, `subagent_type: "general-purpose"`, `isolation: "worktree"`,
+`model` per tier, background. One agent per task; remember its name/ID (you
+will `SendMessage` it for fixes). The brief:
 
 ```
-TASK <ID> — <title from plans/05-TASKS.md>
+TASK <ID> — <title>
 
-Repo: C:\Yanivs\shareCtrlScreen (you are in a git worktree on branch task/<ID>,
-based on port/multi-os). Commit to that branch; do not push, do not merge.
+You are a BUILDER for the ShareCtrlScreen macOS/Linux port. You are in a git
+worktree of C:\Yanivs\shareCtrlScreen checked out from port/multi-os. First:
+`git checkout -b task/<ID>`. Commit to that branch only. Never push, never
+merge, never touch other branches.
 
-Read first, in this order:
-1. plans/00-DECISIONS.md (locked decisions; follow them)
-2. plans/05-TASKS.md — only your task's entry and the Status table
-3. native/crates/platform-api/src/<the trait files your task implements>
-   — the trait docs state invariants; each one fixed a real bug. Keep them.
-4. plans/0<N>-<FINDINGS/ARCHITECTURE>.md sections named in your task entry
-5. plans/appendix-codemap/<file>.md for the Windows code you are porting from
+Read, in this order, before writing code:
+1. plans/00-DECISIONS.md — locked decisions; they override everything.
+2. plans/05-TASKS.md — the "### <ID> —" entry is your spec; its Deliverable
+   and Acceptance lines are binding, as is the Status table's "interfaces"
+   note.
+3. native/crates/platform-api/src/<trait files you implement> — each
+   invariant in the trait docs fixed a real bug; keep every one.
+4. The plans/0x sections your task entry names; plans/appendix-codemap/ for
+   the Windows code you are porting from (facts there were spot-checked, not
+   verified line by line — trust the code over the map).
+5. native/crates/platform-windows — the reference implementation of the
+   same traits.
 
-Deliverable: <copied from the task entry>.
-Acceptance: <copied from the task entry>.
+Standard of work — production grade, long term:
+- RESEARCH FIRST: read the official platform docs for every API you use;
+  cite them in a `//! ## References` block at the top of the module.
+- No unwrap/expect on OS or I/O results; every failure maps to the trait's
+  error type with a message a user could act on.
+- Every invariant you rely on gets a comment saying WHY.
+- No TODO, FIXME, unimplemented!, todo!, dead code, or commented-out code.
+- No patch "to make it work": if the right design needs more time, take it;
+  if it needs a platform-api change, STOP and report the exact change.
+- New dependencies only from plans/06-CRATES-AND-LICENSES.md; after adding
+  one run `cargo deny check` and paste the result.
+- Code reads like the surrounding code (comment density, naming, idiom).
+- Tests: unit tests for pure logic; platform_api::mock for everything else;
+  hardware-only checks are `#[ignore = "needs <device>"]` with a doc comment
+  describing how to run them on the device.
+- Keep plans/05-TASKS.md and native/README.md truthful if your work changes
+  what they say.
 
-Rules:
-- Do not change any signature in native/crates/platform-api. If your task
-  cannot be done without one, stop and report the exact change you need.
-- New dependencies only from plans/06-CRATES-AND-LICENSES.md; run
-  `cargo deny check` after adding one.
-- Code reads like the surrounding code (comment density, naming). Every
-  invariant you rely on gets a comment saying why.
-- Tests: unit tests for pure logic; use platform_api::mock for everything else.
-  Mark hardware-only verification with `#[ignore = "needs <device>"]` and say
-  so in your report.
-- Before you finish, run and paste the output of:
-    cargo fmt --all --check
-    cargo clippy --workspace --all-targets -- -D warnings
-    cargo test --workspace
-  on every OS you can build on (Windows here; Linux via `wsl -e bash -lc`
-  with CARGO_TARGET_DIR=/tmp/sct-<ID>; macOS only compiles in CI — say so).
-- If an acceptance test fails twice for the same reason, stop and report
-  what you tried; do not keep churning.
+Building: use `CARGO_BUILD_JOBS=4` (other builders share this machine) and
+`cargo check -p <crate>` while iterating. Linux: run in WSL with
+`wsl -e bash -lc 'source $HOME/.cargo/env; cd <your worktree under /mnt/c>/native && CARGO_TARGET_DIR=/tmp/sct-<ID> ...'`.
+macOS code cannot run here; type-check with
+`cargo check -p platform-macos --target aarch64-apple-darwin` and
+`cargo clippy -p platform-macos --target aarch64-apple-darwin -- -D warnings`.
 
-Report back (this is your final message, nothing else is seen):
-- branch name and commit hashes
-- what you built, in 5 lines
-- the check output above, verbatim
-- what is NOT verified and needs a device
-- any platform-api change you need, or "none"
+Before you finish, run and paste VERBATIM:
+  cargo fmt --all --check
+  cargo clippy --workspace --all-targets -- -D warnings
+  cargo test --workspace
+on Windows and (for anything touching shared or Linux code) in WSL.
+`cargo test -p engine --test loopback` must still pass.
+
+If an acceptance test fails twice for the same reason, stop and report what
+you tried. Do not churn.
+
+Your final message is the only thing the orchestrator sees. Report:
+- worktree path, branch, commit hashes
+- what you built (≤ 10 lines) and the research sources you relied on
+- the check output, verbatim
+- what is NOT verified and needs a device, exactly how to verify it there
+- platform-api change needed: the exact signature, or "none"
+- open risks you would want a reviewer to look at
 ```
 
-Fill the `<…>` from the task entry; do not paraphrase acceptance criteria.
+Add task-specific lines where useful (e.g. for L5-spike: "WSLg provides a
+Wayland display `wayland-0`; use it"; for M-tasks: "the objc2 crate family only").
 
-## 4. Verifying a returned task (never merge on the agent's word)
+## 4. Review and gate (every task, before merge)
 
-In the main checkout, with the worktree's branch:
+**Haiku-built tasks only — first an Opus reviewer:** launch an Opus agent
+(`isolation` none; it reads the builder's worktree path) with: the builder's
+report, "review for correctness, invariants kept, production quality per the
+brief, test adequacy; return findings with file:line and a verdict
+APPROVE / CHANGES"; findings go to the builder via `SendMessage`; loop until
+APPROVE.
 
-1. `git log port/multi-os..task/<ID> --oneline` — must be only that task.
-2. Rebase onto current `port/multi-os`; if it conflicts, hand the conflict back
-   to the same agent (SendMessage) rather than resolving it yourself.
-3. Run the full gate yourself on **both** local OSes (Windows + WSL):
-   fmt check, clippy `-D warnings`, `cargo test --workspace`, `cargo deny check`.
-   The loopback test (`cargo test -p engine --test loopback`) must still pass;
-   run it 3× — it is the regression net for everything.
-4. If the task touches Windows behaviour: `cargo build -p app`, launch
-   `native\target\debug\sharectrl.exe` for ~8 s, read
-   `%APPDATA%\ShareCtrlScreen\app.log` — it must show the platform line, the
-   surface created, and "registered with server". (This re-points the
-   Start-with-Windows entry to the debug exe; harmless.)
-5. Read the diff. Reject for: a changed `platform-api` signature without
-   approval; an invariant comment deleted; `unwrap()` on OS results; a test
-   weakened to pass; copied-in code from AGPL/GPL projects (RustDesk, scrap).
-6. Merge with `git merge --ff-only task/<ID>` into `port/multi-os`, delete the
-   branch and worktree, update the Status table (state, commit, notes), commit
-   the plan update. One commit per task is fine; do not squash across tasks.
+**Then the orchestrator, for every task:**
+1. `git -C <worktree> log port/multi-os..HEAD --oneline` — only this task.
+2. Rebase onto `port/multi-os`; conflicts go back to the builder.
+3. Read the whole diff. Reject for: changed `platform-api` signatures without
+   approval; a deleted or weakened invariant comment or test; unwrap/expect on
+   OS results; TODO/stub left; copied code from AGPL/GPL projects (RustDesk,
+   scrap, hwcodec); a dependency not in 06-CRATES; a behaviour change not in
+   the task.
+4. Run the gate yourself in the worktree, on Windows **and** WSL:
+   `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+   `cargo test --workspace`, `cargo deny check`, and
+   `cargo test -p engine --test loopback` three times.
+5. If Windows behaviour changed: `cargo build -p app`, run
+   `native\target\debug\sharectrl.exe` ~8 s, read `%APPDATA%\ShareCtrlScreen\app.log`
+   (platform line, "native video child window created", "registered with
+   server"). This re-points the Start-with-Windows entry to the debug exe —
+   harmless, tell the owner once.
+6. Merge: `git merge --ff-only task/<ID>` into `port/multi-os`; re-run step 4 on
+   `port/multi-os`; update the Status table (state, commit, "device-pending"
+   if applicable, tier used); commit the plan update; `git worktree remove`,
+   `git branch -d task/<ID>`; retire the builder.
 
-Reject = SendMessage to the same agent with the specific failure. After two
-rejections, escalate: re-run on the next tier up with the agent's report
-attached.
+Findings always go to the original builder. After two rejected rounds on the
+same point, escalate the task one tier up with the full history attached.
 
-## 5. Resuming / taking over
+## 5. Resuming
 
-- An agent that stopped mid-task: `SendMessage` to continue it if it is still
-  listed by `ListAgents`; otherwise start a new agent on the same worktree branch
-  with the brief plus "continue from commit <hash>; here is the previous report".
-- Never two agents on one branch.
+A builder still listed by `ListAgents` is continued with `SendMessage`. One
+that is gone is replaced by a new agent of the same tier on the same worktree
+branch, with the brief plus "continue from commit <hash>; previous report:
+…". Never two builders on one branch.
 
 ## 6. Changing `platform-api`
 
-Treat it as frozen. When a task genuinely needs a change:
-1. Stop that task.
-2. Make the change yourself on `port/multi-os` (Opus tier), with the doc comment
-   explaining the invariant, update the mocks and `unavailable.rs`, run the gate.
-3. Tell every running agent (SendMessage) what changed and that they must
-   rebase. Record the change in `plans/05-TASKS.md` § Status "interfaces".
+Frozen. When a builder reports a needed change: pause that task; make the
+change yourself only if trivial and purely additive, otherwise launch an Opus
+agent for it on `port/multi-os` with mocks + `unavailable.rs` + docs updated;
+gate; merge; `SendMessage` every running builder to rebase; record it in the
+Status table "interfaces" note.
 
-## 7. Hardware hand-off (macOS, Linux desktops, GPUs)
+## 7. Hardware hand-off
 
-Tasks M1, M4–M6, M10–M11, L1, L3–L6 and all I-tasks end as "needs device".
-- Builds come from CI: pushing `port/multi-os` needs the user's OK — ask once
-  per session, not per push. The macOS job of `native-ci.yml` is still
-  unverified until the first push.
-- Write the tester checklist into `plans/checklists/<ID>.md`: install steps,
-  the exact clicks (Open Anyway, permission prompts), what to try, and **where
-  the log is** (`Platform::paths().log_dir/app.log`: Windows
-  `%APPDATA%\ShareCtrlScreen`, macOS `~/Library/Logs/ShareCtrlScreen`, Linux
-  `~/.local/state/sharectrl`). Ask for the log file and a screenshot, nothing
-  else.
-- A task stays "needs device" in the Status table until a log from a real
-  device backs it; it is never marked done on compile + mocks alone.
+Tasks M1, M4–M6, M10–M11, L1, L3–L6, L7 and the I-tasks end "device-pending":
+merged after review + mocks, but never marked done until a log from a real
+device backs them. For each, write `plans/checklists/<ID>.md`: install steps,
+exact clicks (Open Anyway, permission prompts), what to try, and the log path
+(Windows `%APPDATA%\ShareCtrlScreen\app.log`, macOS
+`~/Library/Logs/ShareCtrlScreen/app.log`, Linux `~/.local/state/sharectrl/app.log`).
+Builds come from CI; pushing `port/multi-os` needs the owner's OK — ask once
+per session. The macOS CI job is unverified until the first push.
 
-## 8. Reporting to the user
+## 8. Reporting
 
-After each batch (not each task), one message:
-- Status table delta (done / needs device / blocked), one line per task.
-- Anything you rejected and why.
-- Decisions needed, each with options and your recommendation — only things
-  `plans/00-DECISIONS.md` does not already settle.
-- Never report a task done that the gate in §4 did not pass on this machine.
+After each merge batch, one message: status delta per task; what was rejected
+and why; what is device-pending and what the tester must do; decisions needed
+(only ones `00-DECISIONS.md` does not settle), each with options and a
+recommendation. Never call something done that the gate did not pass here.
 
-## 9. Pitfalls already hit (don't rediscover them)
+## 9. Pitfalls already paid for
 
-- `cargo check --target <linux/mac>` from Windows fails in `aws-lc-sys`; always
-  check natively (WSL for Linux, CI for macOS).
-- Two cargo builds in one target dir block each other; worktrees + a per-task
-  `CARGO_TARGET_DIR` in WSL avoid it.
-- A WSL `git` call leaves Windows `git status` showing phantom changes until
-  the next Windows-side `git status`; it is stat-cache noise.
-- The LF→CRLF warnings on commit are harmless (autocrlf is on).
-- Shell heredocs/`node -e` with single quotes break in this Bash; write scripts
-  to the scratchpad with the Write tool and run the file.
-- `service` is a Windows-only binary with a stub `main` elsewhere; leave it.
-- Haiku readers in the research sweep were confidently wrong on a few lines;
-  trust the trait docs and the code over `appendix-codemap`.
+- `cargo check --target …` of the *whole workspace* from Windows fails in
+  `aws-lc-sys`; per-crate checks of `platform-macos`/`platform-linux` work.
+- Shared `target/` dirs serialize cargo; one target dir per worktree, and
+  `CARGO_TARGET_DIR=/tmp/sct-<ID>` in WSL.
+- WSL `git` leaves Windows `git status` showing phantom changes until the next
+  Windows-side `git status`; stat-cache noise.
+- LF→CRLF commit warnings are harmless.
+- `node -e '…'`/heredocs with single quotes break in this Bash; write scripts
+  with the Write tool and run the file.
+- `service` is Windows-only with a stub `main` elsewhere.
+- Launching the debug app re-points the Start-with-Windows registry entry.

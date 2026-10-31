@@ -10,6 +10,8 @@
 
 #![cfg(target_os = "linux")]
 
+pub mod secret;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -17,7 +19,7 @@ mod autostart;
 mod clipboard;
 
 use codec_openh264::{OpenH264, WithSoftwareH264};
-use platform_api::unavailable::{NoAutostart, NoCodecs, NoSecretStore};
+use platform_api::unavailable::{NoAutostart, NoCodecs};
 use platform_api::{
     Autostart, CaptureError, Clipboard, CodecFactory, DisplayInfo, InputError, InputInjector,
     OsPermission, Paths, PermissionReport, Platform, PlatformInfo, RawDisplayHandle,
@@ -172,7 +174,7 @@ impl Platform for LinuxPlatform {
     }
 
     fn secrets(&self) -> Arc<dyn SecretStore> {
-        Arc::new(NoSecretStore)
+        Arc::new(secret::SecretServiceStore)
     }
 
     fn autostart(&self) -> Arc<dyn Autostart> {

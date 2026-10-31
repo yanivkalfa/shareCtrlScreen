@@ -15,6 +15,13 @@ platform-api = { path = "../platform-api" }
 codec-openh264 = { path = "../codec-openh264" }
 tracing.workspace = true
 dirs = "6"
+# Secret Service (org.freedesktop.secrets) for saved passwords. The store is built
+# per call rather than through the keyring crate's v1 layer, which caches its first
+# initialisation result for the process (see src/secret.rs). Pure Rust over zbus,
+# so no libdbus-1-dev is needed at build time.
+keyring-core = "1"
+zbus-secret-service-keyring-store = "1"
+uuid.workspace = true
 # Portal D-Bus client. No `pipewire` feature: it pins an older pipewire-rs than the
 # capture task (L1) uses and the permission flow only needs the D-Bus half.
 ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "screencast", "remote_desktop"] }
@@ -31,3 +38,6 @@ wl-clipboard-rs = "0.9"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 tempfile = "3"
+# Reads the daemon's items directly in tests/secret_daemon.rs. Same zbus runtime
+# (async-io) as the store, so the test exercises the production runtime.
+secret-service = { version = "5", features = ["rt-async-io-crypto-rust"] }

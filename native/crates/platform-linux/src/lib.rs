@@ -164,7 +164,7 @@ impl Platform for LinuxPlatform {
             Err(e) => {
                 tracing::warn!("start at login unavailable: {e}");
                 Arc::new(NoAutostart {
-                    reason: "start at login is unavailable: the program path or config directory could not be determined",
+                    reason: "start at login is unavailable: this program's file path could not be used (see app.log)",
                 })
             }
         }

@@ -8,6 +8,7 @@
 #![cfg(target_os = "macos")]
 
 mod autostart;
+mod permissions;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,9 +16,8 @@ use std::sync::Arc;
 use platform_api::unavailable::{NoAutostart, NoCodecs, NoSecretStore};
 use platform_api::{
     Autostart, CaptureError, Clipboard, CodecFactory, DisplayInfo, InputError, InputInjector,
-    OsPermission, Paths, PermissionReport, PermissionState, Platform, PlatformInfo,
-    RawDisplayHandle, RawWindowHandle, ScreenCapture, SecretStore, ShortcutHook, SurfaceError,
-    VideoSurface,
+    OsPermission, Paths, PermissionReport, Platform, PlatformInfo, RawDisplayHandle,
+    RawWindowHandle, ScreenCapture, SecretStore, ShortcutHook, SurfaceError, VideoSurface,
 };
 
 mod clipboard;
@@ -76,15 +76,12 @@ impl Platform for MacPlatform {
     }
 
     fn permissions(&self) -> PermissionReport {
-        PermissionReport {
-            screen_capture: PermissionState::NotDetermined,
-            input_injection: PermissionState::NotDetermined,
-            input_monitoring: PermissionState::NotDetermined,
-            notes: vec!["Screen sharing on macOS is not available in this version.".into()],
-        }
+        permissions::report()
     }
 
-    fn request_permission(&self, _p: OsPermission) {}
+    fn request_permission(&self, p: OsPermission) {
+        permissions::request(p);
+    }
 
     fn create_capture(
         &self,

@@ -13,7 +13,8 @@
 | platform-macos / platform-linux | **scaffold** `f1b961c` | Real paths (+ Linux session-type detection); every other capability fails safely. Lanes M and L replace these stubs in place. |
 | L5-spike, M4, D2, M1, L3 | **in progress** (Opus) | branches `task/<ID>`, started 2026-11-01 |
 | D3, D4, D5, M7, M10, M11, L8, L11, L12, T5 | **in progress** (Sonnet) | branches `task/<ID>` |
-| D6, M8, M9, L9, L10 | **in progress** (Haiku → Opus review) | branches `task/<ID>` |
+| D6 docs | **done** `c4c55d4` (Haiku, Opus-reviewed: 10 findings fixed) | root README install/what-works-where + docs/FIRST-RUN.md |
+| M8, M9, L9, L10 | **in progress** (Haiku → Opus review) | branches `task/<ID>` |
 | M2, M3, L1, L2, L4, M6, L7 | queued (Opus cap) | start as Opus slots free |
 | W2, W3, M5, L6, L5, D7, T2, T3, T4 | blocked on dependencies | see graph |
 | everything else | open | as below. |

@@ -36,12 +36,12 @@ Unchanged from earlier releases: run the installer from the Releases page.
 
 ### macOS 13 (Ventura) or later
 
-The macOS build is a universal DMG (Apple silicon and Intel). It is **not notarized by
-Apple**, so the first launch needs one extra step.
+The macOS build runs on Apple silicon and Intel Macs. It is **not notarized by Apple**,
+so the first launch needs one extra step.
 
 1. Open the `.dmg` and drag **ShareCtrlScreen** into **Applications**. Run it from there.
    Keep it there. The permissions in step 4 are tied to the app's identity and its install
-   path (`plans/01-MACOS-FINDINGS.md` §1).
+   path.
 2. macOS blocks the first launch with a dialog that starts **"Apple could not verify"**.
    Dismiss it.
 3. Open **System Settings → Privacy & Security**, scroll down to the message about
@@ -51,11 +51,11 @@ Apple**, so the first launch needs one extra step.
 4. Grant the permissions in **System Settings → Privacy & Security**:
    - **Screen & System Audio Recording**: needed to share this Mac's screen.
    - **Accessibility**: needed for the remote side to control this Mac.
-   - **Input Monitoring**: may also be needed for shortcut passthrough from this Mac
-     (unverified).
+   - **Input Monitoring**: turn this on too if Cmd+Tab passthrough does not work when this
+     Mac controls another computer.
 5. On macOS 15 (Sequoia) and later, macOS asks about once a month whether the app may
    keep recording the screen. Click **Allow**. A host that is left unattended stops
-   sharing until someone does. The app is designed to show a notice when this happens.
+   sharing until someone does. The app shows a notice when sharing stops for this reason.
 
 Builds without the signing certificate (development builds) are ad-hoc signed. On those,
 macOS forgets the permissions in step 4 after every update, so they must be granted
@@ -78,17 +78,21 @@ Hardware video needs the GPU driver packages. Install the one for your GPU:
 `intel-media-va-driver-non-free` (Intel), `mesa-va-drivers` (AMD), or NVIDIA's
 proprietary driver (NVIDIA). Package names are for Ubuntu.
 
-Check the hardware video support with `vainfo`. It prints the VA-API version at the top
-and lists the video profiles your GPU offers. Hardware video needs libva 2.20 or newer.
-Ubuntu 22.04 ships libva 2.14, so there the app uses software video whatever the GPU is.
+Check the hardware video support with `vainfo`. Near the top it prints a line such as
+`vainfo: VA-API version: 1.20 (libva 2.20.1)`. The number in brackets is the libva version,
+and hardware video needs 2.20 or newer. Below that it lists the video profiles your GPU
+offers. Ubuntu 22.04 ships libva 2.14, so there the app uses software video whatever the
+GPU is.
 
-**Remote control on Wayland without the portal.** Some Wayland desktops cannot control
-input through the portal. Hyprland is one (view only). For those, the optional uinput
-setting creates a virtual keyboard and mouse through `/dev/uinput`. It is off by default;
-turn it on only if you need it. The app's installer for it asks for your password once
-(through `pkexec`). To set it up by hand, add a udev rule
-`KERNEL=="uinput", GROUP="input", MODE="0660"`, add your user to the `input` group, and
-log out and back in (the exact steps are unverified).
+**Remote control on Wayland without the portal.** Some Wayland desktops, such as Weston,
+give apps no way to control input. On those, remote control needs the optional uinput
+setting. It is off by default; turn it on only if you need it. The app's installer for it
+asks for your password once (through `pkexec`). To set it up by hand: put
+`KERNEL=="uinput", GROUP="input", MODE="0660"` in `/etc/udev/rules.d/99-uinput.rules`, run
+`sudo udevadm control --reload-rules && sudo udevadm trigger`, then
+`sudo usermod -aG input $USER`, and log out and back in. If `/dev/uinput` is missing, run
+`sudo modprobe uinput` first. Members of the `input` group can read and send input on every
+device, so do this only on a machine you trust.
 
 **Wayland consent.** On a Wayland session the first share opens the desktop's consent
 dialog. Allow it. The choice is remembered in `~/.local/state/sharectrl/portal.token`, so
@@ -108,7 +112,7 @@ been tested on hardware.
 | Feature | Windows | macOS 13+ | Linux, X11 | Linux, Wayland |
 |---|---|---|---|---|
 | Screen capture | Yes (DXGI) | Yes, with Screen Recording permission (ScreenCaptureKit) | Yes, no prompt | Yes, after the portal consent dialog (ScreenCast) |
-| Remote mouse and keyboard | Yes, except elevated windows unless the host runs as administrator | Yes, with Accessibility permission | Yes (XTest) | Yes on GNOME 46+ and KDE Plasma 6 (RemoteDesktop portal). Hyprland: view only unless uinput is enabled. Other compositors: unverified |
+| Remote mouse and keyboard | Yes. Elevated windows and UAC prompts need the Windows service or a host run as administrator | Yes, with Accessibility permission | Yes (XTest) | Yes on GNOME 46+ and KDE Plasma 6 (RemoteDesktop portal). Sway and Hyprland: through wlroots virtual input, no dialog (unverified). Others, such as Weston: view only unless the uinput setting is on |
 | Clipboard text, both ways | Yes | Yes | Yes. The clipboard lives only while the app runs | Yes, same as X11 |
 | Clipboard files, pasted on this side | Yes | Yes | Yes | Yes |
 | File push, controller to controlled | Yes | Yes | Yes | Yes |
@@ -117,8 +121,8 @@ been tested on hardware.
 | Lock screen (a user is logged in) | Yes, with the Windows service | In scope. Unverified | In scope. Unverified | In scope. Unverified |
 | Login window (nobody logged in) | Yes, with the Windows service | No | No | No |
 | Hardware video encode | Yes (Media Foundation, H.264 and HEVC) | Yes (VideoToolbox, H.264 and HEVC) | Intel and AMD via VA-API, when libva is 2.20 or newer. NVIDIA via NVENC (optional) | Same as X11 |
-| Hardware video decode | Yes (Direct3D 11) | Yes (VideoToolbox). AV1 on M3 and later | Intel and AMD via VA-API, when libva is 2.20 or newer | Same as X11 |
-| Software video (OpenH264) | Yes, downloaded from Cisco on first use | Yes, downloaded from Cisco on first use | Yes, downloaded from Cisco on first use | Yes, downloaded from Cisco on first use |
+| Hardware video decode | Yes (Direct3D 11) | Yes (VideoToolbox). AV1 on M3 and later | Intel and AMD via VA-API, when libva is 2.20 or newer. NVIDIA via NVDEC (optional) | Same as X11 |
+| Software video (OpenH264) | Not yet (planned: downloaded from Cisco on first use) | Yes, downloaded from Cisco on first use | Yes, downloaded from Cisco on first use | Yes, downloaded from Cisco on first use |
 | Saved passwords | Yes (Windows DPAPI) | Yes (Keychain) | Yes with a Secret Service keyring (GNOME Keyring or KWallet). Without one, nothing is saved | Same as X11 |
 | Start at sign-in | Yes | Yes (LaunchAgent) | Yes (XDG autostart) | Yes (XDG autostart) |
 
@@ -179,13 +183,15 @@ reconnecting — and can end the session.
 
 ## Packaging
 
-```bash
-cd app
-npm run dist
-```
-
-Produces an NSIS installer and a portable `.exe` in `app/dist/`. There is no code
-signing in v1, so Windows SmartScreen will warn on first run — that is expected.
+Releases are built by the **Release** workflow (`.github/workflows/release.yml`, started by
+hand from Actions). It reads `version` from `native/Cargo.toml` and builds the native Tauri
+app as an NSIS installer plus the Windows service `sharectrl-service.exe`. It publishes both
+to a GitHub Release `v<version>`, and skips the run if that release already exists. To build
+the same on Windows: `cd native && cargo build -p service --release`, then
+`cd app && cargo tauri build --bundles nsis`. The installer lands in
+`native/target/release/bundle/nsis/`. There is no code signing, so SmartScreen warns on first
+run (More info → Run anyway). The legacy Electron app can still be packaged with
+`cd app && npm run dist`.
 
 ## Known limitations (v1)
 
@@ -197,8 +203,9 @@ signing in v1, so Windows SmartScreen will warn on first run — that is expecte
 - **Wayland focus.** On Wayland the app cannot bring a remote window to the front without a
   click, because no focus request is possible for other apps. A file dropped on a remote
   window stays on the clipboard, and a notice shows.
-- **Hyprland (Linux).** Remote control needs the optional uinput setting; without it the
-  session is view only. Weston is also view only.
+- **Wayland desktops without remote input (Linux).** On Weston and similar desktops,
+  sessions are view only unless the optional uinput setting is on. Sway and Hyprland may
+  work without it.
 - **Protected video (DRM).** Protected content shows as black on every system.
 - **macOS signing.** The app is not notarized by Apple. The first launch needs
   **Open Anyway** (see [Install](#install)), and on macOS 15 and later Screen Recording

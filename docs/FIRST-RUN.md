@@ -4,9 +4,8 @@ This page covers the first time ShareCtrlScreen opens on a machine. Each system 
 own security dialogs, and the app needs some of them answered before it can share or
 control the screen. Find your system below.
 
-The dialog text quoted here is what the platform research recorded. Wording changes with
-the OS version, so match the meaning of the dialog rather than the exact letters. For
-installing, see the [Install section](../README.md#install) of the README.
+Dialog wording varies between OS versions, so match the meaning rather than the exact
+words. For installing, see the [Install section](../README.md#install) of the README.
 
 ## Windows
 
@@ -37,9 +36,10 @@ sharectrl-service.exe --install-service
 4. Turn on the permissions in **System Settings → Privacy & Security**:
    - **Screen & System Audio Recording**: needed to share this Mac's screen. If you
      clicked **Don't Allow** earlier, turn it on here. macOS asks only once.
-   - **Accessibility**: needed so the remote side can control this Mac.
-   - **Input Monitoring**: may also be needed for shortcut passthrough from this Mac
-     (unverified).
+   - **Accessibility**: needed so the remote side can control this Mac, and for Cmd+Tab
+     passthrough when this Mac controls another.
+   - **Input Monitoring**: turn this on too if Cmd+Tab passthrough does not work when this
+     Mac controls another computer.
 5. On macOS 15 (Sequoia) and later, macOS asks about once a month whether ShareCtrlScreen
    may bypass the system private window picker. The text is "...is requesting to bypass
    the system private window picker". Click **Allow**. A Mac that nobody is sitting at
@@ -56,10 +56,13 @@ sharectrl-service.exe --install-service
    the desktop refuses the remembered choice, the dialog appears once more.
 4. **GNOME:** while your screen is being shared, an orange indicator shows that the screen
    is being shared. Click it to stop sharing.
-5. **Hardware video:** run `vainfo` in a terminal. It prints the VA-API version and the video
-   profiles your GPU supports. Ubuntu 22.04 has a libva too old for the hardware video
-   path, so there the app uses software video. The app still works.
-6. **Hyprland:** the screen can be viewed but not controlled unless you turn on the uinput
-   setting in Settings. That setting asks for your password once.
+5. **Hardware video:** run `vainfo` in a terminal. Near the top it prints a line such as
+   `vainfo: VA-API version: 1.20 (libva 2.20.1)`. The number in brackets is the libva
+   version, and hardware video needs 2.20 or newer. Below that it lists the video profiles
+   your GPU offers. Ubuntu 22.04 has a libva too old for the hardware video path, so there
+   the app uses software video. The app still works.
+6. **Weston and similar desktops:** the screen can be viewed but not controlled unless you
+   turn on the uinput setting in Settings. That setting asks for your password once. On Sway
+   and Hyprland, control may work without it.
 
 If something does not work, see [Known limitations](../README.md#known-limitations-v1).

@@ -15,6 +15,8 @@ executed **in one go**, in parallel lanes — see [05-TASKS.md](05-TASKS.md).
 | [06-CRATES-AND-LICENSES.md](06-CRATES-AND-LICENSES.md) | Every crate with version and licence as verified on crates.io |
 | [07-CODEBASE-SEAMS.md](07-CODEBASE-SEAMS.md) | File-by-file: what is Windows-bound, what is portable, known bugs to fix in the split |
 | [appendix-codemap/](appendix-codemap/) | The raw per-subsystem maps from the 20-reader code sweep (line-level) |
+| [../.claude/skills/port-orchestrate/SKILL.md](../.claude/skills/port-orchestrate/SKILL.md) | **How the parallel phase is run** (`/port-orchestrate`): task selection, agent briefs, model routing, verification gate, merging, hardware hand-off |
+| [checklists/](checklists/) | Tester checklists for hardware-verified tasks |
 
 ## TL;DR
 

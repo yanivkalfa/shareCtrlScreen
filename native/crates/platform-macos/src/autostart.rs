@@ -53,12 +53,13 @@
 //! and `is_enabled` still reports true. Only the user can change that switch;
 //! the Settings UI should mention it when the toggle is on.
 //!
-//! ## Why this compiles on every OS
-//! Nothing here calls an OS service; `dirs` and `std::env::current_exe` are the
-//! only platform inputs. Compiling it everywhere lets the Windows CI run the plist
-//! and stale-path tests against a temporary home directory. The macOS-only parts
-//! (the `~/Library` layout, bundle paths) are exercised by the device checklist
-//! in `plans/checklists/M9.md`.
+//! ## Where the tests run
+//! The whole crate is macOS-only (`#![cfg(target_os = "macos")]` in `lib.rs`), like
+//! the other lane-M modules, so the plist and stale-path tests in this file run on
+//! the macOS CI runner (`cargo test --workspace` on `macos-latest`), against a
+//! temporary home directory. They do not run on Windows or Linux. The real-home
+//! round trip is `#[ignore = "needs a Mac"]` and is exercised by the device
+//! checklist in `plans/checklists/M9.md`.
 //!
 //! ## References
 //! - launchd.plist(5), Apple man page: `Label`, `ProgramArguments`, `RunAtLoad`

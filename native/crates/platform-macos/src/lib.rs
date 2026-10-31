@@ -5,6 +5,8 @@
 //! Status: scaffold. Paths are real; every other capability fails safely with a
 //! clear message until its task lands (see `plans/05-TASKS.md`, lane M).
 
+#![cfg(target_os = "macos")]
+
 mod autostart;
 
 use std::path::PathBuf;

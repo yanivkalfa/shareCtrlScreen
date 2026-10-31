@@ -5,7 +5,7 @@
 //! Status: scaffold. Paths are real; every other capability fails safely with a
 //! clear message until its task lands (see `plans/05-TASKS.md`, lane M).
 
-#![cfg(target_os = "macos")]
+mod autostart;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -120,8 +120,11 @@ impl Platform for MacPlatform {
     }
 
     fn autostart(&self) -> Arc<dyn Autostart> {
-        Arc::new(NoAutostart {
-            reason: "start at login is not available on macOS in this version",
-        })
+        match autostart::LaunchAgent::for_current_user() {
+            Ok(agent) => Arc::new(agent),
+            Err(_) => Arc::new(NoAutostart {
+                reason: "start at login is unavailable: this program's path or home folder could not be found",
+            }),
+        }
     }
 }

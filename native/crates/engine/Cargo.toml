@@ -33,3 +33,5 @@ md-5 = "0.10"
 [dev-dependencies]
 tracing-subscriber.workspace = true
 platform-api = { path = "../platform-api", features = ["mock"] }
+tokio-tungstenite.workspace = true
+futures-util.workspace = true

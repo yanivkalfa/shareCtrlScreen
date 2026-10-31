@@ -47,13 +47,21 @@ Requires the Rust `x86_64-pc-windows-msvc` toolchain and the WebView2 runtime
 The single validation that the premise holds. On target hardware:
 
 ```sh
-cargo run -p platform-windows --example latency_smoketest
+cargo run -p smoketest --release
 ```
 
 It wires `capture → encode → decode` on one machine and prints per-stage timings
 against the §2 budget. If capture+encode+decode isn't in the low-single-digit-ms
 range, ~40 ms glass-to-glass is unreachable and the design must change **before**
 polishing transport/UI/elevation.
+
+It works on every OS (through the `platform-api` traits, with the same cfg
+selection as the app). Flags: `--mock` (in-memory platform; runs anywhere and in
+CI), `--software` (software codec factory, once task D2 lands), `--display <id>`,
+`--seconds <n>`, `--size <W>x<H>`. Keep something moving on screen while it runs.
+It prints avg / p50 / p95 / max per stage and exits non-zero when p95 of encode or
+decode misses the §2 target (capture is printed but not gated: it includes waiting
+for the screen to change).
 
 ## Install (§8b, §10)
 

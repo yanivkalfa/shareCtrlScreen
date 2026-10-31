@@ -19,6 +19,7 @@ members = [
     "crates/engine",
     "tools/gen-keymap",
     "app",
+    "tools/smoketest",
     "service",
 ]
 

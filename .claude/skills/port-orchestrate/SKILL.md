@@ -90,9 +90,11 @@ will `SendMessage` it for fixes). The brief:
 TASK <ID> — <title>
 
 You are a BUILDER for the ShareCtrlScreen macOS/Linux port. You are in a git
-worktree of C:\Yanivs\shareCtrlScreen checked out from port/multi-os. First:
-`git checkout -b task/<ID>`. Commit to that branch only. Never push, never
-merge, never touch other branches.
+worktree of C:\Yanivs\shareCtrlScreen. The harness creates worktrees from
+`main`, NOT from the port branch, so FIRST run exactly:
+`git checkout -B task/<ID> port/multi-os` and confirm `plans/` and
+`native/crates/platform-api` exist. Commit to that branch only. Never push,
+never merge, never touch other branches.
 
 Read, in this order, before writing code:
 1. plans/00-DECISIONS.md — locked decisions; they override everything.

@@ -74,7 +74,12 @@ pub(crate) struct RouteToken {
 
 impl Drop for RouteToken {
     fn drop(&mut self) {
-        ROUTES.with(|r| r.borrow_mut().retain(|route| route.sink != self.sink));
+        ROUTES.with(|r| match r.try_borrow_mut() {
+            Ok(mut routes) => routes.retain(|route| route.sink != self.sink),
+            // Dropped from inside `handle` (never today): the route stays,
+            // harmless — its `Weak` no longer upgrades, so it accepts nothing.
+            Err(_) => tracing::debug!("video surface: drop route busy, left in place"),
+        });
     }
 }
 
@@ -89,7 +94,12 @@ pub(crate) fn route(sink: &gdk::Window, shared: Weak<Shared>) -> RouteToken {
     });
     if !INSTALLED.with(|i| i.replace(true)) {
         // Installed once for the process and never removed: with no route it
-        // only forwards, which is exactly GTK's own handler.
+        // only forwards, which is exactly GTK's own handler. GDK keeps ONE
+        // handler: if anything later calls `gdk_event_handler_set` (a future
+        // dependency, a second GTK init) it replaces this one, and drops on
+        // the Wayland video stop arriving — silently, with GTK otherwise
+        // working. Nothing in the tree does so today (tao, wry and Tauri use
+        // GTK's default).
         gdk::Event::set_handler(Some(|ev: &mut gdk::Event| {
             if !handle(ev) {
                 gtk::main_do_event(ev);
@@ -113,7 +123,12 @@ fn handle(ev: &gdk::Event) -> bool {
         return false;
     };
     ROUTES.with(|r| {
-        let mut routes = r.borrow_mut();
+        // The GDK calls below never dispatch events synchronously today, but
+        // a re-entry would find the routes borrowed: hand that event to GTK
+        // (returning `false`) instead of panicking inside a C callback.
+        let Ok(mut routes) = r.try_borrow_mut() else {
+            return false;
+        };
         let Some(route) = routes.iter_mut().find(|route| route.sink == window) else {
             return false;
         };
@@ -124,6 +139,28 @@ fn handle(ev: &gdk::Event) -> bool {
         }
         true
     })
+}
+
+/// Record the drag's position and tell the source whether we take it.
+fn update_status(route: &mut Route, dnd: &gdk::EventDND, time: u32) {
+    let accepts = route
+        .shared
+        .upgrade()
+        .is_some_and(|s| s.shown.load(Ordering::SeqCst) && s.state.accepts_drops());
+    let Some(drag) = &mut route.drag else {
+        return;
+    };
+    // GDK's Wayland backend reports focus-surface-local coordinates here (it
+    // has no root coordinates).
+    let (x, y) = dnd.root();
+    drag.pos = (f64::from(x), f64::from(y));
+    drag.accepted = drag.offers_list && accepts;
+    let action = if drag.accepted {
+        gdk::DragAction::COPY
+    } else {
+        gdk::DragAction::empty()
+    };
+    drag.context.drag_status(action, time);
 }
 
 fn dnd_event(route: &mut Route, ty: gdk::EventType, dnd: &gdk::EventDND) {
@@ -142,27 +179,11 @@ fn dnd_event(route: &mut Route, ty: gdk::EventType, dnd: &gdk::EventDND) {
                 pos: (0.0, 0.0),
                 dropping: None,
             });
+            // GDK 3 sends no motion with the enter: answer now, or a drop
+            // without any further movement would be refused.
+            update_status(route, dnd, time);
         }
-        T::DragMotion => {
-            let accepts = route
-                .shared
-                .upgrade()
-                .is_some_and(|s| s.shown.load(Ordering::SeqCst) && s.state.accepts_drops());
-            let Some(drag) = &mut route.drag else {
-                return;
-            };
-            // GDK's Wayland backend reports focus-surface-local coordinates
-            // here (it has no root coordinates).
-            let (x, y) = dnd.root();
-            drag.pos = (f64::from(x), f64::from(y));
-            drag.accepted = drag.offers_list && accepts;
-            let action = if drag.accepted {
-                gdk::DragAction::COPY
-            } else {
-                gdk::DragAction::empty()
-            };
-            drag.context.drag_status(action, time);
-        }
+        T::DragMotion => update_status(route, dnd, time),
         T::DragLeave => {
             // A leave after the drop is part of finishing it; keep that drag.
             if route.drag.as_ref().is_some_and(|d| d.dropping.is_none()) {

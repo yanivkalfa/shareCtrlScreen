@@ -300,13 +300,15 @@ to run (TCC). Use `objc2` 0.6-family crates throughout (`objc2-app-kit`,
   * **Resize test runs on Xephyr nested in Xvfb.** Xvfb's RandR has exactly one mode, so
     `xrandr -s`, `--fb` and `--newmode/--addmode` all fail on it; Xephyr implements RandR
     size changes. Everything else runs on plain Xvfb.
-  * **WSL runs the tests over TCP.** WSLg mounts `/tmp/.X11-unix` read-only, so test
-    servers get only the abstract socket, which x11rb 0.14 cannot use (it tries the socket
-    path, then TCP). The harness detects the read-only mount and uses `-listen tcp` +
-    `127.0.0.1:<n>`. TCP cannot pass fds, so **in WSL the MIT-SHM path is not exercised**
-    (core `GetImage` is); CI and real desktops cover MIT-SHM, and
-    `sudo mount -o remount,rw /tmp/.X11-unix` restores it in WSL until the next restart.
-  * Test packages (for T3's CI job): `xvfb xserver-xephyr x11-xserver-utils xterm`.
+  * **Abstract-socket connect.** WSLg mounts `/tmp/.X11-unix` read-only, so X servers
+    there get only the Linux abstract socket, which x11rb 0.14 never tries (socket path,
+    then TCP). `platform_linux::x11_connect` retries a local display through the abstract
+    socket (same Xauthority lookup); the capture and the tests use it, so MIT-SHM runs in
+    WSL too and every test capture asserts `X11Capture::uses_mit_shm()`. **Follow-up:**
+    L8's clipboard selection owner still calls `RustConnection::connect` directly and
+    should adopt `x11_connect`.
+  * Test packages (for T3's CI job): `xvfb xserver-xephyr x11-xserver-utils xterm`; set
+    `SCT_X11_TESTS_REQUIRED=1` so a missing tool fails the job instead of skipping.
 
 ### L3 — VA-API encoder (+ NVENC optional)  (size L; needs a real Intel/AMD GPU box — machine B booted from a Linux USB, or the user's Linux PC; NVENC testable in WSL2 per 2026 reports)
 * `impl VideoEncoder` on `cros-libva` (evaluate `cros-codecs` 0.0.6 first; if its encoder

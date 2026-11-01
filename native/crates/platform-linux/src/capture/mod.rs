@@ -59,8 +59,8 @@ use std::time::{Duration, Instant};
 use platform_api::{CaptureError, CapturedFrame, DisplayInfo, Frame, ScreenCapture};
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::randr::{self, ConnectionExt as _};
-use x11rb::rust_connection::RustConnection;
 
+use crate::x11_connect::x11_connect;
 use session::Session;
 
 /// Longest single wait inside `acquire`, so a pointer move on a static screen
@@ -106,7 +106,7 @@ fn display_name(explicit: Option<&str>, env: Option<OsString>) -> Result<String,
 /// [`Platform::displays`](platform_api::Platform::displays).
 pub fn x11_displays(display: Option<&str>) -> Result<Vec<DisplayInfo>, CaptureError> {
     let name = display_name(display, std::env::var_os("DISPLAY"))?;
-    let (conn, screen) = RustConnection::connect(Some(&name)).map_err(|e| {
+    let (conn, screen) = x11_connect(&name).map_err(|e| {
         CaptureError::Backend(format!("cannot connect to the X server at {name} ({e})"))
     })?;
     let fail = |e: &dyn std::fmt::Display| {
@@ -181,6 +181,14 @@ impl X11Capture {
             retry_at: Instant::now(),
             failed_sessions: 0,
         })
+    }
+
+    /// Whether pixels come through MIT-SHM (`false`: core `GetImage`, or no
+    /// session right now). Xorg, Xvfb and Xephyr reached over a Unix socket
+    /// (file or abstract) offer it; TCP cannot pass the segment's fd. Logged
+    /// at open; the tests assert it.
+    pub fn uses_mit_shm(&self) -> bool {
+        self.session.as_ref().is_some_and(Session::uses_mit_shm)
     }
 
     /// End the session after it broke. `failed`: a request failed (as

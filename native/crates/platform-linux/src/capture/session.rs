@@ -31,6 +31,7 @@ use super::events::{self, Pump, Signals, Watch};
 use super::geometry::{merge_dirty, row_bytes, to_local};
 use super::monitors::{self, Monitor, XWAYLAND_OUTPUT_PREFIX};
 use super::pixels::{copy_opaque, cursor_bgra, is_blank};
+use crate::x11_connect::x11_connect;
 
 /// Name of the extension only Xwayland initialises (xwaylandproto: "if the
 /// extension is present, the X server is Xwayland").
@@ -123,10 +124,12 @@ fn visual_facts(setup: &Setup, screen: usize) -> Option<VisualFacts> {
 enum Grabber {
     /// MIT-SHM 1.2: the server allocates the segment and passes its fd over
     /// the socket (`ShmCreateSegment`); `ShmGetImage` writes into it and we
-    /// read it back with `pread`. Reading through the fd instead of mapping it
-    /// keeps the crate free of `mmap` (and of `unsafe`) at the cost of one
-    /// kernel copy — the same single copy a mapping would need anyway, since
-    /// the picture must persist across partial updates.
+    /// read it back with `pread` into `scratch`, then copied into the picture.
+    /// That is one more copy of the dirty bytes than mapping the segment would
+    /// cost (about 8 MB per full 1080p frame, 33 MB at 4K), chosen to keep the
+    /// capture module free of `mmap` and `unsafe`. If the real-desktop CPU
+    /// budget (checklists/L2.md step 3) is missed, mapping the segment fd and
+    /// copying straight from the mapping is the follow-up.
     Shm {
         seg: shm::Seg,
         file: File,
@@ -192,7 +195,7 @@ impl Session {
         let fail = |what: &str, e: &dyn std::fmt::Display| {
             CaptureError::Backend(format!("X11 capture on {display}: {what} failed: {e}"))
         };
-        let (conn, screen) = RustConnection::connect(Some(display)).map_err(|e| {
+        let (conn, screen) = x11_connect(display).map_err(|e| {
             CaptureError::Backend(format!(
                 "cannot connect to the X server at {display} ({e}). Is the desktop session \
                  still running, and is DISPLAY={display} the right one?"
@@ -400,6 +403,10 @@ impl Session {
 
     pub(super) fn monitor_id(&self) -> &str {
         &self.monitor.id
+    }
+
+    pub(super) fn uses_mit_shm(&self) -> bool {
+        matches!(self.grabber, Grabber::Shm { .. })
     }
 
     pub(super) fn filled(&self) -> bool {

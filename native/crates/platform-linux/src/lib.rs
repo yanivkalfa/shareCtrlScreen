@@ -17,6 +17,7 @@ mod capture;
 mod codec;
 pub mod secret;
 mod uinput_access;
+mod x11_connect;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,6 +34,7 @@ use platform_api::{
     OsPermission, Paths, PermissionReport, Platform, PlatformInfo, RawDisplayHandle,
     RawWindowHandle, ScreenCapture, SecretStore, ShortcutHook, SurfaceError, VideoSurface,
 };
+pub use x11_connect::x11_connect;
 
 mod permissions;
 mod portal_token;

@@ -2,16 +2,18 @@
 //! VideoToolbox, an NSView + Metal surface, CGEvent injection and event taps,
 //! NSPasteboard, Keychain, LaunchAgent).
 //!
-//! Status: screen capture and display enumeration (M1), the video surface and
-//! presenter (M4), input injection (M5), clipboard (M7), Keychain (M8),
-//! autostart (M9), permissions (M11) and paths are real; every other
+//! Status: screen capture and display enumeration (M1), VideoToolbox encode
+//! (M2), the video surface and presenter (M4), input injection (M5),
+//! clipboard (M7), Keychain (M8), autostart (M9), permissions (M11) and paths are real; every other
 //! capability fails safely with a clear message until its task lands (see
 //! `plans/05-TASKS.md`, lane M).
 
 #![cfg(target_os = "macos")]
 
 mod autostart;
+mod avcc;
 mod capture;
+mod codecs;
 mod convert;
 mod cursor;
 mod display_id;
@@ -27,6 +29,8 @@ mod presenter;
 mod slot;
 mod surface;
 mod view;
+mod vt_encoder;
+mod vt_params;
 
 pub use capture::SckCapture;
 
@@ -47,16 +51,17 @@ mod secret;
 const NOT_YET: &str = "not available on macOS in this version";
 
 pub struct MacPlatform {
-    /// VideoToolbox lands in lane M; until then (and on any Mac whose
-    /// VideoToolbox refuses H.264) Cisco OpenH264 is the codec.
-    codecs: WithSoftwareH264<NoCodecs>,
+    /// VideoToolbox encode (M2); decode lands with M3. Cisco OpenH264 covers
+    /// H.264 on any Mac whose hardware refuses it, and decoding until M3.
+    codecs: WithSoftwareH264<codecs::VtCodecs>,
 }
 
 impl MacPlatform {
     pub fn new() -> Self {
         let openh264 = Arc::new(OpenH264::new(config_dir().join("codecs")));
+        let hardware = codecs::VtCodecs::new(NoCodecs { reason: NOT_YET });
         Self {
-            codecs: WithSoftwareH264::new(NoCodecs { reason: NOT_YET }, openh264),
+            codecs: WithSoftwareH264::new(hardware, openh264),
         }
     }
 

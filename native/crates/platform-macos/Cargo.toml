@@ -108,6 +108,23 @@ objc2-core-media = { version = "0.3.2", default-features = false, features = [
     "CMSampleBuffer",
     "CMTime",
     "objc2-core-video",
+    # Encoded samples and their parameter sets (task M2).
+    "CMBlockBuffer",
+    "CMFormatDescription",
+] }
+# VideoToolbox encode (task M2). Only the compression session, its
+# properties and errors; the defaults also pull in the frame processors,
+# RAW and multi-pass APIs.
+objc2-video-toolbox = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "VTBase",
+    "VTCompressionProperties",
+    "VTCompressionSession",
+    "VTErrors",
+    "VTPixelTransferProperties",
+    "VTSession",
+    "objc2-core-media",
+    "objc2-core-video",
 ] }
 objc2-core-video = { version = "0.3.2", default-features = false, features = [
     "std",
@@ -115,6 +132,8 @@ objc2-core-video = { version = "0.3.2", default-features = false, features = [
     "CVBuffer",
     "CVImageBuffer",
     "CVPixelBuffer",
+    # CPU frames into IOSurface buffers for the encoder (task M2).
+    "CVPixelBufferPool",
     # Zero-copy present (task M4): CVPixelBuffer planes → MTLTexture.
     "CVMetalTexture",
     "CVMetalTextureCache",

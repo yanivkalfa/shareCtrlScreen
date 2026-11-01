@@ -187,9 +187,80 @@ pub(crate) fn retry_delay(failures: u32) -> std::time::Duration {
     std::time::Duration::from_millis((FIRST_MS << doublings).min(MAX_MS))
 }
 
+/// Copy `rows` rows of `row_bytes` each from a CPU plane into a locked
+/// `CVPixelBuffer` plane. The two strides differ (CoreVideo pads rows to its
+/// own alignment), so this goes row by row. Checked, not trusted: a plane
+/// shorter than its stride × rows is refused instead of read or written past.
+pub(crate) fn copy_plane(
+    dst: &mut [u8],
+    dst_stride: usize,
+    src: &[u8],
+    src_stride: usize,
+    row_bytes: usize,
+    rows: usize,
+) -> Result<(), String> {
+    if rows == 0 || row_bytes == 0 {
+        return Ok(());
+    }
+    let need = |stride: usize| {
+        stride
+            .checked_mul(rows - 1)
+            .and_then(|n| n.checked_add(row_bytes))
+    };
+    if src_stride < row_bytes || need(src_stride).is_none_or(|n| src.len() < n) {
+        return Err(format!(
+            "CPU plane too small: {} bytes at stride {src_stride} for {rows} rows of \
+             {row_bytes} bytes",
+            src.len()
+        ));
+    }
+    if dst_stride < row_bytes || need(dst_stride).is_none_or(|n| dst.len() < n) {
+        return Err(format!(
+            "pixel buffer plane too small: {} bytes at stride {dst_stride} for {rows} rows \
+             of {row_bytes} bytes",
+            dst.len()
+        ));
+    }
+    for (d, s) in dst
+        .chunks_mut(dst_stride)
+        .zip(src.chunks(src_stride))
+        .take(rows)
+    {
+        d[..row_bytes].copy_from_slice(&s[..row_bytes]);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planes_copy_row_by_row_across_strides() {
+        // 3 rows of 4 bytes, source stride 6, destination stride 8.
+        let src: Vec<u8> = (0..16).collect();
+        let mut dst = vec![0xaa; 8 * 2 + 4];
+        copy_plane(&mut dst, 8, &src, 6, 4, 3).expect("copy");
+        assert_eq!(&dst[0..4], &[0, 1, 2, 3]);
+        assert_eq!(&dst[4..8], &[0xaa; 4], "row padding untouched");
+        assert_eq!(&dst[8..12], &[6, 7, 8, 9]);
+        assert_eq!(&dst[16..20], &[12, 13, 14, 15]);
+    }
+
+    #[test]
+    fn short_planes_are_refused() {
+        let mut dst = vec![0; 64];
+        // The last source row would end at 6 * 2 + 4 = 16 > 15.
+        assert!(copy_plane(&mut dst, 8, &[0; 15], 6, 4, 3).is_err());
+        // A stride smaller than a row.
+        assert!(copy_plane(&mut dst, 8, &[0; 64], 3, 4, 3).is_err());
+        // Destination too small.
+        assert!(copy_plane(&mut dst[..10], 8, &[0; 64], 6, 4, 3).is_err());
+        // Overflowing arithmetic is a refusal, not a panic.
+        assert!(copy_plane(&mut dst, 8, &[0; 64], usize::MAX, 4, 3).is_err());
+        // Nothing to copy is fine.
+        assert!(copy_plane(&mut dst, 8, &[], 0, 0, 0).is_ok());
+    }
 
     #[test]
     fn retry_backs_off_to_a_cap() {

@@ -38,7 +38,8 @@
 | M2 VideoToolbox encode | **done** `096a90f` (Opus, Opus-reviewed; type-checked for aarch64-apple-darwin, device-pending) | H.264 + HEVC, hardware only (OpenH264 fallback via `WithSoftwareH264`). Low-latency rate control first (Apple: High profiles only → H.264 Constrained High, auto level); classic Main session with L3's level rule on `-12902`/`-12908`. Burst cap = WebRTC's 1.5 × target over 1 s (a one-frame hard cap would drop keyframes); max QP 32; live bitrate; sticky forced keyframes; lost sessions rebuilt with backoff. **Acceptance device-pending** (checklists/M2.md): `tests/vt_encode.rs` is all `#[ignore]` and CI's `cargo test --workspace` runs none of it; the GitHub macOS-runner step is added by T2 (after M2 + M3) |
 | M3 VideoToolbox decoder | **done** `a90ddfb` (Opus, Opus-reviewed; type-checked for aarch64-apple-darwin, device-pending) | H.264/HEVC/AV1 → IOSurface `420v` `CvPixelBufferFrame`; format changes keep or rebuild the session; synthetic I_PCM streams test it bit-exact on CI; encode→decode PSNR test is `#[ignore]`d until T2 runs it on a Mac. **Device-pending** (checklists/M3.md) |
 | M6 shortcut tap | **done** (Opus) | session `CGEventTap` on the hook thread; Cmd+Tab/Cmd+\`/Cmd+Space/Ctrl+arrows while the video view has the keyboard (focus published by the view into `SurfaceState::key_focus`); Cmd+Q left to the view's key monitor; macOS `input_monitoring` now needs Input Monitoring **and** Accessibility. **Device-pending** (checklists/M6.md); the Cmd+Tab acceptance is **blocked** on the owner's host-modifier-mapping decision |
-| L1, L2, L4, L7 | queued (Opus cap) | start in wave 2, warm caches |
+| L2 X11 capture | **done** (Opus) | `platform_linux::X11Capture`: Damage `NonEmpty` → `DamageSubtract`/`FetchRegion` dirty rects (≤ 16, disjoint), MIT-SHM 1.2 segment read via its fd (core `GetImage` fallback), cursor out of band (`QueryPointer` + XFixes), RandR monitors as `x11:<name>` ids in `Platform::displays()`, refuses Xwayland; abstract-socket connect fallback (`x11_connect`). Xvfb/Xephyr tests in `tests/x11_capture.rs`. **Device-pending** (checklists/L2.md) |
+| L1, L4, L7 | queued (Opus cap) | start in wave 2, warm caches |
 | W3 keymap switch | **done** `e2d6b1c` (Sonnet, Opus-reviewed) | `input::scancode` is an adapter over the generated keymap; NumLock is E0 45 (plain 45 is Pause). Device check: NumLock LED toggles, Pause does nothing |
 | W2 software codec selection | **done** (Sonnet, Opus-reviewed) | H.264 policy on Windows: hardware → MF software decoder → OpenH264 (only while `useOpenH264` is on); `h264_problem()` gives an actionable report when Media Foundation has no H.264 MFTs (N editions without the Media Feature Pack fail at launch — documented). Machine-B check: ignored test + log line "no hardware H264 decoder — using software decode" |
 | D7 release pipeline | **done** `448df49` (Opus, Opus-reviewed) | tag-triggered `release.yml` → reusable `build-assets.yml` → `scripts/release-assets.sh` (one recipe); NSIS/DMG/AppImage/deb/rpm, SHA256SUMS, per-OS third-party notices generated and attached (never committed), version read from cargo metadata, actions pinned to SHAs; macOS: certificate required when the secrets exist, ad-hoc only without them. macOS leg + AppImage verified only on GitHub |
@@ -295,6 +296,17 @@ to run (TCC). Use `objc2` 0.6-family crates throughout (`objc2-app-kit`,
   cursor via XFixes; refuses to run under rootless Xwayland when `WAYLAND_DISPLAY` is set.
 * Acceptance (CI, `Xvfb :99 -screen 0 1920x1080x24`): a moving `xterm` produces dirty
   rects; static screen → `Ok(None)`; `xrandr` size change → `Lost` → `reinit` new dimensions.
+* As built (deviations accepted 2026-11-01):
+  * **Resize test runs on Xephyr nested in Xvfb.** Xvfb's RandR has exactly one mode, so
+    `xrandr -s`, `--fb` and `--newmode/--addmode` all fail on it; Xephyr implements RandR
+    size changes. Everything else runs on plain Xvfb.
+  * **WSL runs the tests over TCP.** WSLg mounts `/tmp/.X11-unix` read-only, so test
+    servers get only the abstract socket, which x11rb 0.14 cannot use (it tries the socket
+    path, then TCP). The harness detects the read-only mount and uses `-listen tcp` +
+    `127.0.0.1:<n>`. TCP cannot pass fds, so **in WSL the MIT-SHM path is not exercised**
+    (core `GetImage` is); CI and real desktops cover MIT-SHM, and
+    `sudo mount -o remount,rw /tmp/.X11-unix` restores it in WSL until the next restart.
+  * Test packages (for T3's CI job): `xvfb xserver-xephyr x11-xserver-utils xterm`.
 
 ### L3 — VA-API encoder (+ NVENC optional)  (size L; needs a real Intel/AMD GPU box — machine B booted from a Linux USB, or the user's Linux PC; NVENC testable in WSL2 per 2026 reports)
 * `impl VideoEncoder` on `cros-libva` (evaluate `cros-codecs` 0.0.6 first; if its encoder

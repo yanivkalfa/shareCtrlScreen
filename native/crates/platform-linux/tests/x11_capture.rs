@@ -601,3 +601,102 @@ fn an_unreachable_display_is_an_actionable_error() {
         Ok(_) => panic!("connected to :4321"),
     }
 }
+
+// ---- real desktop (plans/checklists/L2.md) ----------------------------------
+
+/// CPU seconds this process has used (user + system), from `/proc/self/stat`
+/// fields 14 and 15, in clock ticks of 1/100 s (Linux's `USER_HZ` on every
+/// mainstream architecture).
+fn cpu_seconds() -> f64 {
+    let stat = std::fs::read_to_string("/proc/self/stat").expect("read /proc/self/stat");
+    // The command name (field 2) is parenthesised and may contain spaces.
+    let after = &stat[stat.rfind(')').expect("comm field") + 2..];
+    let f: Vec<&str> = after.split_whitespace().collect();
+    let ticks: u64 = f[11].parse::<u64>().expect("utime") + f[12].parse::<u64>().expect("stime");
+    ticks as f64 / 100.0
+}
+
+/// The monitors of the desktop this test runs in.
+#[test]
+#[ignore = "needs a real X11 desktop session (run from a terminal on the desktop)"]
+fn desktop_lists_displays() {
+    let displays = x11_displays(None).expect("list the desktop's displays");
+    for d in &displays {
+        println!("{d:?}");
+    }
+    assert!(!displays.is_empty());
+    assert_eq!(displays.iter().filter(|d| d.primary).count(), 1);
+}
+
+/// Every listed display opens and its first frame has the listed size.
+#[test]
+#[ignore = "needs a real X11 desktop session (run from a terminal on the desktop)"]
+fn desktop_each_display_captures() {
+    for d in x11_displays(None).expect("list displays") {
+        let mut cap = X11Capture::open(None, Some(&d.id)).expect("open the display");
+        assert_eq!(cap.dimensions(), (d.width, d.height), "{}", d.id);
+        assert!(
+            wait_for(&mut cap, Duration::from_secs(5), |f| !f.pointer_only
+                && (f.frame.width, f.frame.height) == (d.width, d.height)),
+            "{}: a first frame",
+            d.id
+        );
+        println!("{}: {}x{} ok", d.id, d.width, d.height);
+    }
+}
+
+/// 10 s of motion (the tester keeps something moving), then 10 s hands off.
+#[test]
+#[ignore = "needs a real X11 desktop session and a tester moving a window or playing video"]
+fn desktop_busy_then_idle() {
+    let mut cap = X11Capture::open(None, None).expect("open the primary display");
+    let (mut w, mut h) = cap.dimensions();
+    println!("capturing the primary display at {w}x{h}");
+    for (phase, label) in [(1, "BUSY: keep a window moving"), (2, "IDLE: hands off")] {
+        println!("PHASE {phase}: {label} (10 s)");
+        let (mut frames, mut pointer, mut idle, mut area) = (0u64, 0u64, 0u64, 0u64);
+        let cpu0 = cpu_seconds();
+        let end = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < end {
+            let lost = match cap.acquire(Duration::from_millis(100)) {
+                Ok(Some(f)) if f.pointer_only => {
+                    pointer += 1;
+                    false
+                }
+                Ok(Some(f)) => {
+                    frames += 1;
+                    area += f.dirty.iter().map(Rect::area).sum::<u64>();
+                    false
+                }
+                Ok(None) => {
+                    idle += 1;
+                    false
+                }
+                Err(CaptureError::Lost) => true,
+                Err(e) => panic!("capture failed: {e}"),
+            };
+            cap.release();
+            if lost {
+                // A resolution or monitor change (checklist step 4): rebuild,
+                // exactly as the host does.
+                cap.reinit().expect("rebuild after a screen change");
+                (w, h) = cap.dimensions();
+                println!("lost -> rebuilt at {w}x{h}");
+            }
+        }
+        let cpu = (cpu_seconds() - cpu0) / 10.0 * 100.0;
+        let dirty = if frames > 0 {
+            area as f64 / frames as f64 / (w as f64 * h as f64) * 100.0
+        } else {
+            0.0
+        };
+        println!(
+            "=> {:.1} fps, {pointer} pointer-only, {idle} idle, dirty {dirty:.1} % of the \
+             screen per frame, process CPU {cpu:.1} %",
+            frames as f64 / 10.0
+        );
+        if phase == 2 {
+            assert!(idle > 0, "a static desktop must yield Ok(None)");
+        }
+    }
+}

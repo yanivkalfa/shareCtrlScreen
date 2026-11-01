@@ -367,7 +367,11 @@ impl Xvfb {
             None,
             false,
         )
-        .map(Self)
+        .map(|server| {
+            // Shown with --nocapture: proves the tests never run on a desktop's `:0`.
+            eprintln!("input tests: private Xvfb on {}", server.name);
+            Self(server)
+        })
     }
 
     fn connect(&self) -> (x11_client::RustConnection, usize) {

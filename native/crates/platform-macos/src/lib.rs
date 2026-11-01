@@ -83,7 +83,7 @@ impl Platform for MacPlatform {
     fn info(&self) -> PlatformInfo {
         PlatformInfo {
             name: "macos",
-            start_at_login_label: "Start at login",
+            start_at_login_label: "Start at sign-in",
             shortcut_capture_hint: "Cmd+Tab and other system shortcuts act on the remote \
                                     machine while the session window is focused (needs the \
                                     Accessibility permission).",

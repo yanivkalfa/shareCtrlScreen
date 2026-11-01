@@ -114,7 +114,7 @@ impl Platform for LinuxPlatform {
                 SessionType::X11 => "linux-x11",
                 SessionType::Wayland => "linux-wayland",
             },
-            start_at_login_label: "Start at login",
+            start_at_login_label: "Start at sign-in",
             shortcut_capture_hint: "System shortcuts act on the remote machine while the \
                                     session window is focused, where the desktop allows it.",
             login_screen_supported: false,

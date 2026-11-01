@@ -450,7 +450,7 @@ impl Presenter for D3dPresenter {
 }
 
 /// A standalone hardware D3D11 device for the viewer's decode + present.
-fn create_render_device() -> Result<windows::Win32::Graphics::Direct3D11::ID3D11Device, SurfaceError>
+pub(crate) fn create_render_device() -> Result<windows::Win32::Graphics::Direct3D11::ID3D11Device, SurfaceError>
 {
     use windows::Win32::Foundation::HMODULE;
     use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_1};

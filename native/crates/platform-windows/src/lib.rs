@@ -15,19 +15,27 @@
 //! Foundation codec (what machines without a GPU video decoder use); then Cisco
 //! OpenH264, only if the user has it turned on. [`WindowsPlatform::h264_problem`]
 //! reports, in words a user can act on, the one case where none of the three
-//! exists (a Windows "N" edition without the Media Feature Pack and OpenH264
-//! off, unsupported or not downloadable).
+//! exists: Media Foundation is present (the app started) but its H.264
+//! transforms are missing or blocked — for example an administrator removed or
+//! blocked them — and OpenH264 is off, unsupported or not downloadable.
+//!
+//! Windows "N" editions without the Media Feature Pack are a different case and
+//! are *not* detected here: the executable imports `mfplat.dll` statically, so
+//! the loader refuses to start it at all and no code of ours runs. Those
+//! computers need the Media Feature Pack installed before anything else.
 //!
 //! ## References
 //!
 //! * `MFTEnumEx`, `_MFT_ENUM_FLAG` (hardware and synchronous-MFT flags may be
 //!   combined): <https://learn.microsoft.com/windows/win32/api/mfapi/nf-mfapi-mftenumex>,
 //!   <https://learn.microsoft.com/windows/win32/api/mfapi/ne-mfapi-_mft_enum_flag>
-//! * H.264 video decoder / encoder MFTs, and their absence on "N" editions
-//!   without the Media Feature Pack:
+//! * The H.264 decoder and encoder MFTs (CLSIDs; `Msmpeg2vdec.dll`,
+//!   `Mfh264enc.dll`):
 //!   <https://learn.microsoft.com/windows/win32/medfound/h-264-video-decoder>,
-//!   <https://learn.microsoft.com/windows/win32/medfound/h-264-video-encoder>,
-//!   <https://support.microsoft.com/windows/media-feature-pack-for-windows-n-editions>
+//!   <https://learn.microsoft.com/windows/win32/medfound/h-264-video-encoder>
+//! * Windows "N" editions ship without Media Foundation until the Media Feature
+//!   Pack is installed:
+//!   <https://support.microsoft.com/en-us/windows/experience/platform-variants/media-feature-pack-for-windows-n>
 
 #![cfg(windows)]
 
@@ -72,10 +80,7 @@ impl WindowsPlatform {
         Self {
             codecs: WithSoftwareH264::new(adapters::MfCodecFactory, openh264)
                 .with_readback(Box::new(cpu::D3d11Readback))
-                .with_native_probe(Box::new(|| NativeH264 {
-                    encode: codec::encode::can_encode_any(codec::Codec::H264),
-                    decode: codec::decode::can_decode_any(codec::Codec::H264),
-                })),
+                .with_native_probe(Box::new(native_h264)),
             secrets: Arc::new(adapters::DpapiSecretStore),
             autostart: Arc::new(adapters::RunKeyAutostart),
         }
@@ -91,6 +96,18 @@ impl WindowsPlatform {
     pub fn h264_problem(&self) -> Option<String> {
         self.codecs.h264_problem()
     }
+}
+
+/// Whether Media Foundation has any H.264 encoder / decoder transform. Probed
+/// once per process: the answer only changes with a Windows reconfiguration,
+/// and the Settings page asks on every draw from the UI thread, where repeated
+/// `MFTEnumEx` calls would be wasted work.
+fn native_h264() -> NativeH264 {
+    static NATIVE: std::sync::OnceLock<NativeH264> = std::sync::OnceLock::new();
+    *NATIVE.get_or_init(|| NativeH264 {
+        encode: codec::encode::can_encode_any(codec::Codec::H264),
+        decode: codec::decode::can_decode(codec::Codec::H264),
+    })
 }
 
 impl Default for WindowsPlatform {
@@ -205,19 +222,28 @@ impl Platform for WindowsPlatform {
 mod tests {
     use super::*;
 
-    /// Machine-B check (no GPU H.264 decoder): such a computer must advertise
-    /// H.264 and report no "no codec" problem, because Microsoft's software
-    /// decoder (or a downloaded OpenH264) covers it. Run on that machine with
-    /// the ignored tests of this crate enabled, then view a real 1080p session
-    /// from machine A and confirm at least 30 fps.
+    /// Machine-B check (no GPU H.264 decoder): a viewer there must be able to
+    /// build an H.264 decoder on a real D3D11 device and have no "no codec"
+    /// problem to report. `new_decoder` goes hardware first, then Microsoft's
+    /// software decoder (log line "no hardware H264 decoder — using software
+    /// decode"), then OpenH264 (log line "hardware H.264 decoder unavailable");
+    /// success proves one of them opened, which `viewer_decodable` cannot, as it
+    /// always lists H.264. Run on that machine with the ignored tests enabled,
+    /// then view a real 1080p session from machine A and confirm at least 30 fps.
     #[test]
     #[ignore = "needs no-HW-decoder machine"]
-    fn h264_is_usable_without_a_hardware_decoder() {
+    fn h264_decoder_opens_without_a_hardware_decoder() {
         let platform = WindowsPlatform::new();
         assert_eq!(platform.h264_problem(), None);
-        assert!(platform
-            .codecs()
-            .viewer_decodable()
-            .contains(&platform_api::Codec::H264));
+        let device = gpu::D3d11Device(
+            adapters::create_render_device().expect("a D3D11 device for the decoder"),
+        );
+        if let Err(e) =
+            platform
+                .codecs()
+                .new_decoder(Some(&device), platform_api::Codec::H264, 1920, 1080)
+        {
+            panic!("no H.264 decoder could be opened: {e}");
+        }
     }
 }

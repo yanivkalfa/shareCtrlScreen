@@ -487,10 +487,10 @@ pub fn can_encode(codec: Codec) -> bool {
 }
 
 /// Is there any Media Foundation encoder for `codec` — hardware or Microsoft's
-/// software one? `false` on Windows "N" editions without the Media Feature
-/// Pack, where the software H.264 encoder is not installed. `MFTEnumEx` accepts
-/// the hardware and synchronous-MFT flags together (`_MFT_ENUM_FLAG`) and
-/// nothing is activated.
+/// software one? `false` when the software H.264 encoder is missing or blocked
+/// (an administrator can disable MFTs) and there is no hardware one. `MFTEnumEx`
+/// accepts the hardware and synchronous-MFT flags together (`_MFT_ENUM_FLAG`)
+/// and nothing is activated.
 pub fn can_encode_any(codec: Codec) -> bool {
     can_encode_with(
         codec,

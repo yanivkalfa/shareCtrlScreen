@@ -212,7 +212,7 @@ impl OpenH264 {
         Self::with_source(codecs_dir, spec_for_this_target(), DOWNLOAD_BASE)
     }
 
-    fn with_source(dir: PathBuf, spec: Option<&'static BinarySpec>, base: &'static str) -> Self {
+    pub(crate) fn with_source(dir: PathBuf, spec: Option<&'static BinarySpec>, base: &'static str) -> Self {
         Self {
             dir,
             spec,

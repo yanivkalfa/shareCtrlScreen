@@ -133,11 +133,16 @@ I1..I4 after all lanes (hardware validation)
 ### W2 — Software codec backend selection on Windows  (size S, Windows)
 * Depends on: D2. **Code done** (selection policy): hardware Media Foundation, then
   Microsoft's software MF codec, then Cisco OpenH264 only while `useOpenH264` is on;
-  `WindowsPlatform::h264_problem()` tells Settings → Advanced when none exists (an "N"
-  edition without the Media Feature Pack and OpenH264 off or unavailable). Matrix
-  unit-tested with mocks. Acceptance (machine B decodes H.264 from machine A at ≥ 30 fps
+  `WindowsPlatform::h264_problem()` tells Settings → Advanced when none exists, i.e. Media
+  Foundation is present but its H.264 transforms are missing or blocked (e.g. by an
+  administrator) and OpenH264 is off or unavailable. Matrix unit-tested with mocks.
+  Not covered: a Windows "N" edition without the Media Feature Pack never starts the app
+  (`mfplat.dll` is imported statically), so nothing of ours can advise there; that pack
+  must be installed first. Acceptance (machine B decodes H.264 from machine A at ≥ 30 fps
   1080p) still needs the device: run the ignored test in `platform-windows`, then a real
-  session; the log line "hardware H.264 decoder unavailable" shows OpenH264 took over.
+  session. On machine B expect the log line "no hardware H264 decoder — using software
+  decode" (Microsoft's software decoder); OpenH264 ("hardware H.264 decoder unavailable")
+  is only expected when MF's software decoder is missing too.
 
 ### W3 — Keymap switch on Windows  (size S, Windows)
 * Depends on: D3. Replace `input/src/scancode.rs` lookups with the generated table (Set-1

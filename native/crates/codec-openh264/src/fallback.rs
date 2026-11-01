@@ -70,9 +70,9 @@ impl<H: CodecFactory> WithSoftwareH264<H> {
     }
 
     /// `Some(advice)` when this computer would fail to host and/or view for lack
-    /// of any H.264 codec: the OS has none for that direction **and** OpenH264
-    /// cannot step in (turned off, no Cisco binary for this system, or its last
-    /// download failed). `None` when everything works — or will work once the
+    /// of any H.264 codec: the OS's own H.264 transforms are missing or blocked
+    /// for that direction **and** OpenH264 cannot step in (turned off, no Cisco
+    /// binary for this system, or its last download failed). `None` when everything works — or will work once the
     /// first-use download runs — and always `None` without a probe, because
     /// then the platform's own availability is unknown and a guess would
     /// either cry wolf or hide a real problem.
@@ -89,20 +89,17 @@ impl<H: CodecFactory> WithSoftwareH264<H> {
             Availability::Disabled => {
                 "Turn on \"Use Cisco OpenH264\" in Settings → Advanced to fix this.".to_string()
             }
-            Availability::Unsupported => {
-                "Cisco provides no software codec for this system; install the \
-                 operating system's media codecs (on Windows \"N\" editions, the \
-                 Media Feature Pack)."
-                    .to_string()
-            }
+            Availability::Unsupported => "Cisco provides no software codec for this system. \
+                 Ask your administrator to allow the system's own H.264 codecs."
+                .to_string(),
             Availability::Failed(msg) => format!(
-                "The software codec could not be downloaded: {msg} You can also install \
-                 the operating system's media codecs (on Windows \"N\" editions, the \
-                 Media Feature Pack)."
+                "The software codec could not be downloaded: {}. You can also ask your \
+                 administrator to allow the system's own H.264 codecs.",
+                msg.trim_end_matches('.')
             ),
         };
         Some(format!(
-            "This computer has no H.264 video codec, so it cannot {what}. {fix}"
+            "This computer's own H.264 video codec is missing or blocked, so it cannot {what}. {fix}"
         ))
     }
 
@@ -317,9 +314,27 @@ mod tests {
     };
 
     /// A handle in a fresh, empty directory: enabled, nothing downloaded.
-    fn not_downloaded(tag: &str) -> Arc<OpenH264> {
-        let dir = std::env::temp_dir().join(format!("sct-openh264-policy-{tag}"));
-        Arc::new(OpenH264::new(dir))
+    fn not_downloaded(scratch: &Scratch) -> Arc<OpenH264> {
+        Arc::new(OpenH264::new(scratch.0.clone()))
+    }
+
+    /// A per-process scratch directory, emptied first and removed on drop (also
+    /// when an assertion panics), so concurrent test runs never share state.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("sct-openh264-policy-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            Self(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
@@ -330,10 +345,51 @@ mod tests {
 
     #[test]
     fn no_problem_while_the_download_can_still_happen() {
-        let f = probed(NOTHING, not_downloaded("pending"));
-        if f.openh264().availability() == Availability::NotDownloaded {
-            assert_eq!(f.h264_problem(), None);
-        }
+        let scratch = Scratch::new("pending");
+        let f = probed(NOTHING, not_downloaded(&scratch));
+        assert_eq!(f.openh264().availability(), Availability::NotDownloaded);
+        assert_eq!(f.h264_problem(), None);
+    }
+
+    #[test]
+    fn unsupported_system_says_who_can_help() {
+        let scratch = Scratch::new("unsupported");
+        let handle = Arc::new(OpenH264::with_source(
+            scratch.0.clone(),
+            None,
+            crate::binary::DOWNLOAD_BASE,
+        ));
+        assert_eq!(handle.availability(), Availability::Unsupported);
+        let msg = probed(NOTHING, handle).h264_problem().unwrap_or_default();
+        assert!(
+            msg.contains("Cisco provides no software codec") && msg.contains("administrator"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn failed_download_reports_the_reason_and_an_alternative() {
+        // Port 9 on loopback refuses at once: "offline" with no network use.
+        static SPEC: crate::binary::BinarySpec = crate::binary::BinarySpec {
+            file: "openh264-policy-test.dll",
+            archive_sha256: "00",
+            library_sha256: "00",
+        };
+        let scratch = Scratch::new("failed");
+        let handle = Arc::new(OpenH264::with_source(
+            scratch.0.clone(),
+            Some(&SPEC),
+            "https://127.0.0.1:9/",
+        ));
+        assert!(handle.ensure().is_err());
+        let msg = probed(NOTHING, handle).h264_problem().unwrap_or_default();
+        assert!(
+            msg.contains("could not be downloaded") && msg.contains("administrator"),
+            "{msg}"
+        );
+        // The download reason ends in a full stop that is ours, never doubled.
+        assert!(!msg.contains(".."), "{msg}");
+        assert!(msg.contains(". You can also"), "{msg}");
     }
 
     #[test]
@@ -377,14 +433,15 @@ mod tests {
 
     #[test]
     fn turning_it_off_reports_instead_of_downloading() {
-        let handle = not_downloaded("off-no-download");
+        let scratch = Scratch::new("off-no-download");
+        let handle = not_downloaded(&scratch);
         handle.set_enabled(false);
         let f = probed(NOTHING, handle);
         assert!(f.h264_problem().is_some());
         // Neither the report nor a codec attempt may touch the network or disk.
         assert!(f.new_decoder(None, Codec::H264, 64, 64).is_err());
         assert!(f.new_encoder(None, EncoderConfig::default()).is_err());
-        assert!(f.openh264().library_path().is_none_or(|p| !p.exists()));
+        assert!(!scratch.0.exists(), "a disabled codec must not create files");
     }
 
     #[test]
@@ -398,18 +455,16 @@ mod tests {
 
     #[test]
     fn downloaded_library_clears_the_problem() {
-        let handle = not_downloaded("ready");
-        let Some(path) = handle.library_path() else {
-            return; // Cisco ships nothing for this target: nothing to pin.
-        };
-        let Some(dir) = path.parent() else { return };
-        if std::fs::create_dir_all(dir).is_err() || std::fs::write(&path, b"x").is_err() {
-            return;
-        }
+        let scratch = Scratch::new("ready");
+        let handle = not_downloaded(&scratch);
+        let path = handle
+            .library_path()
+            .expect("shipped targets have a pinned Cisco binary");
+        std::fs::create_dir_all(&scratch.0).expect("create the scratch directory");
+        std::fs::write(&path, b"x").expect("write a placeholder library");
         let f = probed(NOTHING, handle);
         assert_eq!(f.openh264().availability(), Availability::Ready);
         assert_eq!(f.h264_problem(), None);
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

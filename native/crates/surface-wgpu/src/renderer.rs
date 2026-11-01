@@ -432,8 +432,8 @@ fn params_bytes(
         target.1.max(1) as f32,
     ];
     let mut out = [0u8; PARAMS_SIZE];
-    for (chunk, v) in out.chunks_exact_mut(4).zip(floats) {
-        chunk.copy_from_slice(&v.to_le_bytes());
+    for (chunk, v) in out.as_chunks_mut::<4>().0.iter_mut().zip(floats) {
+        *chunk = v.to_le_bytes();
     }
     out[40..44].copy_from_slice(&u32::from(full_range).to_le_bytes());
     out

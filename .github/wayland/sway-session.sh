@@ -7,8 +7,9 @@
 #   ->  pipewire (+ its core check)  ->  wireplumber (+ its liveness check)
 #   ->  xdg-desktop-portal-wlr (backend)  ->  xdg-desktop-portal (frontend)
 # then waits until the portal frontend exposes ScreenCast on the bus, and runs
-# the Rust tests of L5 (wayland_surface), L1 (portal_capture, ignored) and L6
-# (input::tests, minus the uinput and xtest_ tests; see the cargo line below).
+# the Rust tests of L5 (wayland_surface) and L6 (input::tests, minus the uinput
+# and xtest_ tests; see the cargo line below). L1's portal_capture is skipped
+# with a warning annotation: see the comment at the test step for why.
 #
 # Documentation behind each setting:
 # * sway headless env: WLR_BACKENDS=headless, WLR_RENDERER=pixman,
@@ -119,6 +120,10 @@ done
 export WAYLAND_DISPLAY="$SOCKET"
 echo "sway is up on $WAYLAND_DISPLAY"
 
+# swaymsg finds the IPC socket through SWAYSOCK, which sway exports only to its
+# own children; export it here so the diagnostics below say something.
+SWAYSOCK="$(find "$RUNTIME" -maxdepth 1 -name 'sway-ipc.*.sock' 2>/dev/null | head -n 1 || true)"
+export SWAYSOCK
 echo "outputs: $(swaymsg -t get_outputs -r 2>/dev/null | tr -d '\n' | head -c 400)"
 
 # The moving client (the screencast's "test pattern"; portal_capture needs
@@ -223,8 +228,23 @@ cd "$NATIVE"
 # workflow) makes a missing sway a failure, not a skip.
 cargo test -p platform-linux --test wayland_surface -- --nocapture
 
-# L1: real portal ScreenCast + PipeWire, 100 frames, restore-token round trip.
-cargo test -p platform-linux --test portal_capture -- --ignored --nocapture
+# L1 (portal_capture: real ScreenCast + PipeWire, 100 frames, restore-token
+# round trip) does NOT run here, and that is a known gap, not a pass:
+# xdg-desktop-portal-wlr 0.7.1 refuses every cast when the compositor advertises
+# zwlr_screencopy_manager_v1 version 3 but sends no linux_dmabuf frame event
+# (src/screencast/screencast.c, start_screencast: `screencast_version >= 3 &&
+# screencopy_frame_info[DMABUF].format == DRM_FORMAT_INVALID` -> "unable to
+# receive a valid format from wlr_screencopy", handler returns -1, the frontend
+# reports "A backend call failed: Operation not permitted"). A headless pixman
+# sway has no dmabuf-capable allocator, so no linux_dmabuf event ever comes
+# (CI runs main #46 and #49, portal-wlr.log at TRACE). Ways to close it, both
+# unverified: a virtual DRM device (`modprobe vkms`) with Mesa kms_swrast and
+# WLR_RENDERER=gles2 so buffers are dmabufs, or a newer xdg-desktop-portal-wlr
+# that accepts shm-only frames. Until then portal_capture is a device-pass item
+# (plans/checklists/L1.md). The stack above still proves sway, PipeWire,
+# WirePlumber and both portals come up and that ScreenCast is on the bus.
+echo "wayland-sway: portal_capture skipped on purpose (xdg-desktop-portal-wlr needs dmabuf with screencopy v3; see the comment in this script)"
+echo "::warning title=portal_capture not run::xdg-desktop-portal-wlr 0.7.1 rejects shm-only screencopy v3 frames on the headless pixman compositor; L1 portal capture is a device-pass item"
 
 # L6, wlroots virtual input against a private headless sway (the test starts its
 # own sway, as L5 does) and the in-process EIS server (no peer needed).

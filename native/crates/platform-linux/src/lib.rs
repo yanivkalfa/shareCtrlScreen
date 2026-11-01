@@ -5,12 +5,12 @@
 //!
 //! Status: paths, session-type detection, the clipboard (text and file
 //! lists), Secret Service passwords (L9), XDG autostart (L10), the
-//! permissions preflight (L12), hardware video encode (L3) and decode (L4)
-//! ([`LinuxCodecs`]), the Cisco OpenH264 fallback (D2), X11 screen capture
-//! with display enumeration (L2, [`X11Capture`]) and Wayland screen capture
-//! through the portal and PipeWire (L1) are real; every other capability fails
-//! safely with a clear message until its task lands (see `plans/05-TASKS.md`,
-//! lane L).
+//! permissions preflight (L12), shortcut capture (L7), hardware video encode
+//! (L3) and decode (L4) ([`LinuxCodecs`]), the Cisco OpenH264 fallback (D2),
+//! X11 screen capture with display enumeration (L2, [`X11Capture`]) and
+//! Wayland screen capture through the portal and PipeWire (L1) are real; every
+//! other capability fails safely with a clear message until its task lands
+//! (see `plans/05-TASKS.md`, lane L).
 
 #![cfg(target_os = "linux")]
 
@@ -41,6 +41,7 @@ mod permissions;
 mod portal_capture;
 mod portal_session;
 mod portal_token;
+mod shortcuts;
 
 pub use uinput_access::{
     install_uinput_access, InstallMode, UinputInstallError, UinputInstallOutcome,
@@ -196,7 +197,9 @@ impl Platform for LinuxPlatform {
     }
 
     fn create_shortcut_hook(&self) -> Option<Box<dyn ShortcutHook>> {
-        None
+        // Available on X11 and Wayland alike; whether it can work on this
+        // desktop is `install`'s answer (L7).
+        Some(Box::new(shortcuts::LinuxShortcutHook::default()))
     }
 
     fn create_clipboard(&self) -> Box<dyn Clipboard> {

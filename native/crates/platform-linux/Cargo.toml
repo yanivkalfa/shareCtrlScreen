@@ -56,10 +56,18 @@ libloading = "0.8"
 arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
 # X11 selection owner for file lists and X11 screen capture (pure-Rust
 # connection, no libxcb). Capture (task L2) uses MIT-SHM, DAMAGE, XFixes and
-# RandR; `damage` implies `xfixes`, `randr` implies `render`.
-x11rb = { version = "0.14", features = ["shm", "damage", "xfixes", "randr"] }
+# RandR; `damage` implies `xfixes`, `randr` implies `render`. The shortcut hook
+# (L7) uses the XInput2 keyboard grab (`xinput`).
+x11rb = { version = "0.14", features = ["shm", "damage", "xfixes", "randr", "xinput"] }
 # Wayland selection owner for file lists (data-control protocols).
 wl-clipboard-rs = "0.9"
+# Shortcut hook on Wayland: keyboard-shortcuts-inhibit (`unstable`) on GDK's own
+# connection. `client_system` makes wayland-backend wrap libwayland-client
+# (already loaded by GTK), which is what lets us join GDK's `wl_display`
+# (Backend::from_foreign_display).
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 tempfile = "3"
@@ -70,3 +78,6 @@ secret-service = { version = "5", features = ["rt-async-io-crypto-rust"] }
 # of the golden streams (src/codec/golden.rs). Already workspace dependencies.
 sha2.workspace = true
 hex.workspace = true
+# The shortcut hook's Xvfb tests type with XTEST and build window handles.
+x11rb = { version = "0.14", features = ["xinput", "xtest"] }
+raw-window-handle = "0.6"

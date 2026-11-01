@@ -186,6 +186,17 @@ toggles (loses the overlay UX on Wayland only); (3) in-webview WebCodecs decode 
 2.54 has WebCodecs via GStreamer; decoder crashes take the web process down — last resort).
 X11 needs no spike.
 
+**Spike result (2026-11-01, [spikes/L5-wayland-subsurface.md](spikes/L5-wayland-subsurface.md)):**
+option (1) works on wlroots (sway) and Weston, with the `VideoSurface` contract unchanged.
+GNOME/KDE still need the device pass before L5 is done. Design corrections to the Linux
+Wayland row above: use an `area` + `video` subsurface pair (gtkwaylandsink layout) so the
+reveal crop is one atomic commit we own; do **not** call `place_above(parent)` (a new
+subsurface is already top-most; that call would lower it below sibling subsurfaces); bind our
+own `wl_seat`/`wl_pointer` on our own queue over GDK's connection; create the video
+`wl_surface` through libwayland with a widget-less `GdkWindow` as its user data (GDK 3's touch
+path casts it unchecked). Decision #3 stays as a runtime fallback (missing
+`wp_viewporter`, or a compositor that fails the hide check).
+
 Tauri 2.11 exposes everything needed: `WebviewWindow::{hwnd, ns_window, ns_view,
 gtk_window}` (verified in `tauri-2.11.5/src/webview/webview_window.rs:1835-1862`) plus
 `HasWindowHandle`.

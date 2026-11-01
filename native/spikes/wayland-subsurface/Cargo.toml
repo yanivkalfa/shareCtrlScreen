@@ -1,0 +1,45 @@
+# L5-spike (plans/05-TASKS.md): a wgpu-rendered `wl_subsurface` above WebKitGTK
+# inside a tao/wry window — the same GTK3 + WebKitGTK stack Tauri 2 builds on.
+#
+# Deliberately NOT a workspace member: it is Linux-only and pulls wgpu, which the
+# shipped workspace does not depend on yet (task L5 adds it). The empty
+# `[workspace]` table below stops cargo from treating `native/` as its parent.
+[package]
+name = "wayland-subsurface-spike"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Proprietary"
+publish = false
+
+[workspace]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+rust_2018_idioms = "warn"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+platform-api = { path = "../../crates/platform-api" }
+input = { path = "../../crates/input" }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+raw-window-handle = "0.6"
+# The exact GTK3 stack of tauri 2.11 (see native/Cargo.lock): a different minor
+# would load a second, incompatible copy of the gtk-rs type registry. gdk and
+# glib are used through gtk's re-exports, as Tauri does, so the glib 0.18
+# unsound advisory (RUSTSEC-2024-0429, `VariantStrIter`, unused here) stays a
+# transitive one exactly as in the shipped workspace.
+tao = "0.35"
+wry = "0.55"
+gtk = "0.18"
+gdkwayland-sys = "0.18"
+# Wayland: `client_system` makes wayland-backend wrap libwayland-client, which is
+# what lets us share GDK's `wl_display` connection (from_foreign_display).
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-sys = { version = "0.31", features = ["client"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+# Only for the `drive` test binary (virtual pointer on wlroots compositors).
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wgpu = { version = "30", default-features = false, features = ["vulkan", "gles", "wgsl", "std"] }

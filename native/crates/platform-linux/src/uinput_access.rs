@@ -220,6 +220,9 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    /// Serialises every test that spawns a process (see `run_with_fake_pkexec`).
+    static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn dry_run_spawns_nothing_and_reports_the_plan() {
         // A dry run that tried to spawn "/nonexistent/pkexec" would fail.
@@ -275,40 +278,51 @@ mod tests {
 
     #[test]
     fn missing_pkexec_is_reported() {
+        let _guard = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
         let err = install_with("/nonexistent/pkexec", "alice", InstallMode::Apply).unwrap_err();
         assert!(matches!(err, UinputInstallError::PkexecMissing));
     }
 
-    fn fake_pkexec(dir: &std::path::Path, body: &str) -> String {
+    /// Writes an executable stand-in for pkexec and runs an install through it.
+    /// Writing and spawning happen under one lock: a fork from a concurrently
+    /// running test while the script is still open for writing makes exec fail
+    /// with ETXTBSY.
+    fn run_with_fake_pkexec(
+        tag: &str,
+        body: &str,
+    ) -> (
+        Result<UinputInstallOutcome, UinputInstallError>,
+        std::path::PathBuf,
+    ) {
+        let _guard = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("sct-pkexec-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("pkexec");
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path.to_string_lossy().into_owned()
+        let result = install_with(&path.to_string_lossy(), "alice", InstallMode::Apply);
+        (result, dir)
     }
 
     #[test]
     fn apply_runs_the_command_and_reports_relogin() {
-        let dir = std::env::temp_dir().join(format!("sct-pkexec-ok-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let log = dir.join("argv");
-        let pk = fake_pkexec(
-            &dir,
+        let log = std::env::temp_dir().join(format!("sct-pkexec-argv-{}", std::process::id()));
+        let (result, dir) = run_with_fake_pkexec(
+            "ok",
             &format!("printf '%s\\n' \"$@\" > '{}'", log.display()),
         );
-        let out = install_with(&pk, "alice", InstallMode::Apply).unwrap();
+        let out = result.unwrap();
         assert!(out.applied && out.relogin_required);
         let argv = std::fs::read_to_string(&log).unwrap();
         assert!(argv.contains(UINPUT_RULE_PATH) && argv.contains("alice"));
+        std::fs::remove_file(&log).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn apply_surfaces_a_dismissed_dialog() {
-        let dir = std::env::temp_dir().join(format!("sct-pkexec-cancel-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let pk = fake_pkexec(&dir, "exit 126");
-        let err = install_with(&pk, "alice", InstallMode::Apply).unwrap_err();
-        assert!(matches!(err, UinputInstallError::Cancelled));
+        let (result, dir) = run_with_fake_pkexec("cancel", "exit 126");
+        assert!(matches!(result, Err(UinputInstallError::Cancelled)));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -24,6 +24,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use codec_openh264::{OpenH264, WithSoftwareH264};
+
+/// GPU→CPU readback of Desktop Duplication frames for the software encoder;
+/// public so tools that build their own OpenH264 factory (the smoketest's
+/// `--software`) can feed it real captures.
+pub use cpu::D3d11Readback;
 use platform_api::{
     Autostart, CaptureError, Clipboard, CodecFactory, DisplayInfo, InputError, InputInjector,
     OsPermission, Paths, PermissionReport, Platform, PlatformInfo, RawDisplayHandle,

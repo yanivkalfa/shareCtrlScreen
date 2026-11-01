@@ -23,7 +23,9 @@ mod stats;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use codec_openh264::{OpenH264, WithSoftwareH264};
 use platform_api::mock::MockPlatform;
+use platform_api::unavailable::NoCodecs;
 use platform_api::{CodecFactory, Platform};
 
 use args::{Args, Command};
@@ -32,15 +34,18 @@ use args::{Args, Command};
 /// capture never sleeps for long and the run is quick and deterministic.
 const MOCK_FPS: u32 = 1000;
 
-/// The OS backend for this build; the same selection as the app's
-/// `make_platform()`, so the tool measures exactly what the app would run.
-fn os_platform() -> Arc<dyn Platform> {
+/// The OS backend for this build and its Cisco OpenH264 handle; the same
+/// selection as the app's `make_platform()`, so the tool measures exactly what
+/// the app would run (and shares the app's downloaded codec).
+fn os_platform() -> (Arc<dyn Platform>, Arc<OpenH264>) {
     #[cfg(windows)]
-    return Arc::new(platform_windows::WindowsPlatform::new());
+    let platform = platform_windows::WindowsPlatform::new();
     #[cfg(target_os = "macos")]
-    return Arc::new(platform_macos::MacPlatform::new());
+    let platform = platform_macos::MacPlatform::new();
     #[cfg(target_os = "linux")]
-    return Arc::new(platform_linux::LinuxPlatform::new());
+    let platform = platform_linux::LinuxPlatform::new();
+    let openh264 = platform.openh264();
+    (Arc::new(platform), openh264)
 }
 
 fn mock_platform(size: Option<(u32, u32)>) -> Arc<dyn Platform> {
@@ -54,24 +59,34 @@ fn mock_platform(size: Option<(u32, u32)>) -> Arc<dyn Platform> {
     Arc::new(platform)
 }
 
-/// The software codec factory, once one exists in this build.
-///
-/// Task D2 (OpenH264 loaded from the Cisco binary at runtime) replaces this
-/// with its factory; until then `--software` has nothing to select.
-fn software_codecs(_platform: &dyn Platform) -> Option<&dyn CodecFactory> {
-    None
+/// Cisco OpenH264 only: the adapter over a "hardware" factory that always
+/// refuses, so every H.264 request takes the software path (downloading the
+/// binary on first use, exactly as the app would).
+fn software_codecs(openh264: Arc<OpenH264>) -> WithSoftwareH264<NoCodecs> {
+    let codecs = WithSoftwareH264::new(
+        NoCodecs {
+            reason: "--software skips the hardware codec",
+        },
+        openh264,
+    );
+    // Desktop Duplication frames live on the GPU; read them back like the app.
+    #[cfg(windows)]
+    let codecs = codecs.with_readback(Box::new(platform_windows::D3d11Readback));
+    codecs
 }
 
 fn run(args: &Args) -> Result<bool, String> {
+    // The OS backend's handle even for `--mock`: one download location, the
+    // per-user codecs directory, never a temp path.
+    let (os, openh264) = os_platform();
     let platform = if args.mock {
         mock_platform(args.size)
     } else {
-        os_platform()
+        os
     };
+    let software = software_codecs(openh264);
     let codecs: &dyn CodecFactory = if args.software {
-        software_codecs(&*platform).ok_or(
-            "no software codec in this build; --software needs the OpenH264 backend (task D2)",
-        )?
+        &software
     } else {
         platform.codecs()
     };
@@ -179,13 +194,23 @@ mod tests {
         assert!(run(&args).is_err());
     }
 
+    /// `--software` reaches OpenH264 and never the hardware codec. Checked with
+    /// the codec turned off, so the test needs no network: the error must come
+    /// from the software side.
     #[test]
-    fn software_without_a_backend_says_so() {
-        let args = Args {
-            software: true,
-            ..mock_args()
-        };
-        let err = run(&args).expect_err("no software codec yet");
-        assert!(err.contains("no software codec in this build"), "{err}");
+    fn software_selects_openh264_only() {
+        let openh264 = Arc::new(OpenH264::new(
+            std::env::temp_dir().join("sct-smoketest-openh264-unused"),
+        ));
+        openh264.set_enabled(false);
+        let codecs = software_codecs(openh264);
+        assert_eq!(codecs.host_encodable(), vec![platform_api::Codec::H264]);
+        let err = codecs
+            .new_encoder(None, platform_api::EncoderConfig::default())
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("--software skips the hardware codec"), "{err}");
+        assert!(err.contains("Cisco OpenH264"), "{err}");
     }
 }

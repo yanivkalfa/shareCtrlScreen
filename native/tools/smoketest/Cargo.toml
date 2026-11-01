@@ -13,6 +13,7 @@ workspace = true
 # so `--mock` runs anywhere (and in CI); the shipped app does not.
 [dependencies]
 platform-api = { path = "../../crates/platform-api", features = ["mock"] }
+codec-openh264 = { path = "../../crates/codec-openh264" }
 tracing-subscriber.workspace = true
 
 # The same per-OS selection as `app/Cargo.toml` and its `make_platform()`.

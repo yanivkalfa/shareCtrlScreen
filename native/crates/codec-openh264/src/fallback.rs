@@ -99,19 +99,22 @@ impl<H: CodecFactory> CodecFactory for WithSoftwareH264<H> {
             Err(e) => return Err(e),
         };
         tracing::warn!("hardware H.264 encoder unavailable ({hw_err}) — trying Cisco OpenH264");
-        let software = || -> Result<Box<dyn VideoEncoder>, CodecError> {
-            let readback = self
-                .readback
-                .as_ref()
-                .map(|f| f.new_readback(device))
-                .transpose()?;
-            Ok(Box::new(SoftwareEncoder::new(
-                &self.openh264,
-                cfg,
-                readback,
-            )?))
-        };
-        software().map_err(|sw| both(hw_err, sw))
+        // A capture without the GPU device the readback needs (a CPU capture,
+        // a test mock) still encodes: only GPU frames need a readback, and
+        // without one they fail per frame with a message saying so.
+        let readback = self
+            .readback
+            .as_ref()
+            .and_then(|f| match f.new_readback(device) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    tracing::info!("openh264: no GPU readback ({e}); CPU frames only");
+                    None
+                }
+            });
+        SoftwareEncoder::new(&self.openh264, cfg, readback)
+            .map(|e| Box::new(e) as Box<dyn VideoEncoder>)
+            .map_err(|sw| both(hw_err, sw))
     }
 
     fn new_decoder(

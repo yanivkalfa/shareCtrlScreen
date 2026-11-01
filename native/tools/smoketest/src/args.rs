@@ -10,7 +10,7 @@ against the plan 04 section 2 budget. Exits 1 when the budget is missed.
 
 Options:
   --mock             use the in-memory MockPlatform (runs anywhere, for CI)
-  --software         use the software codec factory instead of the OS one
+  --software         use only Cisco OpenH264 (downloaded on first use)
   --display <id>     display id from the printed list (default: primary)
   --seconds <n>      how long to sample (default: 5)
   --size <W>x<H>     ask the capture backend for this output size

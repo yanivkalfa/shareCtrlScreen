@@ -6,12 +6,14 @@
 //! Status: paths, session-type detection, the clipboard (text and file
 //! lists), Secret Service passwords (L9), XDG autostart (L10), the
 //! permissions preflight (L12), hardware
-//! video encode (L3, [`LinuxCodecs`]) and the Cisco OpenH264 fallback (D2)
-//! are real; every other capability fails safely with a clear message until
-//! its task lands (see `plans/05-TASKS.md`, lane L).
+//! video encode (L3, [`LinuxCodecs`]), the Cisco OpenH264 fallback (D2) and
+//! X11 screen capture with display enumeration (L2, [`X11Capture`]) are real;
+//! every other capability fails safely with a clear message until its task
+//! lands (see `plans/05-TASKS.md`, lane L).
 
 #![cfg(target_os = "linux")]
 
+mod capture;
 mod codec;
 pub mod secret;
 mod uinput_access;
@@ -22,6 +24,7 @@ use std::sync::Arc;
 mod autostart;
 mod clipboard;
 
+pub use capture::{x11_displays, X11Capture};
 pub use codec::LinuxCodecs;
 use codec_openh264::{OpenH264, WithSoftwareH264};
 use platform_api::unavailable::NoAutostart;
@@ -140,7 +143,14 @@ impl Platform for LinuxPlatform {
     }
 
     fn displays(&self) -> Vec<DisplayInfo> {
-        Vec::new()
+        match self.session {
+            SessionType::X11 => x11_displays(None).unwrap_or_else(|e| {
+                tracing::warn!("cannot list displays: {e}");
+                Vec::new()
+            }),
+            // The portal picks the monitor in its own dialog (task L1).
+            SessionType::Wayland => Vec::new(),
+        }
     }
 
     fn permissions(&self) -> PermissionReport {
@@ -153,9 +163,16 @@ impl Platform for LinuxPlatform {
 
     fn create_capture(
         &self,
-        _display: Option<&str>,
+        display: Option<&str>,
     ) -> Result<Box<dyn ScreenCapture>, CaptureError> {
-        Err(CaptureError::Backend(format!("screen capture {NOT_YET}")))
+        match self.session {
+            SessionType::X11 => Ok(Box::new(X11Capture::open(None, display)?)),
+            // Never X11 capture here: under Xwayland the root window shows
+            // only X11 apps, not the desktop (plans/02 §1).
+            SessionType::Wayland => Err(CaptureError::Backend(format!(
+                "screen capture on Wayland {NOT_YET}"
+            ))),
+        }
     }
 
     fn codecs(&self) -> &dyn CodecFactory {

@@ -44,8 +44,10 @@ libloading = "0.8"
 # Clipboard text (X11 + Wayland). No `image-data`: images are out of scope and the
 # default feature drags in the `image` decoder stack.
 arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
-# X11 selection owner for file lists (pure-Rust connection, no libxcb).
-x11rb = "0.14"
+# X11 selection owner for file lists and X11 screen capture (pure-Rust
+# connection, no libxcb). Capture (task L2) uses MIT-SHM, DAMAGE, XFixes and
+# RandR; `damage` implies `xfixes`, `randr` implies `render`.
+x11rb = { version = "0.14", features = ["shm", "damage", "xfixes", "randr"] }
 # Wayland selection owner for file lists (data-control protocols).
 wl-clipboard-rs = "0.9"
 

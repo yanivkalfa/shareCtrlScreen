@@ -28,8 +28,12 @@
 | engine secret-store hardening | **done** `62e14ca` (orchestrator) | `SecretStore::forget`; seal/open off the signaling loop (spawn_blocking, 60 s bound on open); MSRV 1.88 |
 | L5-spike | **done** `de9f354` (Opus) | Wayland subsurface works on sway/Weston; GNOME/KDE device pass pending; L5 builds option 1 (see plans/spikes) |
 | D2 OpenH264 | **done** `0dd75a1` (Opus) | Cisco binary downloaded at runtime (SHA-256 pinned), licence toggle + notice in Settings → Advanced, `WithSoftwareH264` adapter on all three platforms, D3D11 readback + CPU-NV12 upload on Windows. 1080p encode budget to be measured on an idle machine |
-| M4, L9, M8b | **gated, merging** | NSView + wgpu/Metal surface (`surface-wgpu` shared crate); Secret Service store; Keychain `forget` |
-| L3, L11 | **fix round** | NVENC + VA-API dlopen encoders (reviewer APPROVE with should-fix items); deb/rpm/AppImage + uinput installer |
+| M4 NSView surface | **done** `76eccb2` (Opus) | `surface-wgpu` shared crate (WGSL NV12→RGB, letterbox, cursor, reveal, held-input release) + NSView/CAMetalLayer view, bounded main-thread hop, zero-copy CVPixelBuffer import. Uses `gpu::CvPixelBufferFrame` and the generated keymap. **Device-pending** (checklists/M4.md) |
+| L9 Secret Service store | **done** `bc7f6d0` (Haiku, Opus-reviewed) | keyring-core + zbus store, fresh connection per call (no poisoned cache), `forget` implemented; daemon round-trip test. The dev-dep feature-unification build defect was caught by the gate and fixed |
+| M8b Keychain `forget` | **done** `63e5466` (Haiku) | follow-up to M8 |
+| L3 NVENC + VA-API encode | **done** `8baf62c` (Opus, independent FFI review: layouts verified with gcc; 9 findings fixed) | dlopen bindings, CBR/max-QP-32/one-frame VBV recipe, levels from size+fps, driver-header capture. NVENC verified on the GTX 1080 Ti; **VA-API device-pending** (checklists/L3.md) |
+| L11 Linux packaging | **done** `8e15a11` (Sonnet) | deb/rpm/AppImage targets + deps, desktop template, hicolor icons, `uinput_access` (pkexec installer), `linux-build.yml`. deb built and inspected in WSL; AppImage/VM installs CI/device-pending (checklists/L11.md). **Owner TODO:** 1024×1024 icon |
+| advisories | **clean** `e92735f` | tokio → 1.54.1; `cargo deny check` passes on all four triples |
 | M2, M3, L1, L2, L4, M6, L7 | queued (Opus cap) | start in wave 2, warm caches |
 | W2, W3, M5, L6, L5, D7, T2, T3, T4 | blocked on dependencies | W3/M5/L6 unblocked by D3; W2 by D2; D7 by M10 (+L11); L5 by the spike |
 | everything else | open | as below. |

@@ -73,7 +73,10 @@ parking_lot = "0.12"
 # 0.3.59, so bindgen has nothing to bind) and `spa_video_info_raw.flags` (0.3.65+)
 # unconditionally. The patched sites and the PipeWire commits are listed in
 # vendor/libspa/src/lib.rs. Linux-only in practice: only platform-linux reaches it
-# (through `pipewire`). Drop this once an upstream release builds on 0.3.48.
+# (through `pipewire`). On any pipewire-rs bump, re-vendor the matching libspa and
+# re-apply the marked patches, or drop this once upstream builds on 0.3.48 (when the
+# versions diverge cargo only warns "patch ... was not used" and builds the unpatched
+# registry crate, which fails on 22.04).
 [patch.crates-io]
 libspa = { path = "vendor/libspa" }
 

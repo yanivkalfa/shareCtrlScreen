@@ -10,8 +10,12 @@ process.stdin.on('end', () => {
   const cmd = (input && input.tool_input && input.tool_input.command) || '';
   // Lane scripts are allowed to be *started* (they are not cargo themselves).
   if (/lane[\\/](drain|run-request|lane-up)\.ps1/.test(cmd)) process.exit(0);
-  const heavy = /(^|[\s;&|(`'"])(cargo|rustc)(\.exe)?(\s|$)/m.test(cmd)
-    || /(^|[\s;&|(`'"])npm(\.cmd)?\s+(run\s+)?(build|tauri)\b/m.test(cmd);
+  // Writing a request file mentions cargo in its body; that is the sanctioned path.
+  if (/queue/.test(cmd) && /[\w-]+-\d+\.request\b/.test(cmd)) process.exit(0);
+  // A command position only: line start or after a shell separator/quote. A
+  // bare "cargo" inside prose (commit messages, comments) is not a build.
+  const heavy = /(^|[;&|(`'"])\s*(cargo|rustc)(\.exe)?\s/m.test(cmd)
+    || /(^|[;&|(`'"])\s*npm(\.cmd)?\s+(run\s+)?(build|tauri)\b/m.test(cmd);
   if (!heavy) process.exit(0);
   process.stderr.write(
     'BLOCKED by the lane guard: cargo/rustc/npm build never run directly on this machine. ' +

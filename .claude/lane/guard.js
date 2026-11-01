@@ -11,7 +11,7 @@ process.stdin.on('end', () => {
   // Lane scripts are allowed to be *started* (they are not cargo themselves).
   if (/lane[\\/](drain|run-request|lane-up)\.ps1/.test(cmd)) process.exit(0);
   // Writing a request file mentions cargo in its body; that is the sanctioned path.
-  if (/queue/.test(cmd) && /[\w-]+-\d+\.request\b/.test(cmd)) process.exit(0);
+  if (/queue/.test(cmd) && /[\w-]+-\w+\.request\b/.test(cmd)) process.exit(0);
   // A command position only: line start or after a shell separator/quote. A
   // bare "cargo" inside prose (commit messages, comments) is not a build.
   const heavy = /(^|[;&|(`'"])\s*(cargo|rustc)(\.exe)?\s/m.test(cmd)

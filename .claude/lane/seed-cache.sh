@@ -29,7 +29,11 @@ drop_workspace_artifacts() {
   local dest="$1" d stem hash n=0
   for d in "$dest"/deps/*.d; do
     [ -e "$d" ] || continue
-    if grep -qE 'shareCtrlScreen[\\/]native[\\/]' "$d"; then
+    # Source dirs only (a registry crate's dep-info can also name its build
+    # script's OUT_DIR under target/, which is not ours to drop), in the base
+    # checkout OR any worktree: a shared inode rewritten by another worktree's
+    # build names that worktree's sources.
+    if grep -qE 'shareCtrlScreen[\\/](native|\.claude[\\/]worktrees[\\/][^\\/ ]+[\\/]native)[\\/](crates|app|tools|service|spikes)[\\/]' "$d"; then
       stem="$(basename "$d" .d)"; hash="${stem##*-}"
       rm -f "$dest"/deps/"$stem" "$dest"/deps/"$stem".* "$dest"/deps/lib"$stem".*
       rm -rf "$dest"/.fingerprint/*-"$hash" "$dest"/build/*-"$hash"
@@ -71,6 +75,29 @@ if [ "${1:-}" = "--prune" ]; then
     script_win="$(cygpath -m "$(realpath "$0")")"
     drive="$(echo "${script_win:0:1}" | tr 'A-Z' 'a-z')"
     wsl.exe -e bash -lc "bash '/mnt/$drive/${script_win:3}' --prune-wsl '$task'"
+  fi
+  exit 0
+fi
+# --prune-base: the base caches themselves. Their workspace artifacts were
+# shared with worktrees through hard links and may hold another tree's output
+# while the base's own fingerprints still say "fresh"; drop them so the next
+# base build recompiles our crates from the base sources.
+if [ "${1:-}" = "--prune-base" ]; then
+  main="$(git rev-parse --show-toplevel)"
+  for triple in "" aarch64-apple-darwin x86_64-apple-darwin; do
+    d="$main/native/target/${triple:+$triple/}debug"
+    [ -d "$d/deps" ] || continue
+    for name in $WORKSPACE_CRATES; do
+      u="${name//-/_}"
+      find "$d/deps" -maxdepth 1 \( -name "lib${u}-*" -o -name "${u}-*" -o -name "${name}-*" \) -exec rm -rf {} + 2>/dev/null || true
+      find "$d/.fingerprint" "$d/build" -maxdepth 1 \( -name "${name}-*" -o -name "${u}-*" \) -exec rm -rf {} + 2>/dev/null || true
+    done
+    drop_workspace_artifacts "$d"
+  done
+  if command -v wsl.exe >/dev/null 2>&1; then
+    script_win="$(cygpath -m "$(realpath "$0")")"
+    drive="$(echo "${script_win:0:1}" | tr 'A-Z' 'a-z')"
+    wsl.exe -e bash -lc "bash '/mnt/$drive/${script_win:3}' --prune-wsl base"
   fi
   exit 0
 fi

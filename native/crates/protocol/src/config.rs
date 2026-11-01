@@ -87,6 +87,11 @@ pub struct Config {
     /// requires the user to be able to turn it off and on again; default on.
     #[serde(rename = "useOpenH264")]
     pub use_openh264: bool,
+    /// Viewer-side: translate modifier keys for the host's OS (a Mac's Cmd
+    /// becomes Ctrl on a Windows/Linux host and Cmd+Tab becomes Alt+Tab; a
+    /// PC's Ctrl becomes Cmd on a Mac host). Settings → Advanced, default on,
+    /// as in Microsoft's Windows App; off sends every key literally.
+    pub translate_modifiers: bool,
     /// Viewer-side: when a host asks for a password we already have working
     /// credentials for, submit them without prompting.
     pub auto_login: bool,
@@ -120,6 +125,7 @@ impl Default for Config {
             paste_dropped_files: true,
             start_with_windows: false,
             use_openh264: true,
+            translate_modifiers: true,
             auto_login: false,
             saved_logins: BTreeMap::new(),
         }
@@ -307,5 +313,16 @@ mod tests {
         assert!(!off.use_openh264);
         let json = serde_json::to_string(&off).unwrap();
         assert!(json.contains(r#""useOpenH264":false"#), "{json}");
+    }
+
+    #[test]
+    fn modifier_translation_is_on_by_default_including_for_older_files() {
+        assert!(Config::default().translate_modifiers);
+        let old: Config = serde_json::from_str(r#"{"uuid":"u"}"#).unwrap();
+        assert!(old.translate_modifiers);
+        let off: Config = serde_json::from_str(r#"{"translateModifiers":false}"#).unwrap();
+        assert!(!off.translate_modifiers);
+        let json = serde_json::to_string(&off).unwrap();
+        assert!(json.contains(r#""translateModifiers":false"#), "{json}");
     }
 }

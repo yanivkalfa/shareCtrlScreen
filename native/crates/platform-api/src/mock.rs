@@ -852,6 +852,11 @@ pub struct MockPlatform {
     pub permission_requests: Mutex<Vec<OsPermission>>,
     /// What `focus_window_at` returns.
     pub focus_result: bool,
+    /// [`PlatformInfo::name`] this fake OS reports: `"mock"` by default (an
+    /// OS the engine does not know), or a real backend's name (`"windows"`,
+    /// `"macos"`, `"linux-x11"`, …) for tests of OS-dependent behaviour such
+    /// as modifier translation.
+    pub os_name: &'static str,
     codecs: MockCodecFactory,
     secrets: Arc<MockSecretStore>,
 }
@@ -878,6 +883,7 @@ impl MockPlatform {
             }),
             permission_requests: Mutex::default(),
             focus_result: true,
+            os_name: "mock",
             codecs: MockCodecFactory,
             secrets: Arc::new(MockSecretStore),
         }
@@ -887,7 +893,7 @@ impl MockPlatform {
 impl Platform for MockPlatform {
     fn info(&self) -> PlatformInfo {
         PlatformInfo {
-            name: "mock",
+            name: self.os_name,
             start_at_login_label: "Start at sign-in",
             shortcut_capture_hint: "Shortcut capture is not available in tests.",
             login_screen_supported: false,

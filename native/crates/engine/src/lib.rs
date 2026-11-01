@@ -11,6 +11,7 @@
 
 pub mod handshake;
 mod media;
+mod modifiers;
 mod session;
 pub mod transfer;
 mod tuning;
@@ -129,6 +130,15 @@ pub struct Engine {
     /// The codec of the current/next session: chosen by the host at accept time,
     /// adopted by the viewer from the connect-response.
     negotiated: Mutex<Codec>,
+    /// Viewer: the host's OS from its connect-response (unknown when it did not
+    /// say). It arrives before the host's offer, so every viewer session knows
+    /// it before its first key event.
+    peer_os: Mutex<modifiers::OsFamily>,
+    /// The live "Translate modifiers for the remote OS" setting, shared with
+    /// the running session's key translator so a change applies to the next
+    /// key without a reconnect. Kept equal to `config.translate_modifiers` by
+    /// [`Engine::update_config`].
+    translate_modifiers: Arc<AtomicBool>,
     /// The live session, if any (one at a time).
     pub(crate) session: Mutex<Option<session::Session>>,
     ice_policy: Mutex<IcePolicy>,
@@ -152,6 +162,7 @@ impl Engine {
         let (signaling, sig_rx) =
             SignalingClient::spawn(config.server_url.clone(), config.uuid.clone());
         let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        let translate_modifiers = Arc::new(AtomicBool::new(config.translate_modifiers));
         let engine = Arc::new(Self {
             config_path,
             config: Arc::new(Mutex::new(config)),
@@ -169,6 +180,8 @@ impl Engine {
             platform,
             surface: Mutex::new(None),
             negotiated: Mutex::new(Codec::H264),
+            peer_os: Mutex::new(modifiers::OsFamily::Unknown),
+            translate_modifiers,
             session: Mutex::new(None),
             ice_policy: Mutex::new(IcePolicy::Full),
         });
@@ -193,6 +206,8 @@ impl Engine {
     pub fn update_config(&self, f: impl FnOnce(&mut Config)) {
         let mut cfg = self.config.lock();
         f(&mut cfg);
+        self.translate_modifiers
+            .store(cfg.translate_modifiers, Ordering::Relaxed);
         let _ = cfg.persist(&self.config_path);
     }
 
@@ -238,9 +253,10 @@ impl Engine {
                 permission,
                 reason,
                 codec,
+                os,
                 ..
             } => {
-                self.on_connect_response(from, accepted, permission, reason, codec)
+                self.on_connect_response(from, accepted, permission, reason, codec, os)
                     .await;
             }
             SignalMsg::PasswordRequired {
@@ -333,6 +349,7 @@ impl Engine {
                 permission: None,
                 reason: Some("busy".into()),
                 codec: None,
+                os: None,
             });
             return;
         }
@@ -379,6 +396,7 @@ impl Engine {
                         permission: None,
                         reason: Some("bad-password".into()),
                         codec: None,
+                        os: None,
                     });
                 }
             }
@@ -398,6 +416,7 @@ impl Engine {
                     permission: None,
                     reason: Some("denied".into()),
                     codec: None,
+                    os: None,
                 });
             }
             ApprovalDecision::Allow(permission) => self.accept(from, permission).await,
@@ -426,6 +445,10 @@ impl Engine {
             permission: Some(permission.as_str().into()),
             reason: None,
             codec: Some(codec),
+            // The viewer translates modifier keys for this OS (D8).
+            os: modifiers::OsFamily::from_name(self.platform.info().name)
+                .wire_name()
+                .map(String::from),
         });
         *self.role.lock() = Role::Host {
             peer: peer.clone(),
@@ -628,6 +651,7 @@ impl Engine {
         permission: Option<String>,
         reason: Option<String>,
         codec: Option<String>,
+        os: Option<String>,
     ) {
         // Only the host we asked may answer, and only once.
         {
@@ -674,6 +698,13 @@ impl Engine {
             .as_deref()
             .and_then(Codec::from_caps_str)
             .unwrap_or(Codec::H264);
+        // And which OS it runs, for modifier translation; absent = unknown =
+        // keys forwarded literally.
+        let host_os = os
+            .as_deref()
+            .map_or(modifiers::OsFamily::Unknown, modifiers::OsFamily::from_name);
+        tracing::info!("host OS: {host_os:?}");
+        *self.peer_os.lock() = host_os;
         let perm = permission
             .as_deref()
             .map(|p| match p {
@@ -808,6 +839,14 @@ impl Engine {
 
     pub(crate) fn negotiated_codec(&self) -> Codec {
         *self.negotiated.lock()
+    }
+
+    pub(crate) fn peer_os(&self) -> modifiers::OsFamily {
+        *self.peer_os.lock()
+    }
+
+    pub(crate) fn translate_modifiers_handle(&self) -> Arc<AtomicBool> {
+        self.translate_modifiers.clone()
     }
 
     // Accessors used by the session module.

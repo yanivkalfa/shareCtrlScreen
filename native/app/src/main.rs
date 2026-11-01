@@ -99,6 +99,7 @@ fn get_config(state: tauri::State<'_, AppState>) -> serde_json::Value {
         "pasteDroppedFiles": c.paste_dropped_files,
         "startWithWindows": c.start_with_windows,
         "useOpenH264": c.use_openh264,
+        "translateModifiers": c.translate_modifiers,
         // Count only — the saved passwords themselves never reach the WebView.
         "savedLoginCount": c.saved_logins.len(),
     })
@@ -286,6 +287,11 @@ fn save_settings(
         }
         if let Some(b) = patch.get("useOpenH264").and_then(|v| v.as_bool()) {
             cfg.use_openh264 = b;
+        }
+        // Read by the running session's key translator on its next key event
+        // (`Engine::update_config` publishes it); held keys release as sent.
+        if let Some(b) = patch.get("translateModifiers").and_then(|v| v.as_bool()) {
+            cfg.translate_modifiers = b;
         }
     });
     // Takes effect for the next codec the engine creates (Cisco's licence: the

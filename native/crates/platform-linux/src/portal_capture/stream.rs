@@ -490,3 +490,160 @@ fn read_cursor(cursor: &MetaCursor) -> CursorMeta {
     };
     CursorMeta::At(position, sprite)
 }
+
+#[cfg(test)]
+mod tests {
+    //! The libspa paths this module relies on that the workspace patches to build on
+    //! PipeWire 0.3.48 (`native/vendor/libspa`): damage iteration and the raw video
+    //! info. They run against whatever headers the build used, so they hold on 22.04
+    //! and on current PipeWire alike.
+
+    use super::*;
+    use pw::spa::param::format::FormatProperties;
+    use pw::spa::param::video::VideoFormat;
+    use pw::spa::pod::serialize::PodSerializer;
+    use pw::spa::pod::{Object, Property, Value};
+    use pw::spa::sys;
+    use pw::spa::utils::{Fraction, Id, Rectangle, SpaTypes};
+    use std::io::Cursor;
+
+    fn region(x: i32, y: i32, width: u32, height: u32) -> sys::spa_meta_region {
+        sys::spa_meta_region {
+            region: sys::spa_region {
+                position: sys::spa_point { x, y },
+                size: sys::spa_rectangle { width, height },
+            },
+        }
+    }
+
+    /// The damage regions libspa yields for `regions`, of which the metadata
+    /// declares the first `bytes` bytes.
+    fn damage(regions: &mut [sys::spa_meta_region], bytes: usize) -> Vec<(i32, i32, u32, u32)> {
+        assert!(bytes <= size_of_val(regions));
+        let meta = sys::spa_meta {
+            type_: sys::SPA_META_VideoDamage,
+            size: u32::try_from(bytes).unwrap_or(u32::MAX),
+            data: regions.as_mut_ptr().cast(),
+        };
+        // SAFETY: `MetaVideoDamage` is `#[repr(transparent)]` over `spa_meta`, and
+        // `meta.data` points at `regions`, which outlives the borrow and holds at least
+        // the `bytes` the metadata declares (asserted above).
+        let damage = unsafe { &*std::ptr::from_ref(&meta).cast::<MetaVideoDamage>() };
+        damage
+            .iter()
+            .map(|r| {
+                (
+                    r.position().x,
+                    r.position().y,
+                    r.size().width,
+                    r.size().height,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn damage_iteration_stops_at_the_first_empty_region() {
+        let mut regions = [
+            region(0, 0, 10, 20),
+            region(5, 6, 7, 8),
+            region(0, 0, 0, 0),
+            region(1, 1, 1, 1),
+        ];
+        let bytes = size_of_val(&regions);
+        assert_eq!(
+            damage(&mut regions, bytes),
+            vec![(0, 0, 10, 20), (5, 6, 7, 8)]
+        );
+    }
+
+    #[test]
+    fn damage_iteration_stays_inside_the_declared_size() {
+        let one = size_of::<sys::spa_meta_region>();
+        let mut regions = [region(0, 0, 10, 20), region(5, 6, 7, 8)];
+        assert_eq!(
+            damage(&mut regions, 2 * one),
+            vec![(0, 0, 10, 20), (5, 6, 7, 8)]
+        );
+        // A trailing partial region is not read.
+        assert_eq!(damage(&mut regions, one + one / 2), vec![(0, 0, 10, 20)]);
+        assert!(damage(&mut regions, one - 1).is_empty());
+        assert!(damage(&mut regions, 0).is_empty());
+    }
+
+    #[test]
+    fn a_zero_width_or_height_region_is_invalid() {
+        let mut regions = [region(0, 0, 10, 0)];
+        let bytes = size_of_val(&regions);
+        assert!(damage(&mut regions, bytes).is_empty());
+        let mut regions = [region(0, 0, 0, 10)];
+        assert!(damage(&mut regions, bytes).is_empty());
+    }
+
+    #[test]
+    fn video_info_raw_starts_empty_and_keeps_the_whole_modifier() {
+        let mut info = VideoInfoRaw::new();
+        assert_eq!(info.format(), VideoFormat::Unknown);
+        assert_eq!((info.size().width, info.size().height), (0, 0));
+        assert_eq!(info.modifier(), 0);
+        // DRM_FORMAT_MOD_INVALID, and a value with the top bit set: the field is
+        // `int64_t` before PipeWire 0.3.65 and `uint64_t` since.
+        for modifier in [0x00ff_ffff_ffff_ffff_u64, 0x8000_0000_0000_0005] {
+            info.set_modifier(modifier);
+            assert_eq!(info.modifier(), modifier);
+        }
+    }
+
+    #[test]
+    fn video_info_raw_parses_a_fixed_format() {
+        let object = Object {
+            type_: SpaTypes::ObjectParamFormat.as_raw(),
+            id: ParamType::EnumFormat.as_raw(),
+            properties: vec![
+                Property::new(
+                    FormatProperties::MediaType.as_raw(),
+                    Value::Id(Id(MediaType::Video.as_raw())),
+                ),
+                Property::new(
+                    FormatProperties::MediaSubtype.as_raw(),
+                    Value::Id(Id(MediaSubtype::Raw.as_raw())),
+                ),
+                Property::new(
+                    FormatProperties::VideoFormat.as_raw(),
+                    Value::Id(Id(VideoFormat::BGRx.as_raw())),
+                ),
+                Property::new(
+                    FormatProperties::VideoModifier.as_raw(),
+                    Value::Long(0x0100_0000_0000_0002),
+                ),
+                Property::new(
+                    FormatProperties::VideoSize.as_raw(),
+                    Value::Rectangle(Rectangle {
+                        width: 2560,
+                        height: 1440,
+                    }),
+                ),
+                Property::new(
+                    FormatProperties::VideoFramerate.as_raw(),
+                    Value::Fraction(Fraction { num: 60, denom: 1 }),
+                ),
+            ],
+        };
+        let bytes = match PodSerializer::serialize(Cursor::new(Vec::new()), &Value::Object(object))
+        {
+            Ok((out, _)) => out.into_inner(),
+            Err(e) => panic!("cannot build the format pod: {e:?}"),
+        };
+        let Some(pod) = Pod::from_bytes(&bytes) else {
+            panic!("not a pod");
+        };
+        let mut info = VideoInfoRaw::new();
+        if let Err(e) = info.parse(pod) {
+            panic!("spa_format_video_raw_parse failed: {e}");
+        }
+        assert_eq!(info.format(), VideoFormat::BGRx);
+        assert_eq!((info.size().width, info.size().height), (2560, 1440));
+        assert_eq!((info.framerate().num, info.framerate().denom), (60, 1));
+        assert_eq!(info.modifier(), 0x0100_0000_0000_0002);
+    }
+}

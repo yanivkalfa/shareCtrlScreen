@@ -41,6 +41,7 @@ every crate below.
 |---|---|---|---|
 | `ashpd` | 0.13.13 (2026-07-17) | MIT | portal ScreenCast + RemoteDesktop (+ restore tokens); **do not** enable its `pipewire` feature |
 | `pipewire` (pipewire-rs) | 0.10.1 (2026-08-19) | MIT | PipeWire stream (needs `libpipewire-0.3-dev` ≥ 0.3.x) |
+| `libspa` (pipewire-rs, vendored) | 0.10.1, patched | MIT (unchanged) | dependency of `pipewire`. Vendored at `native/vendor/libspa` and applied with `[patch.crates-io]` (source = path; excluded from the workspace): upstream uses symbols that PipeWire 0.3.48 (Ubuntu 22.04) lacks, so it effectively needs 0.3.65. Three sites patched, PipeWire commits cited in its `src/lib.rs`. No new crates. Drop the patch once an upstream release builds on 0.3.48 |
 | `reis` | 0.7.1 (2026-07-30) | MIT | pure-Rust libei client for input via the RemoteDesktop portal |
 | `x11rb` | 0.14.0 (2026-07-16) | MIT OR Apache-2.0 | X11 capture (`shm`, `damage`, `xfixes`, `randr`), input (`xtest`), clip (`shape`), window child |
 | `cros-libva` | 0.0.13 (2024-12-06) | BSD-3-Clause | VA-API bindings (libva ≥ 1.20) |

@@ -25,6 +25,10 @@ members = [
     "tools/smoketest",
     "service",
 ]
+# Vendored third-party crates are path dependencies under the workspace root, which
+# cargo would otherwise make members (linted and tested with `--workspace`, and built
+# on every OS). They are only dependencies.
+exclude = ["vendor/libspa"]
 
 [workspace.package]
 version = "2.0.0"
@@ -62,6 +66,16 @@ uuid = { version = "1", features = ["v4"] }
 bytes = "1"
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
+
+# libspa 0.10.1 (MIT, pipewire-rs) patched to build against PipeWire 0.3.48, the
+# version on Ubuntu 22.04 (the oldest supported Linux, plans/00-DECISIONS.md). Every
+# upstream release uses `spa_meta_first`/`spa_meta_region_is_valid` (macros before
+# 0.3.59, so bindgen has nothing to bind) and `spa_video_info_raw.flags` (0.3.65+)
+# unconditionally. The patched sites and the PipeWire commits are listed in
+# vendor/libspa/src/lib.rs. Linux-only in practice: only platform-linux reaches it
+# (through `pipewire`). Drop this once an upstream release builds on 0.3.48.
+[patch.crates-io]
+libspa = { path = "vendor/libspa" }
 
 # Workspace-wide lints (§4).
 [workspace.lints.rust]

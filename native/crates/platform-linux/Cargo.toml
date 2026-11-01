@@ -45,7 +45,9 @@ tokio = { workspace = true }
 futures-util.workspace = true
 # MIT. The capture's PipeWire stream (L1). Links libpipewire-0.3 (the deb/rpm already
 # depend on it); building needs libpipewire-0.3-dev, libspa-0.2-dev and libclang-dev
-# (bindgen). No version feature: nothing newer than Ubuntu 22.04's 0.3.48 is used.
+# (bindgen). No version feature: our code uses nothing newer than Ubuntu 22.04's
+# 0.3.48. Its libspa dependency does (upstream effectively needs 0.3.65), so the
+# workspace patches libspa with native/vendor/libspa (see native/Cargo.toml).
 pipewire = "0.10.1"
 # ISC. dlopen/dlsym: the permissions preflight's libva probe and the VA-API /
 # NVENC / NVDEC / CUDA runtime bindings (decision #7: libva is dlopen'd, never linked).

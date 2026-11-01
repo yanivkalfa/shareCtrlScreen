@@ -298,6 +298,19 @@ to run (TCC). Use `objc2` 0.6-family crates throughout (`objc2-app-kit`,
 * Acceptance (CI with headless `sway` + `xdg-desktop-portal-wlr` + `pipewire`, see T4):
   capture 100 frames of a test pattern window; restore token round-trip skips the dialog on
   the second run (`-wlr` supports it); GNOME VM manual check.
+* As built: builds against PipeWire 0.3.48 (Ubuntu 22.04): inline SPA helpers
+  reimplemented, `flags` gated (task L1-fix). The breakage was in pipewire-rs's `libspa`
+  0.10.1 itself, not in our code. Every upstream release uses `spa_meta_first` and
+  `spa_meta_region_is_valid`, which are macros before PipeWire 0.3.59 (commits 90c955c2,
+  671a7102), so bindgen has nothing to bind. It also uses `spa_video_info_raw.flags` and
+  the `uint64_t` modifier, both from 0.3.65 (commit c61b9a09). Upstream effectively needs
+  0.3.65. The fix vendors libspa 0.10.1 at `native/vendor/libspa` (MIT, `[patch.crates-io]`,
+  excluded from the workspace) with three patches. The helpers are rewritten in Rust; the
+  damage bounds check is one region wide. `VideoInfoRaw::new` is built without naming
+  `flags`, the `flags` accessors sit behind the crate's `v0_3_65` feature, and the modifier
+  is cast for either signedness. `stream.rs` tests cover damage iteration and the
+  raw-format parse. Proven locally against the jammy 0.3.48 `-dev` headers through the
+  lane (L1-fix-01); CI proof is `bundle / linux` on ubuntu-22.04.
 
 ### L2 — X11 capture: XShm + XDamage  (size M; runs in WSL under Xvfb and in CI)
 * `x11rb` with `shm`,`damage`,`xfixes`,`randr`; dirty rects from Damage; `GpuFrame::Cpu(Bgra8)`;

@@ -286,7 +286,10 @@ mod tests {
     /// Writes an executable stand-in for pkexec and runs an install through it.
     /// Writing and spawning happen under one lock: a fork from a concurrently
     /// running test while the script is still open for writing makes exec fail
-    /// with ETXTBSY.
+    /// with ETXTBSY. The lock only covers this module's tests; a fork anywhere
+    /// else in the test binary (other modules spawn threads and processes) can
+    /// still hold the write descriptor for the instant before its own exec, so a
+    /// busy executable is retried briefly, as cargo and Go do for the same race.
     fn run_with_fake_pkexec(
         tag: &str,
         body: &str,
@@ -300,7 +303,18 @@ mod tests {
         let path = dir.join("pkexec");
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let result = install_with(&path.to_string_lossy(), "alice", InstallMode::Apply);
+        let mut result = install_with(&path.to_string_lossy(), "alice", InstallMode::Apply);
+        for _ in 0..50 {
+            match &result {
+                Err(UinputInstallError::Io(e))
+                    if e.kind() == std::io::ErrorKind::ExecutableFileBusy =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    result = install_with(&path.to_string_lossy(), "alice", InstallMode::Apply);
+                }
+                _ => break,
+            }
+        }
         (result, dir)
     }
 

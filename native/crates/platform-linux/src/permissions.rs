@@ -23,20 +23,14 @@
 //! * `zbus` properties proxy: <https://docs.rs/zbus/5/zbus/fdo/struct.PropertiesProxy.html>
 //! * plans/02-LINUX-FINDINGS.md §1 (restore tokens), §3 (input matrix), §4 (compositors).
 
-use std::future::Future;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, OnceLock};
 use std::time::Duration;
 
-use ashpd::desktop::remote_desktop::{DeviceType, RemoteDesktop, SelectDevicesOptions};
-use ashpd::desktop::screencast::{Screencast, SelectSourcesOptions, SourceType};
-use ashpd::desktop::{PersistMode, ResponseError};
-use ashpd::enumflags2::BitFlags;
 use ashpd::zbus::{self, fdo, names::InterfaceName};
 use platform_api::{OsPermission, PermissionReport, PermissionState};
-use tokio::runtime::{Builder, Runtime};
 
+use crate::portal_session::{self, block_on, runtime, Failure, Scope};
 use crate::portal_token::{self, StoredToken};
 use crate::SessionType;
 
@@ -225,7 +219,7 @@ pub(crate) fn request(session: SessionType, state_dir: &Path, p: OsPermission) {
     rt.spawn(async move {
         match run_flow(want_input, &path).await {
             Ok(()) => {}
-            Err(ashpd::Error::Response(ResponseError::Cancelled)) => {
+            Err(e) if e.is_cancel() => {
                 tracing::info!("portal consent dismissed by the user");
             }
             Err(e) => tracing::warn!("portal consent flow failed: {e}"),
@@ -235,112 +229,37 @@ pub(crate) fn request(session: SessionType, state_dir: &Path, p: OsPermission) {
 }
 
 /// ScreenCast (+ RemoteDesktop when input is wanted) up to `Start`, then store the
-/// restore token and close. L1 reuses the token for the real capture session.
-async fn run_flow(want_input: bool, token_path: &Path) -> Result<(), ashpd::Error> {
+/// restore token and close. The capture session (`portal_capture`) restores it.
+async fn run_flow(want_input: bool, token_path: &Path) -> Result<(), Failure> {
     let existing = portal_token::read(token_path);
     if !want_input && existing.as_ref().is_some_and(|t| t.covers_input) {
         // A combined token already restores capture; a screen-only one would
         // overwrite it and silently drop remote control.
         return Ok(());
     }
-    // Hand back the old token so a still-valid grant is renewed without a dialog.
-    // Only one of the same scope: a screen-only token cannot restore devices.
-    let previous = existing
-        .as_ref()
-        .filter(|t| !want_input || t.covers_input)
-        .map(|t| t.token.as_str());
-
-    let stored = if want_input {
-        combined_session(previous).await?
+    let previous = previous_token(want_input, existing.as_ref());
+    let scope = if want_input {
+        Scope::ScreenAndInput
     } else {
-        screen_session(previous).await?
+        Scope::Screen
     };
-    match stored {
-        Some(stored) => {
-            if let Err(e) = portal_token::write(token_path, &stored) {
-                tracing::warn!(path = %token_path.display(), "cannot store portal token: {e}");
-            }
-        }
-        None => tracing::info!("the portal returned no restore token; consent will not persist"),
-    }
+    // No bound, never abandoned: the settings screen polls in the background while
+    // the user decides.
+    let granted = portal_session::start(scope, previous, None, std::future::pending()).await?;
+    let stored = granted.token.clone();
+    granted.session.close().await;
+    // Only a token handed to `Start` is spent; a screen-only token kept back from a
+    // combined request is still valid if the portal returns no replacement.
+    portal_token::replace(token_path, previous.is_some(), stored.as_ref());
     Ok(())
 }
 
-async fn screen_session(previous: Option<&str>) -> Result<Option<StoredToken>, ashpd::Error> {
-    let screencast = Screencast::new().await?;
-    let session = screencast.create_session(Default::default()).await?;
-    let result = async {
-        screencast
-            .select_sources(&session, screen_sources(previous))
-            .await?;
-        let streams = screencast
-            .start(&session, None, Default::default())
-            .await?
-            .response()?;
-        Ok(streams.restore_token().map(|token| StoredToken {
-            token: token.to_owned(),
-            covers_input: false,
-        }))
-    }
-    .await;
-    log_close(session.close().await);
-    result
-}
-
-/// One RemoteDesktop session carrying a ScreenCast selection: a single consent dialog
-/// and a single restore token for capture and input (plans/02 §3).
-async fn combined_session(previous: Option<&str>) -> Result<Option<StoredToken>, ashpd::Error> {
-    let remote_desktop = RemoteDesktop::new().await?;
-    let screencast = Screencast::new().await?;
-    let session = remote_desktop.create_session(Default::default()).await?;
-    let result = async {
-        remote_desktop
-            .select_devices(
-                &session,
-                SelectDevicesOptions::default()
-                    .set_devices(DeviceType::Keyboard | DeviceType::Pointer)
-                    .set_persist_mode(PersistMode::ExplicitlyRevoked)
-                    .set_restore_token(previous),
-            )
-            .await?;
-        // Persistence is owned by the RemoteDesktop side in a combined session, so the
-        // ScreenCast selection carries no persist mode or token of its own.
-        screencast
-            .select_sources(
-                &session,
-                SelectSourcesOptions::default().set_sources(BitFlags::from(SourceType::Monitor)),
-            )
-            .await?;
-        let selected = remote_desktop
-            .start(&session, None, Default::default())
-            .await?
-            .response()?;
-        let covers_input = selected
-            .devices()
-            .contains(DeviceType::Keyboard | DeviceType::Pointer);
-        Ok(selected.restore_token().map(|token| StoredToken {
-            token: token.to_owned(),
-            covers_input,
-        }))
-    }
-    .await;
-    log_close(session.close().await);
-    result
-}
-
-fn screen_sources(previous: Option<&str>) -> SelectSourcesOptions {
-    SelectSourcesOptions::default()
-        .set_sources(BitFlags::from(SourceType::Monitor))
-        .set_persist_mode(PersistMode::ExplicitlyRevoked)
-        .set_restore_token(previous)
-}
-
-/// The token is already in hand; a failed close only leaves the portal to time the
-/// session out, so it is logged, not propagated.
-fn log_close(closed: Result<(), ashpd::Error>) {
-    if let Err(e) = closed {
-        tracing::debug!("closing the portal session failed: {e}");
-    }
+/// The stored token to hand back so a still-valid grant is renewed without a dialog.
+/// Only one of the same scope: a screen-only token cannot restore devices.
+fn previous_token(want_input: bool, existing: Option<&StoredToken>) -> Option<&str> {
+    existing
+        .filter(|t| !want_input || t.covers_input)
+        .map(|t| t.token.as_str())
 }
 
 async fn probe_portal() -> Portal {
@@ -410,42 +329,6 @@ fn probe_vaapi() -> Vaapi {
     // is dropped immediately and nothing is called through it.
     let libva = unsafe { libloading::Library::new("libva.so.2") }.is_ok();
     Vaapi { render_node, libva }
-}
-
-/// One small runtime for all portal traffic. `ashpd` caches its D-Bus connection in a
-/// process-wide static whose background tasks live on the runtime that created it, so a
-/// per-call runtime would leave later calls with a dead connection. Worker threads
-/// (not `current_thread`) so those tasks run without anyone blocking on the runtime.
-pub(crate) fn runtime() -> Option<&'static Runtime> {
-    static RUNTIME: OnceLock<std::io::Result<Runtime>> = OnceLock::new();
-    match RUNTIME.get_or_init(|| {
-        Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("sharectrl-portal")
-            .enable_all()
-            .build()
-    }) {
-        Ok(rt) => Some(rt),
-        Err(e) => {
-            tracing::warn!("cannot start the portal runtime: {e}");
-            None
-        }
-    }
-}
-
-/// Run `fut` on the portal runtime and wait up to `timeout`. Waiting on a channel (not
-/// `Runtime::block_on`) keeps this safe to call from inside another tokio runtime.
-fn block_on<T: Send + 'static>(
-    fut: impl Future<Output = T> + Send + 'static,
-    timeout: Duration,
-) -> Option<T> {
-    let rt = runtime()?;
-    let (tx, rx) = mpsc::channel();
-    rt.spawn(async move {
-        // The receiver is gone after a timeout; nobody is left to tell.
-        let _ = tx.send(fut.await);
-    });
-    rx.recv_timeout(timeout).ok()
 }
 
 #[cfg(test)]
@@ -609,6 +492,26 @@ mod tests {
         // Returns before touching D-Bus, so this runs without a portal.
         runtime().unwrap().block_on(run_flow(false, &path)).unwrap();
         assert_eq!(portal_token::read(&path), Some(combined));
+    }
+
+    #[test]
+    fn a_combined_request_keeps_back_and_so_never_spends_a_screen_only_token() {
+        let screen_only = token(false).unwrap();
+        let combined = token(true).unwrap();
+        // Combined request: a screen-only token cannot restore devices, so it is not
+        // handed over; `replace` is then told it was not spent and keeps it when the
+        // portal returns no replacement (the user unticked "remember").
+        assert_eq!(previous_token(true, Some(&screen_only)), None);
+        assert_eq!(previous_token(true, Some(&combined)), Some("t"));
+        assert_eq!(previous_token(false, Some(&screen_only)), Some("t"));
+        assert_eq!(previous_token(true, None), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = portal_token::path_in(dir.path());
+        portal_token::write(&path, &screen_only).unwrap();
+        let previous = previous_token(true, Some(&screen_only));
+        portal_token::replace(&path, previous.is_some(), None);
+        assert_eq!(portal_token::read(&path), Some(screen_only));
     }
 
     /// WSLg runs Weston: a Wayland session with no portal service. Skips itself on a

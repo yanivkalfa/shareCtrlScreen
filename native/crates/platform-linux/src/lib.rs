@@ -6,10 +6,11 @@
 //! Status: paths, session-type detection, the clipboard (text and file
 //! lists), Secret Service passwords (L9), XDG autostart (L10), the
 //! permissions preflight (L12), hardware video encode (L3) and decode (L4)
-//! ([`LinuxCodecs`]), the Cisco OpenH264 fallback (D2) and X11 screen
-//! capture with display enumeration (L2, [`X11Capture`]) are real; every
-//! other capability fails safely with a clear message until its task lands
-//! (see `plans/05-TASKS.md`, lane L).
+//! ([`LinuxCodecs`]), the Cisco OpenH264 fallback (D2), X11 screen capture
+//! with display enumeration (L2, [`X11Capture`]) and Wayland screen capture
+//! through the portal and PipeWire (L1) are real; every other capability fails
+//! safely with a clear message until its task lands (see `plans/05-TASKS.md`,
+//! lane L).
 
 #![cfg(target_os = "linux")]
 
@@ -37,6 +38,8 @@ use platform_api::{
 pub use x11_connect::x11_connect;
 
 mod permissions;
+mod portal_capture;
+mod portal_session;
 mod portal_token;
 
 pub use uinput_access::{
@@ -171,9 +174,8 @@ impl Platform for LinuxPlatform {
             SessionType::X11 => Ok(Box::new(X11Capture::open(None, display)?)),
             // Never X11 capture here: under Xwayland the root window shows
             // only X11 apps, not the desktop (plans/02 §1).
-            SessionType::Wayland => Err(CaptureError::Backend(format!(
-                "screen capture on Wayland {NOT_YET}"
-            ))),
+            SessionType::Wayland => portal_capture::create(display, &self.paths().log_dir)
+                .map(|c| Box::new(c) as Box<dyn ScreenCapture>),
         }
     }
 

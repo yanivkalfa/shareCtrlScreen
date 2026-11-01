@@ -129,6 +129,13 @@ PipeWire 0.3 client library, libxkbcommon. Recommended (not required): `libva2` 
 falls back to software encoding and decoding without them) and `xdg-desktop-portal` with a backend for
 your desktop (`-gnome`, `-kde`, `-wlr`, `-hyprland`), which Wayland screen sharing needs.
 
+**Wayland screen sharing.** The host shares the screen through the desktop portal's
+ScreenCast dialog and reads it from PipeWire. The first session asks which monitor to share;
+the portal's restore token (`~/.local/state/sharectrl/portal.token`) skips the dialog
+afterwards. On Wayland the monitor is chosen in that dialog, not in Settings. "Stop sharing"
+in the desktop's indicator ends the hosted session, as it does in AnyDesk; it is not reopened behind
+your back. Without a portal (WSLg, headless) hosting fails with a message naming the package to install.
+
 **GPU video acceleration.** The driver comes from your distribution, not from this app:
 Intel `intel-media-va-driver-non-free` (or `intel-media-va-driver`), AMD `mesa-va-drivers`,
 NVIDIA proprietary driver. Check with `vainfo` (package `vainfo` / `libva-utils`): it must

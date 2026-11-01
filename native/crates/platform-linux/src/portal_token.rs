@@ -92,6 +92,30 @@ pub fn write(path: &Path, stored: &StoredToken) -> io::Result<()> {
     fs::rename(&tmp, path)
 }
 
+/// Record the outcome of a portal `Start`. `spent` = the stored token was handed to
+/// that `Start`. Tokens are single-use, so a spent one is gone either way: store the
+/// replacement, or remove the file when the portal returned none (version < 4, or the
+/// user unticked "remember"), so the preflight does not report a grant that no longer
+/// exists. A token that was *not* handed over (another scope) is still valid and is
+/// kept unless a replacement arrives. Failures are logged: the worst outcome is one
+/// extra consent dialog next time.
+pub fn replace(path: &Path, spent: bool, token: Option<&StoredToken>) {
+    let result = match token {
+        Some(stored) => write(path, stored),
+        None if !spent => Ok(()),
+        None => {
+            tracing::info!("the portal returned no restore token; consent will not persist");
+            match fs::remove_file(path) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            }
+        }
+    };
+    if let Err(e) = result {
+        tracing::warn!(path = %path.display(), "cannot update portal token: {e}");
+    }
+}
+
 fn is_valid(token: &str) -> bool {
     !token.is_empty() && !token.contains(char::is_whitespace)
 }
@@ -165,6 +189,34 @@ mod tests {
         let path = path_in(dir.path());
         fs::write(&path, "tok\nsomething-else\n").unwrap();
         assert_eq!(read(&path), Some(stored("tok", false)));
+    }
+
+    #[test]
+    fn replace_stores_the_new_token_or_drops_the_spent_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(dir.path());
+        replace(&path, false, Some(&stored("first", true)));
+        assert_eq!(read(&path), Some(stored("first", true)));
+        replace(&path, true, None);
+        assert_eq!(read(&path), None);
+        assert!(!path.exists());
+        // Nothing stored and nothing returned is not an error.
+        replace(&path, true, None);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_token_that_was_not_handed_over_survives_an_empty_answer() {
+        // E.g. a combined consent with only a screen-only token stored: that token was
+        // not passed to `Start`, so it is still valid when the portal returns none.
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(dir.path());
+        write(&path, &stored("screen", false)).unwrap();
+        replace(&path, false, None);
+        assert_eq!(read(&path), Some(stored("screen", false)));
+        // A replacement still overwrites it.
+        replace(&path, false, Some(&stored("both", true)));
+        assert_eq!(read(&path), Some(stored("both", true)));
     }
 
     #[test]

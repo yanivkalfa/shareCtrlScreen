@@ -942,7 +942,7 @@ mod tests {
     /// recycled the way `VaapiDecoder` does.
     #[test]
     fn golden_streams_plan_and_map_without_a_device() {
-        let goldens = crate::codec::golden::all();
+        let goldens = codec_goldens::golden::all();
         let h264: Vec<_> = goldens.iter().filter(|g| g.codec == Codec::H264).collect();
         assert!(!h264.is_empty());
         for g in h264 {
@@ -1004,20 +1004,23 @@ mod tests {
         }
     }
 
-    /// Real decode on an Intel/AMD GPU of the committed golden streams, each
-    /// picture compared with FFmpeg's decode of the same stream (H.264
-    /// decoding is bit-exact, so they must be identical). Run on the Linux
-    /// test machine — see plans/checklists/L4.md.
+    /// The VA-API row of the cross-codec matrix (task I5): real decode on an
+    /// Intel/AMD GPU of every committed H.264 golden stream, each picture
+    /// compared with FFmpeg's decode of the same stream (H.264 decoding is
+    /// bit-exact, so they must be identical). Run on the Linux test machine
+    /// — see plans/checklists/L4.md and I5.md.
     #[test]
     #[ignore = "needs VA-API device"]
     fn vaapi_decodes_the_golden_streams() {
         let probe = decode_probe().expect("VA-API decode probe");
         eprintln!("VA-API decode probe: {}", probe.describe());
-        crate::codec::golden::check_decoder(
-            |codec| codec == Codec::H264,
-            |codec, w, h| {
+        codec_goldens::golden::check_decoder(codec_goldens::golden::DecoderUnderTest {
+            name: "vaapi",
+            decodes: |codec| codec == Codec::H264,
+            make: |codec, w, h| {
                 VaapiDecoder::new(&probe, codec, w, h).map(|d| Box::new(d) as Box<dyn VideoDecoder>)
             },
-        );
+            hash: codec_goldens::golden::cpu_frame_hash,
+        });
     }
 }

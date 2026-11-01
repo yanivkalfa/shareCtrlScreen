@@ -34,8 +34,6 @@ mod annexb;
 #[cfg(any(feature = "nvenc", feature = "nvdec"))]
 #[cfg_attr(not(all(feature = "nvenc", feature = "nvdec")), allow(dead_code))]
 mod cuda;
-#[cfg(all(test, any(feature = "vaapi", feature = "nvdec")))]
-mod golden;
 // Only VA-API writes headers; NVENC's tests reuse its SPS reader.
 #[cfg(any(feature = "vaapi", all(test, feature = "nvenc")))]
 #[cfg_attr(not(feature = "vaapi"), allow(dead_code))]
@@ -674,27 +672,11 @@ mod tests {
         assert!(caps.decodable().contains(&Codec::H264));
     }
 
-    /// A smooth moving BGRA picture (gradients plus a moving block), so the
-    /// decoded luma can be compared with the source within coding error.
+    // A smooth moving BGRA picture (gradients plus a moving block), so the
+    // decoded luma can be compared with the source within coding error —
+    // the picture every golden-stream session encodes.
     #[cfg(any(feature = "vaapi", all(feature = "nvenc", feature = "nvdec")))]
-    fn gradient(w: usize, h: usize, t: usize) -> Vec<u8> {
-        let mut px = vec![0u8; w * h * 4];
-        for y in 0..h {
-            for x in 0..w {
-                let i = (y * w + x) * 4;
-                let block = (x / 32 + t).is_multiple_of(8) && y / 32 == 2;
-                px[i] = (x * 255 / w) as u8;
-                px[i + 1] = (y * 255 / h) as u8;
-                px[i + 2] = if block {
-                    240
-                } else {
-                    ((x + y) * 255 / (w + h)) as u8
-                };
-                px[i + 3] = 255;
-            }
-        }
-        px
-    }
+    use codec_goldens::session::pattern as gradient;
 
     /// Mean absolute difference between a decoded frame's luma and the
     /// BT.709 limited-range luma of the BGRA source.
@@ -890,87 +872,107 @@ mod tests {
         );
     }
 
-    /// Writes the golden streams of the encoders on this machine into
-    /// `native/testdata/golden` (stream + `.aus` index); FFmpeg then writes
-    /// the `.sha256` reference (see `testdata/golden/README.md`). Needs the
-    /// NVIDIA driver and network access (Cisco's OpenH264 download).
-    #[cfg(all(feature = "nvenc", feature = "nvdec"))]
+    /// The scripted golden session (`codec_goldens::session`) at 640x360.
+    #[cfg(feature = "nvenc")]
+    fn golden_session_config(codec: Codec) -> EncoderConfig {
+        EncoderConfig {
+            width: 640,
+            height: 360,
+            fps_num: 30,
+            fps_den: 1,
+            bitrate_bps: codec_goldens::session::START_BITRATE,
+            codec,
+        }
+    }
+
+    /// Encoder-output conformance (task I5) for NVENC: the scripted host
+    /// session has the shape every decoder relies on (Annex-B, IDR first
+    /// with SPS/PPS(/VPS) in front, parameter sets on every IDR, no
+    /// reordering, the forced keyframe on its frame, one unit per frame) —
+    /// H.264, and HEVC where the GPU encodes it. Prints `SKIP nvenc` and
+    /// passes without the driver (CI).
+    #[cfg(feature = "nvenc")]
     #[test]
-    #[ignore = "regenerates testdata/golden; run by hand"]
-    fn regenerate_golden_streams() {
-        use codec_openh264::{OpenH264, SoftwareEncoder};
-        use std::fmt::Write as _;
-
-        fn write(name: &str, ext: &str, units: &[platform_api::EncodedUnit]) {
-            let dir = golden::dir();
-            let mut stream = Vec::new();
-            let mut index = String::new();
-            for u in units {
-                let _ = writeln!(
-                    index,
-                    "{} {} {}",
-                    stream.len(),
-                    u.data.len(),
-                    u.keyframe as u8
-                );
-                stream.extend_from_slice(&u.data);
+    fn nvenc_output_has_the_engine_shape() {
+        let probe = match nvenc::probe() {
+            Ok(p) => p,
+            Err(e) if e.contains("not loadable") => {
+                codec_goldens::skip::skip("nvenc", &e);
+                return;
             }
-            std::fs::write(dir.join(format!("{name}.{ext}")), &stream).expect("write stream");
-            std::fs::write(dir.join(format!("{name}.aus")), index).expect("write index");
-            eprintln!(
-                "wrote {name}.{ext}: {} AUs, {} bytes",
-                units.len(),
-                stream.len()
-            );
+            Err(e) => panic!("NVENC libraries load but the probe failed: {e}"),
+        };
+        let mut codecs = vec![Codec::H264];
+        if probe.hevc {
+            codecs.push(Codec::Hevc);
         }
-
-        fn run(
-            enc: &mut dyn VideoEncoder,
-            w: usize,
-            h: usize,
-            frames: usize,
-        ) -> Vec<platform_api::EncodedUnit> {
-            let mut out = Vec::new();
-            for t in 0..frames {
-                if t == frames / 2 {
-                    enc.force_keyframe();
-                }
-                if t == frames * 3 / 4 {
-                    enc.set_bitrate(1_000_000).expect("bitrate");
-                }
-                let src = gradient(w, h, t);
-                out.extend(
-                    enc.encode(&platform_api::Frame::bgra(w as u32, h as u32, &src, w * 4))
-                        .expect("encode"),
-                );
+        for codec in codecs {
+            let mut enc = nvenc::NvencEncoder::new(golden_session_config(codec))
+                .unwrap_or_else(|e| panic!("NVENC {codec:?}: {e}"));
+            let session = codec_goldens::session::record_cpu(
+                &mut enc,
+                640,
+                360,
+                codec_goldens::session::FRAMES,
+            )
+            .unwrap_or_else(|e| panic!("NVENC {codec:?} session: {e}"));
+            match codec_goldens::shape::check_session(codec, &session) {
+                Ok(shape) => eprintln!("NVENC {codec:?}: {shape:?}"),
+                Err(e) => panic!("NVENC {codec:?}: {e}"),
             }
-            out
         }
+    }
 
+    /// Encoder-output conformance for the VA-API encoder, as the NVENC test
+    /// above. Run on the Linux test machine (plans/checklists/I5.md).
+    #[cfg(feature = "vaapi")]
+    #[test]
+    #[ignore = "needs VA-API device"]
+    fn vaapi_output_has_the_engine_shape() {
+        let probe = vaapi::probe().expect("VA-API encode probe");
         let cfg = EncoderConfig {
             width: 640,
             height: 360,
             fps_num: 30,
             fps_den: 1,
-            bitrate_bps: 3_000_000,
+            bitrate_bps: codec_goldens::session::START_BITRATE,
             codec: Codec::H264,
         };
+        let mut enc = vaapi::VaapiEncoder::new(&probe, cfg).expect("VA-API encoder");
+        let session =
+            codec_goldens::session::record_cpu(&mut enc, 640, 360, codec_goldens::session::FRAMES)
+                .expect("VA-API session");
+        match codec_goldens::shape::check_session(Codec::H264, &session) {
+            Ok(shape) => eprintln!("VA-API H264: {shape:?}"),
+            Err(e) => panic!("VA-API H264: {e}"),
+        }
+    }
+
+    /// Writes the golden streams of the encoders on this machine into
+    /// `native/testdata/golden` (stream + `.aus` index); FFmpeg then writes
+    /// the `.sha256` reference (see `testdata/golden/README.md`). Needs the
+    /// NVIDIA driver and network access (Cisco's OpenH264 download). The
+    /// committed files are never replaced: `codec_goldens::session::write`
+    /// refuses an existing name, so delete the ones you mean to remake.
+    #[cfg(all(feature = "nvenc", feature = "nvdec"))]
+    #[test]
+    #[ignore = "regenerates testdata/golden; run by hand"]
+    fn regenerate_golden_streams() {
+        use codec_goldens::session::{record_cpu, write, FRAMES};
+        use codec_openh264::{OpenH264, SoftwareEncoder};
+
+        let dir = codec_goldens::golden::dir();
+        let save = |name: &str, codec: Codec, enc: &mut dyn VideoEncoder, w: u32, h: u32| {
+            let session = record_cpu(enc, w, h, FRAMES).expect("encode");
+            write(&dir, name, codec, &session.units).unwrap_or_else(|e| panic!("{e}"));
+        };
+
+        let cfg = golden_session_config(Codec::H264);
         let mut enc = nvenc::NvencEncoder::new(cfg).expect("NVENC H.264");
-        write(
-            "nvenc-h264-main-640x360",
-            "h264",
-            &run(&mut enc, 640, 360, 30),
-        );
-        let mut enc = nvenc::NvencEncoder::new(EncoderConfig {
-            codec: Codec::Hevc,
-            ..cfg
-        })
-        .expect("NVENC HEVC");
-        write(
-            "nvenc-hevc-main-640x360",
-            "hevc",
-            &run(&mut enc, 640, 360, 30),
-        );
+        save("nvenc-h264-main-640x360", Codec::H264, &mut enc, 640, 360);
+        let mut enc =
+            nvenc::NvencEncoder::new(golden_session_config(Codec::Hevc)).expect("NVENC HEVC");
+        save("nvenc-hevc-main-640x360", Codec::Hevc, &mut enc, 640, 360);
 
         let openh264 = OpenH264::new(std::env::temp_dir().join("sct-golden-openh264"));
         let mut enc = SoftwareEncoder::new(
@@ -983,6 +985,6 @@ mod tests {
             None,
         )
         .expect("OpenH264 (needs network for the Cisco download)");
-        write("openh264-cb-320x240", "h264", &run(&mut enc, 320, 240, 30));
+        save("openh264-cb-320x240", Codec::H264, &mut enc, 320, 240);
     }
 }

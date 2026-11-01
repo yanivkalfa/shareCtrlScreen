@@ -13,6 +13,7 @@ members = [
     "crates/capture",
     "crates/codec",
     "crates/codec-openh264",
+    "crates/codec-goldens",
     "crates/transport",
     "crates/signaling",
     "crates/input",

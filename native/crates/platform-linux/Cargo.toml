@@ -98,10 +98,9 @@ tempfile = "3"
 # Reads the daemon's items directly in tests/secret_daemon.rs. Same zbus runtime
 # (async-io) as the store, so the test exercises the production runtime.
 secret-service = { version = "5", features = ["rt-async-io-crypto-rust"] }
-# Per-frame SHA-256 of decoded pictures, compared with FFmpeg's `framehash`
-# of the golden streams (src/codec/golden.rs). Already workspace dependencies.
-sha2.workspace = true
-hex.workspace = true
+# The golden streams, the decoder matrix and the encoder-output shape check
+# (task I5); dev-only, pure Rust.
+codec-goldens = { path = "../codec-goldens" }
 # Scripted input for the headless Wayland video-surface test: the wlroots
 # virtual pointer under headless sway.
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }

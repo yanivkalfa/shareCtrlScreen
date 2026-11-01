@@ -656,26 +656,29 @@ mod tests {
         assert!(tight.refuse(1920, 1088).is_some());
     }
 
-    /// Real NVDEC decode of the committed golden streams (NVENC and OpenH264
-    /// output), each frame compared with FFmpeg's decode of the same stream.
-    /// Gated on the driver library: without `libnvcuvid.so.1` (CI) it reports
-    /// the skip and passes.
+    /// The NVDEC row of the cross-codec matrix (task I5): every committed
+    /// golden stream of a codec this GPU decodes, each frame compared with
+    /// FFmpeg's decode of the same stream. Without `libnvcuvid.so.1` (CI) it
+    /// prints `SKIP nvdec` and passes, unless `SCT_CODEC_TESTS_REQUIRED`
+    /// names `nvdec`.
     #[test]
     fn nvdec_decodes_the_golden_streams() {
         let probe = match probe() {
             Ok(p) => p,
             Err(e) if e.contains("not loadable") => {
-                eprintln!("skipping NVDEC golden decode: {e}");
+                codec_goldens::skip::skip("nvdec", &e);
                 return;
             }
             Err(e) => panic!("NVDEC libraries load but the probe failed: {e}"),
         };
         eprintln!("NVDEC probe: {}", probe.describe());
-        crate::codec::golden::check_decoder(
-            |codec| probe.limits(codec).is_some(),
-            |codec, w, h| {
+        codec_goldens::golden::check_decoder(codec_goldens::golden::DecoderUnderTest {
+            name: "nvdec",
+            decodes: |codec| probe.limits(codec).is_some(),
+            make: |codec, w, h| {
                 NvdecDecoder::new(&probe, codec, w, h).map(|d| Box::new(d) as Box<dyn VideoDecoder>)
             },
-        );
+            hash: codec_goldens::golden::cpu_frame_hash,
+        });
     }
 }

@@ -414,7 +414,10 @@ fn default_keymap_fd() -> Result<(OwnedFd, u32), String> {
 
 impl Backend for Wlr {
     fn pointer(&mut self, at: Point) {
-        let at = mapping::on_primary(at, self.primary);
+        // On Wayland the shared monitor is the one picked in the portal dialog
+        // (published by the capture); without one, our own primary stand-in.
+        let shared = crate::portal_monitor::current().and_then(|m| m.rect);
+        let at = mapping::on_primary(at, shared.or(self.primary));
         let (fx, fy) = mapping::layout_fraction(at, self.layout);
         let (ext_x, ext_y) = self
             .layout

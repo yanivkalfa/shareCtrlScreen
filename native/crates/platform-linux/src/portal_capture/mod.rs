@@ -265,10 +265,15 @@ async fn open_portal(
     let abandon = async {
         let _ = abandon.await;
     };
-    // A combined token, or remote control already holding the shared session:
-    // join that one session (one dialog, one single-use token) rather than
-    // starting a second from the same token.
-    if scope == Scope::ScreenAndInput || portal_shared::live().is_some() {
+    // Join the one shared combined session (one dialog, one single-use token,
+    // one monitor pick) when the token is combined, when remote control
+    // already holds it, or when remote control would use the portal at all:
+    // every host session creates an injector, so on a first run the capture
+    // and the injector would otherwise race into two dialogs.
+    if scope == Scope::ScreenAndInput
+        || portal_shared::live().is_some()
+        || crate::input::injector_uses_portal().await
+    {
         return open_shared(&token_path, slot, close, abandon).await;
     }
     let granted = portal_session::start(scope, previous, Some(DIALOG_TIMEOUT), abandon)
@@ -288,6 +293,7 @@ async fn open_portal(
                 stream.position(),
                 if granted.token.is_some() { "with a" } else { "no" },
             );
+                crate::portal_monitor::publish(crate::portal_monitor::Monitor::of(stream));
                 let node = stream.pipe_wire_node_id();
                 granted
                     .open_pipewire_remote()
@@ -341,6 +347,7 @@ async fn open_shared(
                     stream.size(),
                     stream.position(),
                 );
+                crate::portal_monitor::publish(crate::portal_monitor::Monitor::of(stream));
                 let node = stream.pipe_wire_node_id();
                 granted
                     .open_pipewire_remote()
@@ -827,6 +834,31 @@ impl ScreenCapture for PortalCapture {
 mod tests {
     use super::*;
     use ashpd::desktop::ResponseError;
+
+    fn shared(dismissed: bool) -> OpenError {
+        OpenError::Shared(SharedError {
+            dismissed,
+            message: "why".into(),
+        })
+    }
+
+    #[test]
+    fn a_declined_shared_session_is_a_permission_error_and_never_retried() {
+        assert!(matches!(
+            open_error(&shared(true)),
+            CaptureError::PermissionDenied
+        ));
+        assert!(
+            !retryable(&shared(true)),
+            "retrying would show the dialog again"
+        );
+    }
+
+    #[test]
+    fn a_failed_shared_session_is_a_backend_error_and_retried() {
+        assert!(matches!(open_error(&shared(false)), CaptureError::Backend(m) if m == "why"));
+        assert!(retryable(&shared(false)));
+    }
 
     fn token(covers_input: bool) -> StoredToken {
         StoredToken {

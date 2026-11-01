@@ -183,6 +183,41 @@ pub(super) fn bounding_box(rects: &[Rect]) -> Option<Rect> {
     })
 }
 
+/// The EI region of the monitor the user shared, to stand in for a missing
+/// target: the region whose mapping id matches the ScreenCast stream's (the
+/// exact link, ScreenCast v5), else the region holding the stream's centre,
+/// else the first region. `None` only without regions.
+pub(super) fn pick_region(
+    regions: &[(Rect, Option<&str>)],
+    mapping_id: Option<&str>,
+    stream: Option<Rect>,
+) -> Option<Rect> {
+    let by_id = mapping_id.and_then(|id| regions.iter().find(|(_, m)| *m == Some(id)));
+    let by_place = || {
+        let s = stream?;
+        let (cx, cy) = centre(s);
+        regions.iter().find(|(r, _)| contains(*r, cx, cy))
+    };
+    by_id
+        .or_else(by_place)
+        .or_else(|| regions.first())
+        .map(|(r, _)| *r)
+}
+
+fn centre(r: Rect) -> (i64, i64) {
+    (
+        i64::from(r.x) + i64::from(r.w / 2),
+        i64::from(r.y) + i64::from(r.h / 2),
+    )
+}
+
+fn contains(r: Rect, x: i64, y: i64) -> bool {
+    x >= i64::from(r.x)
+        && x < i64::from(r.x) + i64::from(r.w)
+        && y >= i64::from(r.y)
+        && y < i64::from(r.y) + i64::from(r.h)
+}
+
 /// Where an absolute pointer whose valid area is `regions` (libei device
 /// regions, compositor logical pixels) should go. The target's centre picks the
 /// region so a point at the target's edge can never slip onto a neighbour; with
@@ -191,14 +226,8 @@ pub(super) fn bounding_box(rects: &[Rect]) -> Option<Rect> {
 /// compositor's outputs in order). `None` when the device has no regions.
 pub(super) fn region_position(regions: &[Rect], p: Point) -> Option<(f32, f32)> {
     let contains_centre = |t: Rect| {
-        let cx = i64::from(t.x) + i64::from(t.w / 2);
-        let cy = i64::from(t.y) + i64::from(t.h / 2);
-        move |r: &&Rect| {
-            cx >= i64::from(r.x)
-                && cx < i64::from(r.x) + i64::from(r.w)
-                && cy >= i64::from(r.y)
-                && cy < i64::from(r.y) + i64::from(r.h)
-        }
+        let (cx, cy) = centre(t);
+        move |r: &&Rect| contains(**r, cx, cy)
     };
     let (area, region) = match p.target {
         Some(t) => match regions.iter().find(contains_centre(t)) {
@@ -387,6 +416,36 @@ mod tests {
             bounding_box(&[rect(0, 0, 1920, 1080), rect(-1280, 200, 1280, 1024)]),
             Some(rect(-1280, 0, 3200, 1224))
         );
+    }
+
+    #[test]
+    fn the_shared_monitor_is_found_by_mapping_id_then_place_then_first() {
+        let left = rect(0, 0, 1920, 1080);
+        let right = rect(1920, 0, 2560, 1440);
+        let regions = [(left, Some("out-1")), (right, Some("out-2"))];
+        // The id wins even over a stream rect that points elsewhere.
+        assert_eq!(
+            pick_region(&regions, Some("out-2"), Some(left)),
+            Some(right)
+        );
+        // No id (ScreenCast < 5, or an EIS without mapping ids): the place.
+        assert_eq!(pick_region(&regions, None, Some(right)), Some(right));
+        assert_eq!(
+            pick_region(&regions, Some("gone"), Some(right)),
+            Some(right)
+        );
+        // Nothing known: the first region, as before.
+        assert_eq!(pick_region(&regions, None, None), Some(left));
+        let plain = [(left, None), (right, None)];
+        assert_eq!(pick_region(&plain, Some("out-2"), None), Some(left));
+        assert_eq!(pick_region(&[], Some("out-2"), Some(right)), None);
+        // The picked region then stands in for the missing target.
+        let p = on_primary(
+            at(0.0, 0.0, None),
+            pick_region(&regions, Some("out-2"), None),
+        );
+        let rects = [left, right];
+        assert_eq!(region_position(&rects, p), Some((1920.0, 0.0)));
     }
 
     #[test]

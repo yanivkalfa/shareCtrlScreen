@@ -281,6 +281,26 @@ fn wayland_order_is_wlroots_portal_uinput() {
 }
 
 #[test]
+fn the_capture_joins_the_shared_session_exactly_when_input_would_use_the_portal() {
+    let mut c = caps(SessionType::Wayland);
+    c.portal_remote_desktop = Some(2);
+    assert!(
+        portal_first(&c),
+        "GNOME/KDE: the portal is the injector's route"
+    );
+    c.wlr_virtual_input = true;
+    assert!(!portal_first(&c), "wlroots needs no portal session");
+    c.wlr_virtual_input = false;
+    c.portal_remote_desktop = Some(1);
+    assert!(!portal_first(&c), "no libei, no combined session for input");
+    c.uinput = UinputAccess::Writable;
+    assert!(
+        !portal_first(&c),
+        "uinput first: input never opens a portal session"
+    );
+}
+
+#[test]
 fn a_version_1_portal_is_not_a_route() {
     let mut c = caps(SessionType::Wayland);
     c.portal_remote_desktop = Some(1);
@@ -787,7 +807,7 @@ fn libei_sender_talks_to_an_eis_server() {
     let (client, server) = UnixStream::pair().unwrap();
     let (tx, rx) = mpsc::channel();
     let server = std::thread::spawn(move || eis_server(server, tx));
-    let (backend, client_thread) = libei::Libei::on_socket(client);
+    let (backend, client_thread) = libei::Libei::on_socket(client, None);
     let mut inj = LinuxInjector::new(Box::new(backend));
     inj.set_target_rect(Some(SCREEN));
 

@@ -43,6 +43,7 @@ pub use x11_connect::x11_connect;
 mod input;
 mod permissions;
 mod portal_capture;
+mod portal_monitor;
 mod portal_session;
 mod portal_shared;
 mod portal_token;

@@ -26,6 +26,8 @@
 //!   the most a client may send, and grouping unrelated events is not wanted;
 //! * absolute positions are logical pixels inside one of the device's
 //!   regions, else the event is silently discarded ([`mapping::region_position`]);
+//!   with no target, the region of the monitor the session shares stands in
+//!   ([`mapping::pick_region`]: the stream's mapping id, else its place);
 //! * `scroll_discrete` takes 1/120 detents, positive = down / right.
 
 use std::collections::BTreeSet;
@@ -47,6 +49,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use super::mapping::{self, Point, WheelSteps};
 use super::{Backend, DEVICE_NAME};
+use crate::portal_monitor::Monitor;
 use crate::portal_shared::{self, SharedSession};
 
 /// One validated event for the connection task.
@@ -84,13 +87,15 @@ impl Libei {
     }
 
     /// A backend on an already-connected EIS socket (tests use an in-process
-    /// EIS server; there is no portal).
+    /// EIS server; there is no portal). `monitor` stands for the granted
+    /// stream's monitor.
     #[cfg(test)]
     pub(super) fn on_socket(
         socket: UnixStream,
+        monitor: Option<Monitor>,
     ) -> (Self, std::thread::JoinHandle<Result<(), String>>) {
         let (tx, rx) = unbounded_channel();
-        let thread = spawn_client(socket, rx, ()).expect("the libei thread starts");
+        let thread = spawn_client(socket, rx, monitor, ()).expect("the libei thread starts");
         (Self { tx }, thread)
     }
 
@@ -139,7 +144,10 @@ impl Backend for Libei {
 async fn run_portal(session: Arc<SharedSession>, mut rx: UnboundedReceiver<Command>) {
     let connect = async {
         let granted = session.granted().await.map_err(|e| e.message.clone())?;
-        granted.connect_to_eis().await
+        // The monitor the user picked in this session's dialog: input with no
+        // target goes there, not to the compositor's first output.
+        let monitor = granted.streams.first().map(Monitor::of);
+        granted.connect_to_eis().await.map(|fd| (fd, monitor))
     };
     let fd = tokio::select! {
         fd = connect => fd,
@@ -148,8 +156,8 @@ async fn run_portal(session: Arc<SharedSession>, mut rx: UnboundedReceiver<Comma
         // abandons its dialog (see `portal_shared`).
         () = drain(&mut rx) => return,
     };
-    let started = fd.and_then(|fd| {
-        spawn_client(UnixStream::from(fd), rx, session)
+    let started = fd.and_then(|(fd, monitor)| {
+        spawn_client(UnixStream::from(fd), rx, monitor, session)
             .map_err(|e| ei_error("starting the libei thread", e))
     });
     if let Err(e) = started {
@@ -165,6 +173,7 @@ async fn run_portal(session: Arc<SharedSession>, mut rx: UnboundedReceiver<Comma
 fn spawn_client<K: Send + 'static>(
     socket: UnixStream,
     rx: UnboundedReceiver<Command>,
+    monitor: Option<Monitor>,
     keep_alive: K,
 ) -> io::Result<std::thread::JoinHandle<Result<(), String>>> {
     std::thread::Builder::new()
@@ -174,7 +183,7 @@ fn spawn_client<K: Send + 'static>(
                 .enable_io()
                 .build()
                 .map_err(|e| ei_error("starting the libei runtime", e))
-                .and_then(|rt| rt.block_on(run_ei(socket, rx)));
+                .and_then(|rt| rt.block_on(run_ei(socket, rx, monitor)));
             if let Err(e) = &result {
                 tracing::warn!("remote control (libei): {e}; remote input stops");
             }
@@ -194,7 +203,11 @@ fn ei_error(what: &str, e: impl std::fmt::Display) -> String {
 
 /// The EI client proper, on a connected socket. Ends `Ok` when the injector
 /// is dropped, `Err` when the compositor disconnects or breaks the protocol.
-async fn run_ei(socket: UnixStream, mut rx: UnboundedReceiver<Command>) -> Result<(), String> {
+async fn run_ei(
+    socket: UnixStream,
+    mut rx: UnboundedReceiver<Command>,
+    monitor: Option<Monitor>,
+) -> Result<(), String> {
     let context = ei::Context::new(socket).map_err(|e| ei_error("setting up the EI socket", e))?;
     // SAFETY: the clone shares the context's socket, which stays open while
     // any clone exists; the AsyncFd owns one, so its fd stays valid and the
@@ -221,7 +234,10 @@ async fn run_ei(socket: UnixStream, mut rx: UnboundedReceiver<Command>) -> Resul
         }
     };
     let mut converter = EiEventConverter::new(&context, resp);
-    let mut state = EiState::default();
+    let mut state = EiState {
+        monitor,
+        ..EiState::default()
+    };
 
     loop {
         // Events may already be buffered (sent right after the handshake), so
@@ -310,6 +326,8 @@ struct EiState {
     /// released (EI calls a release without a press a client bug).
     keys: BTreeSet<u32>,
     buttons: BTreeSet<u32>,
+    /// The monitor the session's stream shows; stands in for a missing target.
+    monitor: Option<Monitor>,
 }
 
 impl EiState {
@@ -392,10 +410,21 @@ impl EiState {
                 let Some(device) = self.emulating(DeviceCapability::PointerAbsolute) else {
                     return;
                 };
-                let regions: Vec<Rect> = device.regions().iter().filter_map(region_rect).collect();
+                let regions: Vec<(Rect, Option<&str>)> = device
+                    .regions()
+                    .iter()
+                    .filter_map(|r| Some((region_rect(r)?, r.mapping_id.as_deref())))
+                    .collect();
+                let shared = mapping::pick_region(
+                    &regions,
+                    self.monitor.as_ref().and_then(|m| m.mapping_id.as_deref()),
+                    self.monitor.as_ref().and_then(|m| m.rect),
+                );
+                let at = mapping::on_primary(at, shared);
+                let rects: Vec<Rect> = regions.iter().map(|(r, _)| *r).collect();
                 let (Some(pointer), Some((x, y))) = (
                     device.interface::<ei::PointerAbsolute>(),
-                    mapping::region_position(&regions, at),
+                    mapping::region_position(&rects, at),
                 ) else {
                     return;
                 };

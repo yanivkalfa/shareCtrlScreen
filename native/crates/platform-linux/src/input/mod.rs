@@ -206,6 +206,20 @@ fn probe(session: SessionType) -> Capabilities {
     caps
 }
 
+/// Whether a Wayland injector would inject through the RemoteDesktop portal
+/// (it is the first usable backend). The capture asks, so that it joins the
+/// shared combined session instead of racing the injector into a second
+/// dialog. Runs on the portal runtime.
+pub(crate) async fn injector_uses_portal() -> bool {
+    let mut caps = probe_local(SessionType::Wayland);
+    caps.portal_remote_desktop = crate::permissions::remote_desktop_version_async().await;
+    portal_first(&caps)
+}
+
+fn portal_first(caps: &Capabilities) -> bool {
+    select(caps).is_ok_and(|kinds| kinds.first() == Some(&BackendKind::Portal))
+}
+
 /// Everything but the portal, which the permissions report probes itself:
 /// local sockets and files only, so it is fast and never blocks on a peer.
 pub(crate) fn probe_local(session: SessionType) -> Capabilities {

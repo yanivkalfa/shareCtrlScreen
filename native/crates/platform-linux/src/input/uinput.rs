@@ -363,7 +363,10 @@ impl Uinput {
 
 impl Backend for Uinput {
     fn pointer(&mut self, at: Point) {
-        let at = mapping::on_primary(at, self.primary);
+        // On Wayland the shared monitor is the one picked in the portal dialog
+        // (published by the capture); without one, our own primary stand-in.
+        let shared = crate::portal_monitor::current().and_then(|m| m.rect);
+        let at = mapping::on_primary(at, shared.or(self.primary));
         let (fx, fy) = mapping::layout_fraction(at, self.layout);
         self.write(true, &motion_frame(abs_value(fx), abs_value(fy)));
     }

@@ -121,11 +121,17 @@ pub(crate) fn report(session: SessionType, state_dir: &Path) -> PermissionReport
 /// The RemoteDesktop interface version, `None` when the portal or the
 /// interface is missing. One bounded round trip.
 pub(crate) fn remote_desktop_version() -> Option<u32> {
-    match block_on(probe_portal(), PROBE_TIMEOUT)? {
-        Portal::Reachable {
+    block_on(remote_desktop_version_async(), PROBE_TIMEOUT).flatten()
+}
+
+/// [`remote_desktop_version`] for code already running on the portal runtime
+/// (where waiting on `block_on` would wait on itself).
+pub(crate) async fn remote_desktop_version_async() -> Option<u32> {
+    match tokio::time::timeout(PROBE_TIMEOUT, probe_portal()).await {
+        Ok(Portal::Reachable {
             remote_desktop: Interface::Present { version },
             ..
-        } => Some(version),
+        }) => Some(version),
         _ => None,
     }
 }

@@ -36,8 +36,11 @@ cargo build --workspace --release
 cargo test  --workspace          # all unit tests; runs on Windows, macOS and Linux
 ```
 
-On Linux the shortcut-hook tests start private `Xvfb` servers (`apt-get install xvfb`)
-and skip when it is missing.
+On Linux the X11 tests start private `Xvfb` servers (`apt-get install xvfb`) and skip
+when a tool is missing. The `x11-tests` job in `.github/workflows/native-ci.yml` runs them
+on ubuntu-22.04 with `SCT_X11_TESTS_REQUIRED=1`, so a skip fails there; `cargo test
+--workspace` on the same runner is the lenient run. Packages for the X11 tests:
+`xvfb xserver-xephyr x11-xserver-utils xterm xclip xdotool`.
 
 Two shippable binaries: `sharectrl.exe` (the Tauri app/engine) and
 `sharectrl-service.exe` (the SYSTEM service).

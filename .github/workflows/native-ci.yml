@@ -106,6 +106,60 @@ jobs:
             --skip encodes_300_frames_first_idr_mean_under_8ms \
             --skip holds_the_bitrate_within_15_percent_over_5_seconds
 
+  # The X11 tests with their skips turned into failures (plan task T3). Runs on
+  # ubuntu-22.04, the same image as build-test's Linux leg, the oldest supported
+  # Linux (decision 7). The job
+  # never starts a global Xvfb: each test starts its own private server through
+  # native/crates/platform-linux/tests/support/xserver.rs (Xvfb, and Xephyr for
+  # the resize test) on a display number of its own, reached over the Unix
+  # socket. Packages: `xvfb` and `xserver-xephyr` (Xvfb(1) and Xephyr(1) man
+  # pages; `-displayfd` is the readiness signal), `x11-xserver-utils` (xrandr),
+  # `xterm` (the moving window of the L2 damage test), `xclip` (clipboard
+  # tests), `xdotool` (L6's XTest check reads window names with it; no current
+  # test calls it yet).
+  # build-test's Linux leg runs the same tests WITHOUT SCT_X11_TESTS_REQUIRED,
+  # so a tool it lacks is a printed skip there; this job is the one that forbids
+  # skips.
+  x11-tests:
+    runs-on: ubuntu-22.04
+    env:
+      # Any skip in the X11 tests becomes a panic (support/xserver.rs skip()).
+      SCT_X11_TESTS_REQUIRED: "1"
+      # Software GL for the wgpu presenter in x11_surface: Mesa llvmpipe through
+      # LIBGL_ALWAYS_SOFTWARE, because GitHub's Linux runners have no GPU.
+      # x11_surface also sets it itself.
+      LIBGL_ALWAYS_SOFTWARE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      # The Linux build dependencies of build-test (same list, kept in step),
+      # plus the X11 test packages. The 22.04 runner image already ships xvfb
+      # (runner-images Ubuntu2204-Readme: xvfb 2:21.1.4-2ubuntu1.7~22.04.16);
+      # naming it here keeps the job independent of the image's contents.
+      # xserver-xephyr: packages.ubuntu.com, jammy, 2:21.1.4-2ubuntu1.7~22.04.16.
+      - name: Linux build and X11 test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev libdbus-1-dev libgtk-3-dev \
+            libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev \
+            libpipewire-0.3-dev libspa-0.2-dev libclang-dev \
+            mesa-vulkan-drivers \
+            xvfb xserver-xephyr x11-xserver-utils xterm xclip xdotool
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+      # Each step uses --nocapture so the harness's "private Xvfb on :N" and
+      # "skipping:" lines reach the log.
+      - name: X11 capture (L2: Xvfb, Xephyr for the resize test)
+        run: cargo test -p platform-linux --test x11_capture -- --nocapture
+      - name: X11 video surface (L5: Xvfb, software GL, GL pass re-run)
+        run: cargo test -p platform-linux --test x11_surface -- --nocapture
+      - name: Clipboard (L8: private Xvfb, xclip)
+        run: cargo test -p platform-linux --lib clipboard::tests -- --nocapture
+      - name: Shortcut hook (L7: private Xvfb, XI2 grab, XTEST keys)
+        run: cargo test -p platform-linux --lib shortcuts::xvfb_tests -- --nocapture
+
   release-build:
     # The optimized Windows build the dev/test pipelines ship.
     runs-on: windows-latest

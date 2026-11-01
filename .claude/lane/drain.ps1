@@ -3,6 +3,7 @@
 # Reaps workers that died without writing a result. Started by lane-up.ps1.
 $ErrorActionPreference = 'Continue'
 $Lane = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Root = Split-Path -Parent (Split-Path -Parent $Lane)   # the repository checkout
 $Queue = Join-Path $Lane 'queue'
 $Running = Join-Path $Lane 'running'
 $Done = Join-Path $Lane 'done'
@@ -63,7 +64,9 @@ while ($true) {
         $inFlight = @(Get-ChildItem -LiteralPath $Running -Filter '*.request' -ErrorAction SilentlyContinue).Count
         $max = Slots
         if ($inFlight -lt $max) {
-            $waiting = @(Get-ChildItem -LiteralPath $Queue -Filter '*.request' -ErrorAction SilentlyContinue |
+            # Builders write into their worktree's copy of this folder; scan those too.
+            $queueDirs = @($Queue) + @(Get-ChildItem -Path (Join-Path $Root '.claude\worktrees\*\.claude\lane\queue') -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+            $waiting = @(Get-ChildItem -Path $queueDirs -Filter '*.request' -ErrorAction SilentlyContinue |
                 Where-Object { ((Get-Date) - $_.LastWriteTime).TotalSeconds -ge 2 } |   # let the writer finish
                 Sort-Object @{Expression = { Priority $_ } }, LastWriteTime)
             foreach ($req in $waiting) {

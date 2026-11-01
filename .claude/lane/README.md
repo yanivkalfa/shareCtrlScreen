@@ -16,6 +16,7 @@ agents' shell refuses raw `cargo`.
   seed-cache.sh      hard-links the warm base caches into a task worktree (Windows + WSL)
   slots              optional: a single number overriding the 5-slot default (read every tick)
   queue/             <task>-<nn>.request  — waiting
+                     (the drain also scans every worktree's .claude/lane/queue/)
   running/           claimed requests (+ <name>.pid of the worker)
   done/              <name>.request + <name>.result — finished
   logs/              lane.log, drain.pid, <name>.step<i>.log (full output of every step)

@@ -1,0 +1,46 @@
+[package]
+name = "platform-windows"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# Windows implementation of `platform-api`. Empty on other targets.
+[target.'cfg(windows)'.dependencies]
+platform-api = { path = "../platform-api" }
+protocol = { path = "../protocol" }
+capture = { path = "../capture" }
+codec = { path = "../codec" }
+codec-openh264 = { path = "../codec-openh264" }
+render = { path = "../render" }
+input = { path = "../input" }
+elevation = { path = "../elevation" }
+tracing.workspace = true
+dirs = "6"
+
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Security_Cryptography",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Registry",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+]
+
+[target.'cfg(windows)'.dev-dependencies]
+tracing-subscriber.workspace = true
+# The golden streams, decoder matrix and encoder shape check (task I5).
+codec-goldens = { path = "../codec-goldens" }

@@ -14,7 +14,7 @@ pub mod keyhook;
 pub mod scancode;
 
 pub use protocol::{Button, InputMsg};
-pub use scancode::ScanCode;
+pub use scancode::Set1;
 
 /// Sentinel written to `dwExtraInfo` on every injected event so our own
 /// low-level keyboard hook can filter it out (prevents feedback loops), exactly
@@ -35,6 +35,7 @@ pub struct TargetRect {
 #[cfg(windows)]
 mod imp {
     use super::*;
+    use platform_api::keymap::{from_dom, KeyId};
     use std::collections::HashSet;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
@@ -52,7 +53,7 @@ mod imp {
     /// exactly as the old single-module design did.
     #[derive(Default)]
     pub struct Injector {
-        down_keys: HashSet<String>,
+        down_keys: HashSet<KeyId>,
         down_buttons: HashSet<u8>,
         target: Option<TargetRect>,
     }
@@ -175,23 +176,28 @@ mod imp {
             }
         }
 
-        /// Scan-code injection keeps this layout-independent. Unknown codes are
-        /// silently ignored.
+        /// Scan-code injection keeps this layout-independent. Unknown and
+        /// unsupported codes are silently ignored, as the wire contract says.
         pub fn key(&mut self, code: &str, is_down: bool) {
-            let Some(hit) = scancode::lookup(code) else {
+            let Some(key) = from_dom(code) else {
                 return;
             };
+            let Some(hit) = key.to_set1() else {
+                return;
+            };
+            // Tracked by key, not by string: release_all then needs no second
+            // lookup that could disagree with the one that pressed the key.
             if is_down {
-                self.down_keys.insert(code.to_string());
+                self.down_keys.insert(key);
             } else {
-                self.down_keys.remove(code);
+                self.down_keys.remove(&key);
             }
             self.emit_scancode(hit, is_down);
         }
 
-        fn emit_scancode(&self, hit: ScanCode, is_down: bool) {
+        fn emit_scancode(&self, hit: Set1, is_down: bool) {
             let mut flags: KEYBD_EVENT_FLAGS = KEYEVENTF_SCANCODE;
-            if hit.ext {
+            if hit.extended {
                 flags |= KEYEVENTF_EXTENDEDKEY;
             }
             if !is_down {
@@ -202,7 +208,7 @@ mod imp {
                 Anonymous: INPUT_0 {
                     ki: KEYBDINPUT {
                         wVk: VIRTUAL_KEY(0),
-                        wScan: hit.sc,
+                        wScan: u16::from(hit.code),
                         dwFlags: flags,
                         time: 0,
                         dwExtraInfo: INJECT_SENTINEL,
@@ -215,8 +221,8 @@ mod imp {
         /// Release every key/button currently held (session end or control→view
         /// drop). Button-ups are sent without a preceding move — cursor stays put.
         pub fn release_all(&mut self) {
-            for code in self.down_keys.drain().collect::<Vec<_>>() {
-                if let Some(hit) = scancode::lookup(&code) {
+            for key in self.down_keys.drain().collect::<Vec<_>>() {
+                if let Some(hit) = key.to_set1() {
                     self.emit_scancode(hit, false);
                 }
             }

@@ -166,6 +166,32 @@ function renderRecents() {
   row.appendChild(clear);
 }
 
+// ---- platform wording + displays -------------------------------------------
+// The OS facts the UI words itself around (see `get_platform_info`). The HTML
+// ships neutral defaults, so a failed call leaves a correct, if generic, page.
+async function applyPlatformInfo() {
+  let info;
+  try {
+    info = await invoke('get_platform_info');
+  } catch (_) {
+    return;
+  }
+  $('start-at-login-label').textContent = info.startAtLoginLabel;
+  $('shortcut-capture-hint').textContent = info.shortcutCaptureHint;
+  $('downloads-path').textContent = info.downloadsDir;
+  $('login-screen-note').classList.toggle('hidden', info.loginScreenSupported);
+
+  // Keep the first entry ("Primary monitor", empty id) and list the rest.
+  const select = $('set-share-display');
+  while (select.options.length > 1) select.remove(1);
+  for (const d of info.displays) {
+    const o = document.createElement('option');
+    o.value = d.id;
+    o.textContent = `${d.name} (${d.width}×${d.height})${d.primary ? ' – primary' : ''}`;
+    select.appendChild(o);
+  }
+}
+
 // ---- settings modal --------------------------------------------------------
 function openSettings() {
   $('set-server').value = config.serverUrl;
@@ -181,6 +207,9 @@ function openSettings() {
   $('set-clipboard-sync').checked = config.clipboardSync !== false;
   $('set-paste-dropped').checked = config.pasteDroppedFiles !== false;
   $('set-start-with-windows').checked = !!config.startWithWindows;
+  $('set-openh264').checked = config.useOpenH264 !== false;
+  $('openh264-license').classList.add('hidden');
+  refreshOpenH264();
   const saved = config.savedLoginCount || 0;
   const clear = $('set-clear-logins');
   clear.checked = false;
@@ -210,6 +239,7 @@ async function saveSettings() {
     clipboardSync: $('set-clipboard-sync').checked,
     pasteDroppedFiles: $('set-paste-dropped').checked,
     startWithWindows: $('set-start-with-windows').checked,
+    useOpenH264: $('set-openh264').checked,
     clearSavedLogins: $('set-clear-logins').checked
   };
 
@@ -232,7 +262,212 @@ async function saveSettings() {
   await reloadConfig();
 }
 
+// ---- permissions modal -----------------------------------------------------
+// What each OS permission is for, in words that hold on every OS. Order is the
+// order shown.
+const PERMISSIONS = [
+  {
+    key: 'screenCapture',
+    title: 'Screen recording',
+    desc: 'Lets this computer share its screen with someone who connects.'
+  },
+  {
+    key: 'inputInjection',
+    title: 'Remote control',
+    desc: 'Lets a connected person move the mouse and type on this computer.'
+  },
+  {
+    key: 'inputMonitoring',
+    title: 'Keyboard shortcuts',
+    desc: 'Lets shortcuts you press while controlling another computer reach it.'
+  }
+];
+
+const PERM_POLL_MS = 2000;
+let permPoll = null;
+// Each automatic prompt is shown at most once per run: a user who closed the
+// modal on purpose should not be nagged on every later connection.
+let hostPreflightDone = false;
+let viewerPreflightDone = false;
+
+const permNeedsGrant = (s) => s === 'denied' || s === 'notDetermined';
+
+function renderPermissions(report) {
+  const list = $('perm-list');
+  list.innerHTML = '';
+  let listed = 0;
+  for (const p of PERMISSIONS) {
+    const st = report[p.key];
+    // This OS has no such permission (e.g. everything on Windows) — say nothing.
+    if (st === 'notApplicable') continue;
+    listed += 1;
+
+    const row = document.createElement('li');
+    row.className = 'perm-row';
+
+    const text = document.createElement('div');
+    text.className = 'perm-text';
+    const title = document.createElement('div');
+    title.className = 'perm-title';
+    title.textContent = p.title;
+    const desc = document.createElement('div');
+    desc.className = 'perm-desc';
+    desc.textContent = p.desc;
+    text.append(title, desc);
+
+    const badge = document.createElement('span');
+    const granted = st === 'granted';
+    badge.className = 'badge ' + (granted ? 'badge-granted' : st === 'denied' ? 'badge-denied' : 'badge-pending');
+    badge.textContent = granted ? 'GRANTED' : st === 'denied' ? 'DENIED' : 'NOT ASKED';
+
+    row.append(text, badge);
+    if (!granted) {
+      const grant = document.createElement('button');
+      grant.type = 'button';
+      grant.className = 'btn btn-sm';
+      grant.textContent = 'Grant';
+      grant.addEventListener('click', () => grantPermission(p.key));
+      row.appendChild(grant);
+    }
+    list.appendChild(row);
+  }
+  $('perm-none').classList.toggle('hidden', listed !== 0);
+
+  const notes = $('perm-notes');
+  notes.innerHTML = '';
+  for (const n of report.notes || []) {
+    const li = document.createElement('li');
+    li.textContent = n;
+    notes.appendChild(li);
+  }
+}
+
+function stopPermPoll() {
+  if (permPoll) clearInterval(permPoll);
+  permPoll = null;
+}
+
+// Refresh the rows; stop polling once nothing is left to grant, so an idle
+// modal does not keep asking the OS.
+async function refreshPermissions() {
+  let report;
+  try {
+    report = await invoke('get_permissions');
+  } catch (_) {
+    return null;
+  }
+  // The modal may have been closed while the call was in flight.
+  if ($('modal-permissions').classList.contains('hidden')) return null;
+  renderPermissions(report);
+  if (!PERMISSIONS.some((p) => permNeedsGrant(report[p.key]))) stopPermPoll();
+  return report;
+}
+
+function startPermPoll() {
+  stopPermPoll();
+  permPoll = setInterval(refreshPermissions, PERM_POLL_MS);
+}
+
+async function grantPermission(key) {
+  try {
+    await invoke('request_permission', { name: key });
+  } catch (err) {
+    toast(String((err && err.message) || err), 'error');
+    return;
+  }
+  // The user answers in an OS dialog or settings pane; watch for the result.
+  startPermPoll();
+  refreshPermissions();
+}
+
+async function openPermissions(intro) {
+  // Same ordering rule as Settings: the native video must be down before the
+  // modal paints, or the modal appears underneath it.
+  if (state === 'VIEW_ACTIVE') {
+    try {
+      await invoke('set_video_visible', { visible: false });
+    } catch (_) {
+      /* fall through — the dialog is still better than nothing */
+    }
+  }
+  let report;
+  try {
+    report = await invoke('get_permissions');
+  } catch (err) {
+    toast(String((err && err.message) || err), 'error');
+    if (state === 'VIEW_ACTIVE' && $('modal-settings').classList.contains('hidden')) {
+      invoke('set_video_visible', { visible: true }).catch(() => {});
+    }
+    return;
+  }
+  $('perm-intro').textContent = intro || '';
+  renderPermissions(report);
+  $('modal-permissions').classList.remove('hidden');
+  if (PERMISSIONS.some((p) => permNeedsGrant(report[p.key]))) startPermPoll();
+}
+
+function closePermissions() {
+  stopPermPoll();
+  $('modal-permissions').classList.add('hidden');
+  // Settings (if it is what opened us) restores the video when it closes.
+  if (state === 'VIEW_ACTIVE' && $('modal-settings').classList.contains('hidden')) {
+    invoke('set_video_visible', { visible: true }).catch(() => {});
+  }
+}
+
+// Show the modal on its own when `keys` still need granting. Returns whether it
+// was shown, so a caller can hold back the action the permission is for.
+async function preflight(keys, intro) {
+  let report;
+  try {
+    report = await invoke('get_permissions');
+  } catch (_) {
+    return false;
+  }
+  if (!keys.some((k) => permNeedsGrant(report[k]))) return false;
+  await openPermissions(intro);
+  return true;
+}
+
+// Settings → Advanced: the Cisco OpenH264 software codec. The notice and the
+// licence text come from the backend (Cisco's licence requires both to be
+// shown where the user controls the codec).
+async function refreshOpenH264() {
+  try {
+    const info = await invoke('openh264_info');
+    $('openh264-notice').textContent = info.notice;
+    $('openh264-license').textContent = info.license;
+    // The "no H.264 at all" warning leads: it is the one line the user must act on.
+    $('openh264-status').textContent = info.problem ? `${info.problem} ${info.status}` : info.status;
+    $('btn-openh264-download').disabled = !!info.ready;
+  } catch (err) {
+    $('openh264-status').textContent = String((err && err.message) || err);
+  }
+}
+
+$('btn-openh264-download').addEventListener('click', async () => {
+  const btn = $('btn-openh264-download');
+  if (!$('set-openh264').checked) {
+    toast('Turn on "Use Cisco OpenH264" and save first.', 'error');
+    return;
+  }
+  btn.disabled = true;
+  $('openh264-status').textContent = 'Downloading from Cisco…';
+  try {
+    await invoke('openh264_download');
+  } catch (err) {
+    toast(String((err && err.message) || err), 'error');
+  }
+  await refreshOpenH264();
+});
+
+$('btn-openh264-license').addEventListener('click', () => {
+  $('openh264-license').classList.toggle('hidden');
+});
+
 // ---- wiring ----------------------------------------------------------------
+$('btn-settings-permissions').addEventListener('click', () => openPermissions(''));
+$('btn-permissions-close').addEventListener('click', closePermissions);
 $('btn-settings').addEventListener('click', openSettings);
 $('btn-settings-cancel').addEventListener('click', closeSettings);
 $('btn-settings-save').addEventListener('click', saveSettings);
@@ -269,9 +504,18 @@ $('remote-id').addEventListener('input', () => {
   render();
 });
 
-$('btn-connect').addEventListener('click', () => {
+$('btn-connect').addEventListener('click', async () => {
   const id = $('remote-id').value.trim();
   if (!validUuid(id)) return;
+  // Input monitoring only matters for the optional shortcut capture, so a plain
+  // connection is never held up by it. When capture is on, sort the grant out
+  // once before connecting; the user presses Connect again.
+  if (config && config.captureShortcuts && !viewerPreflightDone) {
+    viewerPreflightDone = true;
+    const intro =
+      'Shortcut capture is on in Settings; it needs this permission to forward shortcuts to the other computer.';
+    if (await preflight(['inputMonitoring'], intro)) return;
+  }
   $('requesting-peer').textContent = id;
   setState('REQUESTING');
   stopCountdown();
@@ -430,6 +674,7 @@ listen('link-restored', () => {
 // ---- boot ------------------------------------------------------------------
 (async () => {
   await reloadConfig();
+  await applyPlatformInfo();
   render();
   // Back-fill the server status: the engine registers ~0.5 s after launch and
   // emits a one-shot 'server-status' event that can fire before this WebView
@@ -444,5 +689,14 @@ listen('link-restored', () => {
     }
   } catch (_) {
     /* command unavailable (older engine) — the event path still covers it */
+  }
+  // Before the first host session: sharing the screen needs the OS grant, and
+  // a connection arriving later is better met with it already in place.
+  if (!hostPreflightDone) {
+    hostPreflightDone = true;
+    await preflight(
+      ['screenCapture', 'inputInjection'],
+      'Grant these so others can see and control this computer when you let them in.'
+    );
   }
 })();

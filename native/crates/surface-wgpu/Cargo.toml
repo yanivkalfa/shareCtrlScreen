@@ -1,0 +1,33 @@
+[package]
+name = "surface-wgpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# Shared by the wgpu presenters (platform-macos: Metal, platform-linux: Vulkan/GL).
+# No GPU backend is enabled here: each platform crate turns on its own, so this
+# crate never drags a backend onto an OS that does not use it.
+[dependencies]
+platform-api = { path = "../platform-api" }
+wgpu = { version = "30", default-features = false, features = ["std", "wgsl"] }
+
+[dev-dependencies]
+pollster = "0.4"
+naga = { version = "30", features = ["wgsl-in"] }
+
+# The headless GPU tests need one real backend per test OS. GitHub's Windows
+# runners provide WARP through DX12, macOS runners Metal, and the Linux runner
+# gets Mesa's lavapipe (software Vulkan) in CI.
+[target.'cfg(windows)'.dev-dependencies]
+wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "dx12"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "metal"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "vulkan"] }

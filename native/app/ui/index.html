@@ -228,13 +228,15 @@
           <legend>This machine</legend>
           <label class="radio">
             <input type="checkbox" id="set-start-with-windows" />
-            Start ShareCtrlScreen when I sign in to Windows
+            <span id="start-at-login-label">Start at sign-in</span>
           </label>
           <div class="hint">
-            Starts minimized, so this machine is reachable after a restart
-            without anyone opening the app. This runs at <b>sign-in</b>, not at
-            boot &mdash; a machine that has restarted but not been signed into
-            cannot be reached.
+            Starts minimized, so this machine is reachable after you sign in
+            without anyone opening the app.
+          </div>
+          <div id="login-screen-note" class="hint hidden">
+            After a restart, someone must sign in on this machine before you
+            can connect to it.
           </div>
         </fieldset>
 
@@ -257,11 +259,11 @@
           <div class="hint">
             Drag files onto the remote screen to send them. With this on, the
             file is pasted straight into whatever you dropped it on (a chat, an
-            email, a folder) &mdash; Windows has no way to fake a true drop, so
-            it goes via the clipboard as a file, exactly as if you had copied it
+            email, a folder) &mdash; no operating system lets an app fake a true
+            drop, so it goes via the clipboard as a file, exactly as if you had copied it
             there. With it off the file is just placed on the remote clipboard
             for you to paste yourself. Either way a copy is saved to
-            <b>Downloads\ShareCtrlScreen</b>.
+            <b id="downloads-path">your Downloads folder</b>.
           </div>
         </fieldset>
 
@@ -272,7 +274,7 @@
             Log in automatically with a saved password
           </label>
           <div class="hint">
-            Saved passwords are encrypted for this Windows account. A saved
+            Saved passwords are encrypted for your user account on this computer. A saved
             password is only kept after it has actually worked.
           </div>
           <label class="radio">
@@ -281,11 +283,7 @@
           </label>
         </fieldset>
 
-        <div class="hint">
-          While a session window is focused, Alt+Tab and the Win key act on the
-          remote machine automatically; click any other window to get them back.
-          Ctrl+Alt+Del can't be captured (Windows security).
-        </div>
+        <div id="shortcut-capture-hint" class="hint"></div>
 
         <label class="field">
           <span>Monitor to share (when hosting)</span>
@@ -294,9 +292,46 @@
           </select>
         </label>
 
+        <fieldset class="field">
+          <legend>Advanced</legend>
+          <label class="radio">
+            <input type="checkbox" id="set-openh264" />
+            Use Cisco OpenH264 (downloaded separately)
+          </label>
+          <div class="hint">
+            <b id="openh264-notice"></b><br />
+            A software video codec, used only when this computer has no hardware
+            H.264 codec. It is downloaded from Cisco the first time it is needed
+            and never ships with ShareCtrlScreen.
+            <span id="openh264-status"></span>
+          </div>
+          <div class="row">
+            <button id="btn-openh264-download" type="button" class="btn btn-sm">Download now</button>
+            <button id="btn-openh264-license" type="button" class="btn btn-ghost btn-sm">Cisco licence</button>
+          </div>
+          <pre id="openh264-license" class="hint mono licence-text hidden"></pre>
+        </fieldset>
+
         <div class="modal-actions">
+          <button id="btn-settings-permissions" class="btn btn-leading">Permissions&hellip;</button>
           <button id="btn-settings-cancel" class="btn">Cancel</button>
           <button id="btn-settings-save" class="btn btn-primary">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- PERMISSIONS — OS grants the app needs (screen recording, remote control,
+         shortcut capture). Rows are filled in by app.js from get_permissions;
+         a permission this OS does not have is simply not listed. -->
+    <div id="modal-permissions" class="modal hidden">
+      <div class="modal-box modal-wide">
+        <h3>Permissions</h3>
+        <p id="perm-intro" class="hint"></p>
+        <ul id="perm-list" class="perm-list"></ul>
+        <p id="perm-none" class="hint hidden">Nothing to grant on this system.</p>
+        <ul id="perm-notes" class="perm-notes"></ul>
+        <div class="modal-actions">
+          <button id="btn-permissions-close" class="btn btn-primary">Close</button>
         </div>
       </div>
     </div>

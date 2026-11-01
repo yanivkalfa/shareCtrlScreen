@@ -1,0 +1,5 @@
+*.sh text eol=lf
+*.plist text eol=lf
+*.yml text eol=lf
+*.h264 binary
+*.hevc binary

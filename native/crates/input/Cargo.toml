@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 protocol = { path = "../protocol" }
+platform-api = { path = "../platform-api" }
 tracing.workspace = true
 parking_lot.workspace = true
 

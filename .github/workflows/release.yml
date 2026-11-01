@@ -1,122 +1,281 @@
+# Release: build ShareCtrlScreen for Windows, macOS and Linux and publish a GitHub Release.
+#
+# Cutting a release
+#   1. Set `version` under [workspace.package] in native/Cargo.toml (the only copy of the
+#      version; tauri.conf.json has none, so Tauri takes it from Cargo). Commit.
+#   2. Push the tag `v<version>`, e.g. `git tag v2.1.0 && git push origin v2.1.0`.
+#   The run checks the tag against `cargo metadata`, runs the licence gate, builds every
+#   OS, writes SHA256SUMS.txt and publishes the release. A version with a pre-release
+#   part (2.1.0-rc.1) becomes a GitHub pre-release.
+#
+# Dry run: Actions -> Release -> Run workflow, `dry_run` ticked (the default). Builds and
+#   uploads every asset plus SHA256SUMS.txt as run artifacts and publishes nothing. To
+#   (re)publish an existing tag by hand, run it from that tag with `dry_run` unticked.
+#
+# Assets (all from native/scripts/release-assets.sh, via build-assets.yml)
+#   ShareCtrlScreen_<v>_x64-setup.exe     Windows NSIS installer (unsigned; SmartScreen)
+#   sharectrl-service.exe                 Windows SYSTEM service (UAC / lock screen)
+#   ShareCtrlScreen_<v>_universal.dmg     macOS 13+, arm64 + x86_64 (self-signed)
+#   ShareCtrlScreen_<v>_amd64.AppImage    Linux, any distro with glibc >= 2.35
+#   ShareCtrlScreen_<v>_amd64.deb         Debian 12+ / Ubuntu 22.04+
+#   ShareCtrlScreen-<v>-1.x86_64.rpm      Fedora 40+
+#   THIRD-PARTY-LICENSES-<os>.html        notices for the crates in that OS's build
+#                                          (also inside each installer)
+#   SHA256SUMS.txt                        `sha256sum -c SHA256SUMS.txt`
+#
+# macOS signing: the repository secrets MAC_SIGN_P12_B64 / MAC_SIGN_P12_PASS hold the
+# self-signed certificate (plans/00-DECISIONS.md #9; native/scripts/macos-make-signing-cert.sh).
+# Set -> the DMG's app must carry a certificate signature or the run fails. Absent (a
+# fork) -> ad-hoc signature, a warning annotation, and a line in the release notes.
+#
+# References
+#   - Events (push tags filter, workflow_dispatch inputs):
+#     https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows
+#   - Concurrency (groups, cancel-in-progress, one pending run per group):
+#     https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs
+#   - GITHUB_TOKEN permissions (workflow and job level):
+#     https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/controlling-permissions-for-github_token
+#   - Security hardening (SHA pinning, untrusted input via env, not inline):
+#     https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions
+#   - Reusable workflows: https://docs.github.com/en/actions/sharing-automations/reusing-workflows
+#   - actions/download-artifact v8 (pattern, merge-multiple):
+#     https://github.com/actions/download-artifact#inputs
+#   - gh release create (--verify-tag, --prerelease, --latest, --notes-file):
+#     https://cli.github.com/manual/gh_release_create
+#   - cargo metadata: https://doc.rust-lang.org/cargo/commands/cargo-metadata.html
+#   - cargo-deny `check` (targets from deny.toml [graph]): https://embarkstudios.github.io/cargo-deny/cli/check.html
+#   - cargo-about `generate --target`: https://embarkstudios.github.io/cargo-about/cli/generate/index.html
+#   - Tauri v2 distribution (NSIS, macOS app/DMG, AppImage, deb, rpm):
+#     https://v2.tauri.app/distribute/ and CLI `build`: https://v2.tauri.app/reference/cli/#build
 name: Release
 
-# Idempotent, version-driven release of the NATIVE Rust app (Plan 04 §10).
-#
-# The single source of truth is `version` under [workspace.package] in
-# native/Cargo.toml. Clicking "Run workflow" (Actions -> Release -> Run workflow):
-#   1. reads that version, e.g. 2.0.0 -> tag "v2.0.0"
-#   2. if a GitHub Release with that tag already exists  -> skips (no-op)
-#   3. otherwise builds the Tauri app (NSIS installer) + the SYSTEM service and
-#      publishes both to a new GitHub Release tagged v<version>.
-#
-# Unsigned build (§8b/§11.4): SmartScreen warns on first install (More info ->
-# Run anyway). No certificate, no codec licence, no cloud bill.
-#
-# To cut a release: bump `version` in native/Cargo.toml, commit, push, run.
 on:
+  push:
+    tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and upload artifacts only; publish nothing
+        type: boolean
+        default: true
 
-permissions:
-  contents: write
+# Two runs for the same ref queue instead of racing, and a release in flight is never
+# cancelled. Publishing across different tags is serialized by the publish job's own group.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Nothing by default; every job asks for what it needs.
+permissions: {}
+
+env:
+  CARGO_DENY_VERSION: "0.20.2"
 
 jobs:
-  # Cheap Linux job: figure out the version and whether it's already released.
-  check:
-    runs-on: ubuntu-latest
+  meta:
+    name: Version and mode
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
     outputs:
-      version: ${{ steps.v.outputs.version }}
-      exists: ${{ steps.exists.outputs.exists }}
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      publish: ${{ steps.meta.outputs.publish }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Read version from native/Cargo.toml
-        id: v
-        shell: bash
-        run: |
-          version=$(grep -m1 '^version' native/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "::notice::native version = $version"
-
-      - name: Check whether release v<version> already exists
-        id: exists
+      # `cargo metadata --no-deps` needs only cargo (preinstalled on the runner) and no
+      # network. The tag must name exactly this version: a release whose binaries say
+      # 2.0.0 under a v2.0.1 tag is worse than no release.
+      - name: Read the version and decide whether to publish
+        id: meta
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          tag="v${{ steps.v.outputs.version }}"
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::Release $tag already exists — skipping build & publish."
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::No release $tag yet — will build & publish."
+          publish=false
+          if [ "$EVENT" = push ] || [ "$DRY_RUN" = false ]; then
+            publish=true
           fi
+          if [ "$REF_TYPE" = tag ]; then
+            version="$(native/scripts/release-version.sh --expect-tag "$REF_NAME")"
+            tag="$REF_NAME"
+          else
+            if [ "$publish" = true ]; then
+              echo "::error::Publishing needs a tag. Push v<version>, or run this workflow from the tag (Use workflow from -> Tags)."
+              exit 1
+            fi
+            version="$(native/scripts/release-version.sh)"
+            tag="v$version"
+          fi
+          case "$version" in *-*) prerelease=true ;; *) prerelease=false ;; esac
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "publish=$publish"
+            echo "prerelease=$prerelease"
+          } >>"$GITHUB_OUTPUT"
+          echo "::notice::ShareCtrlScreen $version, tag $tag, publish=$publish, prerelease=$prerelease"
 
-  # Windows build job: runs ONLY when the release does not already exist.
-  build-release:
-    needs: check
-    if: needs.check.outputs.exists == 'false'
-    # MUST be Windows: DXGI/Media Foundation/WebView2 app + NSIS installer.
-    runs-on: windows-latest
-    defaults:
-      run:
-        working-directory: native
-
+  licenses:
+    name: Licence gate (cargo deny)
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          workspaces: native
-
-      # cargo-deny is a release gate too (§11): never ship a copyleft/banned dep.
-      - uses: taiki-e/install-action@v2
+          persist-credentials: false
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
-          tool: cargo-deny
-      - name: License gate (cargo-deny)
-        run: cargo deny check
+          tool: cargo-deny@${{ env.CARGO_DENY_VERSION }}
+          # Only the checksum-verified prebuilt; never a silent source build.
+          fallback: none
+      # deny.toml [graph].targets lists the Windows, both macOS and the Linux triples,
+      # so one run on one OS vets every shipped dependency graph. --locked: the gate
+      # checks the exact Cargo.lock the builds use.
+      - name: cargo deny check
+        working-directory: native
+        run: cargo deny --locked check
 
-      - name: Install Tauri CLI
-        run: cargo install tauri-cli --version "^2.0" --locked
+  windows:
+    needs: meta
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-assets.yml
+    with:
+      platform: windows
+      artifact-name: release-windows
 
-      # Build the SYSTEM service binary (sharectrl-service.exe).
-      - name: Build service
-        run: cargo build -p service --release
+  macos:
+    needs: meta
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-assets.yml
+    with:
+      platform: macos
+      artifact-name: release-macos
+    # Named, not `inherit`: the called workflow sees these two secrets and no others.
+    secrets:
+      MAC_SIGN_P12_B64: ${{ secrets.MAC_SIGN_P12_B64 }}
+      MAC_SIGN_P12_PASS: ${{ secrets.MAC_SIGN_P12_PASS }}
 
-      # Build the Tauri app + NSIS installer (config lives in native/app).
-      - name: Build app + installer
-        working-directory: native/app
-        run: cargo tauri build --bundles nsis
+  linux:
+    needs: meta
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-assets.yml
+    with:
+      platform: linux
+      artifact-name: release-linux
 
-      # gh creates the tag v<version>, the release, and uploads the installer +
-      # the service exe in one shot — atomic, no race, no draft.
-      - name: Publish GitHub release with assets
-        shell: bash
+  # Gathers every OS's assets and writes SHA256SUMS.txt. Runs on dry runs too, so the
+  # checksum step is exercised before a real release needs it.
+  checksums:
+    needs: [meta, licenses, windows, macos, linux]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Check that every build reports the tagged version
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WANT: ${{ needs.meta.outputs.version }}
+          WIN: ${{ needs.windows.outputs.version }}
+          MAC: ${{ needs.macos.outputs.version }}
+          LNX: ${{ needs.linux.outputs.version }}
         run: |
-          tag="v${{ needs.check.outputs.version }}"
-          shopt -s nullglob
-          installers=(target/release/bundle/nsis/*-setup.exe)
-          service=(target/release/sharectrl-service.exe)
-          files=("${installers[@]}" "${service[@]}")
-          if [ ${#installers[@]} -eq 0 ]; then
-            echo "No NSIS installer produced in native/target/release/bundle/nsis."
+          for got in "$WIN" "$MAC" "$LNX"; do
+            if [ "$got" != "$WANT" ]; then
+              echo "::error::a build reports version '$got', expected '$WANT'"
+              exit 1
+            fi
+          done
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: native/scripts
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: assets
+      - name: SHA256SUMS.txt
+        run: native/scripts/release-assets.sh checksums assets
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-checksums
+          path: assets/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: [meta, macos, checksums]
+    if: needs.meta.outputs.publish == 'true'
+    runs-on: ubuntu-22.04
+    # The only job that can write: it creates the release and uploads the assets.
+    permissions:
+      contents: write
+    # One publisher at a time across all tags, so two releases cannot race for "latest".
+    # (GitHub keeps one pending run per group; a third queued tag would replace the
+    # second's pending publish, which is then re-run from its tag with dry_run off.)
+    concurrency:
+      group: release-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: assets
+
+      # Re-verify after the second download: what is published is what was summed.
+      - name: Verify checksums
+        working-directory: assets
+        run: sha256sum -c SHA256SUMS.txt
+
+      - name: Release notes
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          MAC_SIGNING: ${{ needs.macos.outputs.mac-signing }}
+        run: |
+          if [ "$MAC_SIGNING" = certificate ]; then
+            mac_line="The macOS app is signed with the project's self-signed certificate, so Screen Recording and Accessibility stay granted across updates."
+          else
+            mac_line="**The macOS app in this release is ad-hoc signed** (the signing certificate was not configured): macOS treats every update as a new app and asks for Screen Recording and Accessibility again."
+          fi
+          cat >notes.md <<EOF
+          ShareCtrlScreen $VERSION
+
+          - **Windows:** \`ShareCtrlScreen_${VERSION}_x64-setup.exe\`. Not code-signed: SmartScreen warns on the first install (More info -> Run anyway). For UAC prompts and the lock screen, install the service once as administrator: \`sharectrl-service.exe --install-service\`.
+          - **macOS 13+ (Apple Silicon and Intel):** \`ShareCtrlScreen_${VERSION}_universal.dmg\`. Not notarized: the first launch needs System Settings -> Privacy & Security -> Open Anyway. $mac_line
+          - **Linux (x86_64):** \`.deb\` (Ubuntu 22.04+, Debian 12+), \`.rpm\` (Fedora 40+) or \`.AppImage\`.
+
+          First-run steps for each system: docs/FIRST-RUN.md. Third-party licences: \`THIRD-PARTY-LICENSES-<os>.html\`. Verify downloads with \`sha256sum -c SHA256SUMS.txt\`.
+          EOF
+
+      # --verify-tag: never let gh create the tag; the release is for the commit that
+      # was tagged and built. With assets, gh creates a draft, uploads, then publishes,
+      # so a failed upload leaves a draft rather than a half-filled public release.
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.meta.outputs.tag }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release $TAG already exists. Delete it (and re-run) or release a new version."
             exit 1
           fi
-          echo "Releasing $tag with: ${files[*]}"
-          gh release create "$tag" "${files[@]}" \
+          if [ "$PRERELEASE" = true ]; then kind=--prerelease; else kind=--latest; fi
+          gh release create "$TAG" assets/* \
             --repo "$GITHUB_REPOSITORY" \
-            --title "ShareCtrlScreen v${{ needs.check.outputs.version }}" \
-            --notes "Native Rust build: Tauri app installer + SYSTEM service. Unsigned — SmartScreen will warn (More info -> Run anyway). Install the service (admin, once) for UAC/lock/secure-desktop control: \`sharectrl-service.exe --install-service\`." \
-            --latest
-
-      - name: Upload build artifacts (fallback download)
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: ShareCtrlScreen-v${{ needs.check.outputs.version }}
-          path: |
-            native/target/release/bundle/nsis/*-setup.exe
-            native/target/release/sharectrl-service.exe
-          if-no-files-found: warn
+            --verify-tag \
+            --title "ShareCtrlScreen $VERSION" \
+            --notes-file notes.md \
+            "$kind"

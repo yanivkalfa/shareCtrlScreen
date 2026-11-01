@@ -37,4 +37,15 @@ Thumbs.db
 # Native Rust rewrite build artifacts
 native/target/
 native/third-party-licenses.html
+# Third-party notices generated per OS by native/scripts/release-assets.sh. Never
+# committed: a checked-in copy goes stale with every Cargo.lock change.
+native/app/THIRD-PARTY-LICENSES.html
 native/app/gen/schemas/
+
+# Cisco's OpenH264 binary must reach users only as a separate download from
+# Cisco (licence condition 1, plan 04 §5) — never commit a copy.
+*openh264*.dll
+*openh264*.so
+*openh264*.so.*
+*openh264*.dylib
+*openh264*.bz2

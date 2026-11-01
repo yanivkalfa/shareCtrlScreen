@@ -1,0 +1,48 @@
+name: Build macOS DMG
+
+# Builds the universal (arm64 + x86_64) ShareCtrlScreen.app, signs it with the
+# project's self-signed certificate and packs it into a DMG you can hand to a
+# tester. Actions -> "Build macOS DMG" -> Run workflow, or any push to
+# port/multi-os that touches the native app. Download the DMG from the run's
+# "Artifacts" section.
+#
+# Signing: with the repository secrets MAC_SIGN_P12_B64 / MAC_SIGN_P12_PASS the
+# app is signed with that certificate, so macOS keeps Screen Recording and
+# Accessibility grants across updates. Without them the app is signed ad-hoc and
+# every build is a new app to macOS (development only). Create the secrets with
+# native/scripts/macos-make-signing-cert.sh.
+#
+# The steps are those of a release, not a copy of them: this calls build-assets.yml,
+# which runs native/scripts/release-assets.sh, exactly as release.yml does. Only the
+# trigger and the artifact name differ.
+#
+# References
+#   - Reusable workflows: https://docs.github.com/en/actions/sharing-automations/reusing-workflows
+#   - Tauri v2 macOS bundle: https://v2.tauri.app/distribute/macos-application-bundle/
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [port/multi-os]
+    paths:
+      - "native/**"
+      - ".github/workflows/mac-build.yml"
+      - ".github/workflows/build-assets.yml"
+
+# A newer run on the same ref supersedes an in-flight one.
+concurrency:
+  group: mac-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-assets.yml
+    with:
+      platform: macos
+      artifact-name: ShareCtrlScreen-macos-universal
+    secrets:
+      MAC_SIGN_P12_B64: ${{ secrets.MAC_SIGN_P12_B64 }}
+      MAC_SIGN_P12_PASS: ${{ secrets.MAC_SIGN_P12_PASS }}

@@ -1,8 +1,9 @@
-# CI for the native Rust rewrite (Plan 04 §10). Build + test + the license gate.
-# `cargo-deny` enforces the §11 allowlist / banned-crate list — the one piece
-# that actually keeps the product proprietary + legal (no AGPL/GPL crate can slip
-# in). The `third-party-licenses.html` page (cargo-about) is a docs artifact, not
-# a gate, so it's generated on demand, not in CI. Runs on Windows (the only target).
+# CI for the native Rust app: format, lint, build and test on every shipped OS,
+# plus the license gate. `cargo-deny` enforces the allowlist / banned-crate list
+# for every target triple (see native/deny.toml) — the piece that keeps the
+# product proprietary and legal. The loopback test runs a full two-engine session
+# over real WebRTC with mock OS backends, so it needs no GPU, display or
+# permissions on the runners.
 name: native-ci
 
 on:
@@ -10,10 +11,12 @@ on:
     paths:
       - "native/**"
       - ".github/workflows/native-ci.yml"
+      - ".github/wayland/**"
   pull_request:
     paths:
       - "native/**"
       - ".github/workflows/native-ci.yml"
+      - ".github/wayland/**"
 
 defaults:
   run:
@@ -21,9 +24,51 @@ defaults:
 
 jobs:
   build-test:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-22.04: the oldest supported Linux (glibc 2.35, WebKitGTK 4.1).
+        os: [windows-latest, macos-latest, ubuntu-22.04]
+        # Cross-codec matrix (task I5, crates/codec-goldens): the codec
+        # backends each runner is known to have, so their golden-stream and
+        # encoder-shape tests fail instead of skipping when absent
+        # (SCT_CODEC_TESTS_REQUIRED, comma list of backend names).
+        # * windows-latest: OpenH264 (Cisco download; runners have network).
+        #   The Media Foundation rows (MF H.264 decoder, MF encoder shape)
+        #   skip when the MFTs are absent and run (and must pass) when
+        #   present; they are not required yet because no run has proven the
+        #   runner image has Microsoft's H.264 MFTs (Windows Server ships them
+        #   only with the Media Foundation feature). On a GPU-less runner they
+        #   use a WARP D3D11 device, a path machine A (which has a GPU) never
+        #   exercised; the first pushed run checks it. Once a run's log shows
+        #   `matrix: media-foundation × … PASS`, make this
+        #   `openh264,media-foundation` (plans/checklists/I5.md).
+        # * ubuntu-22.04: OpenH264. No GPU, so NVENC/NVDEC print SKIP and the
+        #   VA-API decode is device-only (#[ignore]); the device-free VA-API
+        #   planner still runs every H.264 golden.
+        # * macos-latest: none here; the VideoToolbox step below (task T2)
+        #   has its own strict-mode switch.
+        include:
+          - os: windows-latest
+            codec_required: openh264
+          - os: ubuntu-22.04
+            codec_required: openh264
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # mesa-vulkan-drivers: lavapipe (software Vulkan) for the headless
+      # presenter-shader tests in surface-wgpu; the runner has no GPU.
+      # libpipewire-0.3-dev / libspa-0.2-dev / libclang-dev: the Wayland capture's
+      # pipewire-rs bindings (bindgen needs libclang).
+      - name: Linux build dependencies (Tauri / WebKitGTK, PipeWire, software Vulkan)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev libdbus-1-dev libgtk-3-dev \
+            libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev \
+            libpipewire-0.3-dev libspa-0.2-dev libclang-dev \
+            mesa-vulkan-drivers
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -32,20 +77,301 @@ jobs:
           workspaces: native
       - name: Format check
         run: cargo fmt --all --check
-      - name: Build
-        run: cargo build --workspace --release
-      - name: Test
-        run: cargo test --workspace
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        env:
+          SCT_CODEC_TESTS_REQUIRED: ${{ matrix.codec_required }}
+        run: cargo test --workspace
+      # VideoToolbox hardware tests (plan task T2). Each test probes first and
+      # skips when VideoToolbox has no hardware for it; a skip is a printed line
+      # and a workflow warning annotation, not a pass. Whether a hosted macOS
+      # runner has the hardware is unproven until a run shows it: GitHub's arm64
+      # macOS images run inside Apple's Virtualization framework, and nothing in
+      # the runner-images docs promises a hardware VideoToolbox there (the README
+      # only says `macos-latest` = macOS 26 arm64). So the strict mode
+      # (SCT_MAC_HW_TESTS_REQUIRED) is opt-in through a repository variable, not
+      # set here: enable it after a run proves the hardware is present. The two
+      # timing tests are device-only (a loaded shared runner cannot hold a
+      # wall-clock budget) and skipped by name here. The golden-stream test
+      # checks VideoToolbox's output against FFmpeg's per-frame hashes
+      # (native/testdata/golden/README.md). --nocapture keeps the printed dB /
+      # frame lines in the log.
+      - name: VideoToolbox hardware tests (macOS)
+        if: runner.os == 'macOS'
+        env:
+          SCT_MAC_HW_TESTS_REQUIRED: ${{ vars.SCT_MAC_HW_TESTS_REQUIRED }}
+        run: |
+          cargo test -p platform-macos --lib vt_encoder::tests -- --ignored --nocapture
+          cargo test -p platform-macos --lib decode:: -- --ignored --nocapture
+          cargo test -p platform-macos --test vt_encode -- --ignored --nocapture --test-threads=1 \
+            --skip encodes_300_frames_first_idr_mean_under_8ms \
+            --skip holds_the_bitrate_within_15_percent_over_5_seconds
+
+  # The X11 tests with their skips turned into failures (plan task T3). Runs on
+  # ubuntu-22.04, the same image as build-test's Linux leg, the oldest supported
+  # Linux (decision 7). The job
+  # never starts a global Xvfb: each test starts its own private server through
+  # native/crates/platform-linux/tests/support/xserver.rs (Xvfb, and Xephyr for
+  # the resize test) on a display number of its own, reached over the Unix
+  # socket. Packages: `xvfb` and `xserver-xephyr` (Xvfb(1) and Xephyr(1) man
+  # pages; `-displayfd` is the readiness signal), `x11-xserver-utils` (xrandr),
+  # `xterm` (the moving window of the L2 damage test), `xclip` (clipboard
+  # tests), `xdotool` (installed because the T3 spec names it; no test calls it
+  # yet). `libegl-mesa0` and `libgl1-mesa-dri` are the EGL and GL drivers the
+  # x11_surface GL child needs under LIBGL_ALWAYS_SOFTWARE (llvmpipe): the
+  # mesa-vulkan-drivers line below does not provide them.
+  # build-test's Linux leg runs the same tests WITHOUT SCT_X11_TESTS_REQUIRED,
+  # so a tool it lacks is a printed skip there; this job is the one that forbids
+  # skips.
+  x11-tests:
+    runs-on: ubuntu-22.04
+    env:
+      # Any skip in the X11 tests becomes a panic (support/xserver.rs skip()).
+      SCT_X11_TESTS_REQUIRED: "1"
+      # Uinput read-back (L6) and the input peers it needs: a missing /dev/uinput,
+      # evdev node or sway becomes a panic (src/input/tests.rs skip_input()).
+      SCT_LINUX_INPUT_TESTS_REQUIRED: "1"
+      # Software GL for the wgpu presenter in x11_surface: Mesa llvmpipe through
+      # LIBGL_ALWAYS_SOFTWARE, because GitHub's Linux runners have no GPU.
+      # x11_surface also sets it itself.
+      LIBGL_ALWAYS_SOFTWARE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      # The Linux build dependencies of build-test (same list, kept in step),
+      # plus the X11 test packages. The 22.04 runner image already ships xvfb
+      # (runner-images Ubuntu2204-Readme: xvfb 2:21.1.4-2ubuntu1.7~22.04.16);
+      # naming it here keeps the job independent of the image's contents.
+      # xserver-xephyr: packages.ubuntu.com, jammy, 2:21.1.4-2ubuntu1.7~22.04.16.
+      - name: Linux build and X11 test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev libdbus-1-dev libgtk-3-dev \
+            libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev \
+            libpipewire-0.3-dev libspa-0.2-dev libclang-dev \
+            mesa-vulkan-drivers libegl-mesa0 libgl1-mesa-dri \
+            xvfb xserver-xephyr x11-xserver-utils xterm xclip xdotool acl
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+      # Each step uses --nocapture so the harness's "private Xvfb on :N" and
+      # "skipping:" lines reach the log.
+      - name: X11 capture (L2: Xvfb, Xephyr for the resize test)
+        run: cargo test -p platform-linux --test x11_capture -- --nocapture
+      - name: X11 video surface (L5: Xvfb, software GL, GL pass re-run)
+        run: cargo test -p platform-linux --test x11_surface -- --nocapture
+      - name: Clipboard (L8: private Xvfb, xclip)
+        run: cargo test -p platform-linux --lib clipboard::tests -- --nocapture
+      - name: Shortcut hook (L7: private Xvfb, XI2 grab, XTEST keys)
+        run: cargo test -p platform-linux --lib shortcuts::xvfb_tests -- --nocapture
+      # L6 (plan 05): the XTest injector against a private Xvfb, then the uinput
+      # read-back. Two filters, not `input::tests`: that module also holds the
+      # libei test (T4's EIS peer) and the wlroots test (needs sway, which this
+      # job does not install); with SCT_LINUX_INPUT_TESTS_REQUIRED=1 the wlroots
+      # test would fail here by design. The pure front-end tests run in
+      # build-test's workspace leg.
+      #
+      # uinput needs /dev/uinput writable and the /dev/input/event* nodes the test
+      # creates readable by the runner user. Group membership is not used: a
+      # `usermod -aG input` run inside the job does not reach the job's already
+      # started steps without a new login, so it would not be in effect. Instead:
+      # - modprobe uinput loads the module, which creates /dev/uinput (the L6
+      #   note says the runner kernel has evdev and uinput);
+      # - setfacl grants the runner user rw on /dev/uinput (acl package above);
+      # - a udev rule (udev(7): KERNEL and MODE keys) gives the event nodes
+      #   mode 0666 when the test creates them. The test waits up to 5 s for
+      #   each node (eventually() in input/tests.rs), which covers udev's
+      #   asynchronous processing.
+      # The runner is a throwaway VM (GitHub-hosted runner reference: passwordless
+      # sudo, a new VM per runner), so the permissive mode does not outlive the job.
+      # The cargo steps run as the runner user, not under `sudo -E`: cargo as root
+      # leaves root-owned files in target/ and the cargo registry, which breaks
+      # rust-cache's save and every later step that runs as the runner user.
+      # Settle runs before setfacl, so no later udev chmod can rewrite the ACL
+      # mask (a chmod on the node clears the named entry's rw). The rule shape
+      # follows the recipe in games-on-whales/wolf PR #554 (modprobe plus a udev
+      # 0666 rule). The last two lines print the result.
+      - name: uinput access for the runner user (L6 read-back)
+        run: |
+          sudo modprobe uinput
+          printf '%s\n' 'KERNEL=="uinput", MODE="0666"' 'KERNEL=="event*", SUBSYSTEM=="input", MODE="0666"' | sudo tee /etc/udev/rules.d/90-sharectrl-ci-input.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --subsystem-match=input
+          sudo udevadm trigger --subsystem-match=misc --sysname-match=uinput
+          sudo udevadm settle
+          sudo setfacl -m "u:$(id -un):rw" /dev/uinput
+          ls -l /dev/uinput
+          getfacl /dev/uinput
+      - name: XTest injector (L6: private Xvfb)
+        run: cargo test -p platform-linux --lib input::tests::xtest -- --nocapture
+      - name: uinput read-back through evdev (L6)
+        run: cargo test -p platform-linux --lib input::tests::uinput -- --nocapture
+
+  # ---------------------------------------------------------------------------
+  # Wayland jobs (plan task T4). NEW AND NEVER RUN: this branch is not pushed
+  # yet, so neither job has a green run on record. They run the Wayland tests
+  # that cannot run on a plain Linux runner: L1's real portal ScreenCast +
+  # PipeWire capture (tests/portal_capture.rs, ignored) and L5's Wayland video
+  # surface (tests/wayland_surface.rs, which starts its own headless sway), and
+  # L6's wlroots and in-process EIS input tests (src/input/tests.rs; the GNOME
+  # libei test is not run in CI, see wayland-gnome), in a private D-Bus session
+  # (`dbus-run-session`) per job. The session scripts
+  # live in .github/wayland/ and document each setting they use.
+  #
+  # Runner choice: ubuntu-24.04 for both. Its archive carries sway 1.9 and
+  # xdg-desktop-portal-wlr 0.7 (the wlr ScreenCast restore-token path needs a
+  # recent wlr), and it is the only Ubuntu LTS with GNOME 46 (mutter 46 with
+  # RemoteDesktop ConnectToEIS, which job (b) needs; ubuntu-22.04 has GNOME 42
+  # and no libei). The shipped Linux floor stays ubuntu-22.04 (build-test); this
+  # is a test-runner choice only. Runner image: actions/runner-images
+  # ubuntu-24.04 README (apt sources are Ubuntu noble).
+  #
+  # Who runs which input test (L6, src/input/tests.rs): wayland-sway runs the
+  # wlroots and EIS tests and filters out uinput_frames_reach_evdev and the
+  # xtest_* tests; T3's x11-tests job runs uinput (sudo, modprobe uinput) and
+  # the xtest_* tests (Xvfb). wayland-gnome runs no input or capture tests: the
+  # libei portal test and portal_capture need an answered consent dialog on
+  # GNOME, which a headless run cannot give (see .github/wayland/gnome-session.sh).
+  wayland-sway:
+    # sway --unsupported-gpu with WLR_BACKENDS=headless WLR_RENDERER=pixman
+    # (sway(5) and the sway wiki's headless notes). The portal stack is
+    # xdg-desktop-portal + xdg-desktop-portal-wlr (portals.conf selects wlr for
+    # ScreenCast; wlr's `[screencast] output_name=HEADLESS-1 chooser_type=none`
+    # skips the chooser). XDG_CURRENT_DESKTOP=sway is exported to the bus.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # A missing sway, pipewire or portal fails the job instead of skipping.
+      SCT_WAYLAND_TESTS_REQUIRED: "1"
+      SCT_LINUX_INPUT_TESTS_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux build and Wayland test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev libdbus-1-dev libgtk-3-dev \
+            libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev \
+            libpipewire-0.3-dev libspa-0.2-dev libclang-dev \
+            mesa-vulkan-drivers
+          # The compositor and its portal stack (all in noble's main archive):
+          #   sway: the headless compositor; weston: weston-simple-shm, the
+          #   animated client the screencast needs (portal_capture waits for
+          #   motion); pipewire, pipewire-bin (pw-cli), wireplumber: the
+          #   PipeWire graph; xdg-desktop-portal + xdg-desktop-portal-wlr: the
+          #   portal frontend and the wlr backend; dbus (dbus-run-session),
+          #   dbus-bin (dbus-update-activation-environment on 24.04),
+          #   dbus-user-session. busctl comes from systemd, which the runner
+          #   image already has; pw-cli comes from pipewire-bin.
+          sudo apt-get install -y --no-install-recommends \
+            sway weston pipewire pipewire-bin wireplumber \
+            xdg-desktop-portal xdg-desktop-portal-wlr \
+            dbus dbus-bin dbus-user-session
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+      - name: Wayland session and tests (sway, portal stack)
+        # dbus-run-session gives the script a private session bus. The script
+        # starts sway, PipeWire, WirePlumber and both portals, then runs
+        # wayland_surface (L5), portal_capture (L1, ignored, real portal), and
+        # input::tests (L6: the wlroots and in-process EIS tests; the uinput and
+        # xtest_* tests are filtered out, see the comment in sway-session.sh).
+        run: dbus-run-session -- bash "$GITHUB_WORKSPACE/.github/wayland/sway-session.sh"
+      - name: Upload Wayland logs (failure)
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wayland-sway-logs
+          path: ${{ runner.temp }}/wayland-logs
+          if-no-files-found: warn
+      - name: Print Wayland logs (failure)
+        if: failure()
+        run: |
+          for f in "$RUNNER_TEMP"/wayland-logs/*.log; do
+            echo "::group::$(basename "$f")"
+            tail -n 200 "$f" || true
+            echo "::endgroup::"
+          done
+
+  wayland-gnome:
+    # mutter --headless --virtual-monitor 1920x1080 --wayland --no-x11 with
+    # xdg-desktop-portal-gnome (mutter 46 exposes org.gnome.Mutter.ScreenCast
+    # and org.gnome.Mutter.RemoteDesktop on the bus, which the GNOME portal
+    # backend drives). XDG_CURRENT_DESKTOP=GNOME. Mutter's --headless and
+    # --virtual-monitor flags: `mutter --help` (GNOME 46) and
+    # https://gitlab.gnome.org/GNOME/mutter.
+    #
+    # THE GAP: this job proves the stack comes up (mutter's ScreenCast and
+    # RemoteDesktop services on the bus, the RemoteDesktop portal and the GNOME
+    # backend registered) and runs no test. The libei test (L6, portal_libei) and
+    # the L1 portal capture need the RemoteDesktop/ScreenCast consent dialog
+    # answered. The portal gives no headless pre-authorization, and the tests do
+    # not reuse a seeded token, so running them here would be a fake pass.
+    # portal_libei also asserts nothing about the pointer. Making them run
+    # headlessly is a follow-up test-harness task; until then they are
+    # device-pass items (checklists/L6.md, checklists/L1.md).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux build and GNOME test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev libdbus-1-dev libgtk-3-dev \
+            libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev \
+            libpipewire-0.3-dev libspa-0.2-dev libclang-dev \
+            mesa-vulkan-drivers
+          # mutter (the headless compositor), xdg-desktop-portal-gnome (the
+          # RemoteDesktop/ScreenCast backend), pipewire + pipewire-bin +
+          # wireplumber, the portal frontend, and dbus. libegl-mesa0 and
+          # libgl1-mesa-dri are listed explicitly: --no-install-recommends would
+          # otherwise leave mutter without its EGL and DRI software renderer.
+          sudo apt-get install -y --no-install-recommends \
+            mutter xdg-desktop-portal xdg-desktop-portal-gnome \
+            pipewire pipewire-bin wireplumber \
+            dbus dbus-bin dbus-user-session \
+            libegl-mesa0 libgl1-mesa-dri
+      - name: GNOME session and portal stack
+        run: dbus-run-session -- bash "$GITHUB_WORKSPACE/.github/wayland/gnome-session.sh"
+      - name: Upload GNOME logs (failure)
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wayland-gnome-logs
+          path: ${{ runner.temp }}/wayland-logs
+          if-no-files-found: warn
+      - name: Print GNOME logs (failure)
+        if: failure()
+        run: |
+          for f in "$RUNNER_TEMP"/wayland-logs/*.log; do
+            echo "::group::$(basename "$f")"
+            tail -n 200 "$f" || true
+            echo "::endgroup::"
+          done
+
+  release-build:
+    # The optimized Windows build the dev/test pipelines ship.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+      - name: Build (release)
+        run: cargo build --workspace --release
 
   license-gate:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       # Prebuilt binary — no 8-minute source compile.
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
-      - name: cargo-deny (license + banned-crate enforcement, §11)
+      - name: cargo-deny (license + banned-crate enforcement, all targets)
         run: cargo deny check

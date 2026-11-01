@@ -5,22 +5,31 @@
 resolver = "2"
 members = [
     "crates/protocol",
+    "crates/platform-api",
+    "crates/platform-windows",
+    "crates/platform-macos",
+    "crates/platform-linux",
+    "crates/surface-wgpu",
     "crates/capture",
     "crates/codec",
+    "crates/codec-openh264",
+    "crates/codec-goldens",
     "crates/transport",
     "crates/signaling",
     "crates/input",
     "crates/render",
     "crates/elevation",
     "crates/engine",
+    "tools/gen-keymap",
     "app",
+    "tools/smoketest",
     "service",
 ]
 
 [workspace.package]
 version = "2.0.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.88"
 license = "Proprietary"
 publish = false
 authors = ["ShareCtrlScreen"]

@@ -2,7 +2,14 @@
 # Run: `cargo deny check` (gate in CI, §10). Keeps the product proprietary + legal.
 
 [graph]
-targets = [{ triple = "x86_64-pc-windows-msvc" }]
+# Every shipped target: a dependency that exists only on one OS must still be
+# vetted, or the gate would silently pass it.
+targets = [
+    { triple = "x86_64-pc-windows-msvc" },
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "x86_64-unknown-linux-gnu" },
+]
 all-features = true
 
 [advisories]
@@ -53,6 +60,11 @@ deny = [
     { crate = "x264", reason = "GPL — §11.1" },
     { crate = "x265", reason = "GPL — §11.1" },
     { crate = "rivet-codec", reason = "non-standard unverified license — §11.1" },
+    # Cisco's patent coverage requires its OpenH264 binary to be downloaded by
+    # the user, never compiled in (plan 04 §5). `nasm-rs` is the build tool of
+    # `openh264-sys2`'s `source` feature, so its presence means the codec is
+    # being built into the product.
+    { crate = "nasm-rs", reason = "OpenH264 `source` feature: the codec must be Cisco's downloaded binary — 04 §5" },
 ]
 
 [sources]

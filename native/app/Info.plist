@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Merged into the generated Info.plist by the Tauri bundler, which picks up
+  native/app/Info.plist next to tauri.conf.json (tauri-cli 2.11,
+  interface/rust.rs). The bundler already writes CFBundleIdentifier,
+  CFBundleName, CFBundleVersion, NSHighResolutionCapable and
+  LSMinimumSystemVersion (from bundle.macOS.minimumSystemVersion); only the
+  privacy strings live here. LSUIElement is deliberately absent: the app has a
+  Dock icon and a window.
+-->
+<plist version="1.0">
+<dict>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>ShareCtrlScreen captures this Mac's screen so the person you approve can see it.</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>ShareCtrlScreen may ask other apps to cooperate when remote input is applied to them.</string>
+</dict>
+</plist>

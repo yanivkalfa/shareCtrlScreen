@@ -1,0 +1,27 @@
+[package]
+name = "smoketest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# Developer tool, never shipped. It enables the `mock` feature of `platform-api`
+# so `--mock` runs anywhere (and in CI); the shipped app does not.
+[dependencies]
+platform-api = { path = "../../crates/platform-api", features = ["mock"] }
+codec-openh264 = { path = "../../crates/codec-openh264" }
+tracing-subscriber.workspace = true
+
+# The same per-OS selection as `app/Cargo.toml` and its `make_platform()`.
+[target.'cfg(windows)'.dependencies]
+platform-windows = { path = "../../crates/platform-windows" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+platform-macos = { path = "../../crates/platform-macos" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+platform-linux = { path = "../../crates/platform-linux" }

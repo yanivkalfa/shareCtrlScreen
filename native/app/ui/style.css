@@ -91,6 +91,8 @@ html, body {
 .row label { color: var(--muted); min-width: 84px; }
 
 .hint { color: var(--muted); font-size: 12px; margin-top: 10px; }
+/* Cisco's licence text: long paragraphs, so wrap and scroll inside the modal. */
+.licence-text { white-space: pre-wrap; max-height: 180px; overflow: auto; font-size: 11px; }
 
 /* recent-connections chips */
 .recents { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-top: 12px; }
@@ -210,6 +212,28 @@ html, body {
 .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px; }
 .modal-actions-stack { flex-direction: column; }
 .modal-actions-stack .btn { width: 100%; }
+
+/* Pushes a secondary action to the left edge of a right-aligned button row. */
+.btn-leading { margin-right: auto; }
+
+/* ---------- permissions modal ---------- */
+.perm-list, .perm-notes { list-style: none; margin: 14px 0 0; padding: 0; }
+.perm-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 0;
+  border-top: 1px solid var(--line);
+}
+.perm-row:first-child { border-top: none; }
+.perm-text { flex: 1; min-width: 0; }
+.perm-title { font-weight: 600; }
+.perm-desc { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.perm-row .badge { min-width: 78px; text-align: center; }
+.badge-granted { background: #1f5c38; color: #8ff0b5; }
+.badge-denied { background: #4a2429; color: #ffc2bd; }
+.badge-pending { background: #4a3d1c; color: #f0d58a; }
+.perm-notes li { color: var(--muted); font-size: 12px; margin-top: 8px; }
 
 .field { display: block; margin-top: 16px; }
 .field > span, .field > legend { display: block; color: var(--muted); font-size: 12px; margin-bottom: 6px; }

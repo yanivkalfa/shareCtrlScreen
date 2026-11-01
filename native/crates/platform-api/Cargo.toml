@@ -1,0 +1,24 @@
+[package]
+name = "platform-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# In-memory backends for every trait: deterministic capture, a fake codec,
+# recording surface/injector/clipboard. Used by unit tests in every crate and by
+# the loopback harness (plan task D1). Never enabled in shipped builds.
+mock = []
+
+[dependencies]
+protocol = { path = "../protocol" }
+thiserror.workspace = true
+raw-window-handle = "0.6"
+
+[dev-dependencies]
+platform-api = { path = ".", features = ["mock"] }

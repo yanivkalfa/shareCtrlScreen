@@ -1,0 +1,3 @@
+# The scripts run under bash (also from a Windows checkout through WSL), which
+# rejects CRLF line endings.
+*.sh text eol=lf

@@ -1,0 +1,36 @@
+# Builds the Linux bundles (AppImage, deb, rpm) on ubuntu-22.04 — the oldest
+# supported distro (glibc 2.35, WebKitGTK 4.1) — and uploads them as artifacts,
+# so the install checklist (plans/checklists/L11.md) can run on real VMs.
+#
+# The steps are those of a release, not a copy of them: this calls build-assets.yml,
+# which runs native/scripts/release-assets.sh, exactly as release.yml does. Only the
+# trigger and the artifact name differ.
+#
+# References
+#   - Reusable workflows: https://docs.github.com/en/actions/sharing-automations/reusing-workflows
+#   - Tauri v2 Linux bundles: https://v2.tauri.app/distribute/
+name: linux-build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [port/multi-os]
+    paths:
+      - "native/**"
+      - ".github/workflows/linux-build.yml"
+      - ".github/workflows/build-assets.yml"
+
+# A newer run on the same ref supersedes an in-flight one.
+concurrency:
+  group: linux-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    uses: ./.github/workflows/build-assets.yml
+    with:
+      platform: linux
+      artifact-name: sharectrl-linux

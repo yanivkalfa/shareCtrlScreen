@@ -1,0 +1,134 @@
+[package]
+name = "platform-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Hardware encoders (task L3) and decoders (task L4). All are loaded with
+# dlopen at run time — nothing is linked and no SDK or headers are needed to
+# build — so enabling them never stops the app starting on a machine without
+# the libraries: the probe simply reports them absent.
+default = ["vaapi", "nvenc", "nvdec"]
+# Intel / AMD (any VA-API driver), H.264 encode and decode: libva.so.2 +
+# libva-drm.so.2.
+vaapi = []
+# NVIDIA encode: libnvidia-encode.so.1 + libcuda.so.1 from the proprietary driver.
+nvenc = []
+# NVIDIA decode (H.264, HEVC, AV1 where the GPU has it): libnvcuvid.so.1 +
+# libcuda.so.1 from the proprietary driver.
+nvdec = []
+
+# Linux implementation of `platform-api` (plan lane L). Empty on other targets.
+[target.'cfg(target_os = "linux")'.dependencies]
+platform-api = { path = "../platform-api" }
+codec-openh264 = { path = "../codec-openh264" }
+tracing.workspace = true
+dirs = "6"
+# Secret Service (org.freedesktop.secrets) for saved passwords. The store is built
+# per call rather than through the keyring crate's v1 layer, which caches its first
+# initialisation result for the process (see src/secret.rs). Pure Rust over zbus,
+# so no libdbus-1-dev is needed at build time.
+keyring-core = "1"
+zbus-secret-service-keyring-store = { version = "1", features = ["rt-async-io-crypto-rust"] }
+uuid.workspace = true
+# Portal D-Bus client. No `pipewire` feature: it pins an older pipewire-rs than the
+# capture task (L1) uses and the permission flow only needs the D-Bus half.
+ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "screencast", "remote_desktop"] }
+tokio = { workspace = true }
+# The portal session's `Closed` signal is a `Stream` (already a workspace crate).
+futures-util.workspace = true
+# MIT. The capture's PipeWire stream (L1). Links libpipewire-0.3 (the deb/rpm already
+# depend on it); building needs libpipewire-0.3-dev, libspa-0.2-dev and libclang-dev
+# (bindgen). No version feature: nothing newer than Ubuntu 22.04's 0.3.48 is used.
+pipewire = "0.10.1"
+# ISC. dlopen/dlsym: the permissions preflight's libva probe and the VA-API /
+# NVENC / NVDEC / CUDA runtime bindings (decision #7: libva is dlopen'd, never linked).
+# Always on because the preflight needs it whatever the encoder features.
+libloading = "0.8"
+# Clipboard text (X11 + Wayland). No `image-data`: images are out of scope and the
+# default feature drags in the `image` decoder stack.
+arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
+# X11 selection owner for file lists and X11 screen capture (pure-Rust
+# connection, no libxcb). Capture (task L2) uses MIT-SHM, DAMAGE, XFixes and
+# RandR; `damage` implies `xfixes`, `randr` implies `render`. The shortcut hook
+# (L7) uses the XInput2 keyboard grab (`xinput`) and key replay (`xtest`). The
+# video surface (L5) uses SHAPE for the hover-bar clip; remote control (L6)
+# injects through XTEST and reads the RandR primary monitor.
+x11rb = { version = "0.14", features = ["shm", "damage", "xfixes", "randr", "xinput", "xtest", "shape"] }
+# Wayland selection owner for file lists (data-control protocols).
+wl-clipboard-rs = "0.9"
+# Shortcut hook on Wayland: keyboard-shortcuts-inhibit (`unstable`) on GDK's own
+# connection. `client_system` makes wayland-backend wrap libwayland-client
+# (already loaded by GTK), which is what lets us join GDK's `wl_display`
+# (Backend::from_foreign_display). Feature unification applies it to the whole
+# process: wl-clipboard-rs (clipboard, L8) runs on libwayland-client too, the
+# binary links libwayland-client.so.0 (the build needs libwayland-dev, which
+# libgtk-3-dev pulls in), and a connection wayland-backend opens itself (the
+# clipboard's, not our guest one) replaces libwayland's process-wide `wl_log`
+# handler when its `log` feature is on. Nothing here needs libwayland newer
+# than 1.20 (Ubuntu 22.04): the 1.23-only API is behind a feature we do not set.
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+# `staging`: wp_fractional_scale_v1 for the video subsurface (L5).
+wayland-protocols = { version = "0.32", features = ["client", "unstable", "staging"] }
+# The video subsurface (L5) also creates its video `wl_surface` through
+# libwayland directly (GDK-safe user data, see surface/wayland/wl.rs).
+wayland-sys = { version = "0.31", features = ["client"] }
+# Video surface + presenter (task L5). The renderer (shader, letterbox, reveal,
+# held-input release) is shared with macOS in surface-wgpu; this crate turns on
+# the Linux GPU backends: Vulkan first, GL (EGL) for VMs without Vulkan.
+surface-wgpu = { path = "../surface-wgpu" }
+wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "vulkan", "gles"] }
+pollster = "0.4"
+raw-window-handle = "0.6"
+# The exact GTK3 stack of tauri 2.11 (see Cargo.lock): another minor would load
+# a second, incompatible copy of the gtk-rs type registry. Used to find the app
+# window's GTK toplevel, follow its layout and take keys away from WebKit.
+gtk = "0.18"
+gdkx11 = "0.18"
+gdkwayland-sys = "0.18"
+# Remote-control input (task L6). `InputMsg`/`Button` are the wire types.
+protocol = { path = "../protocol" }
+# EI protocol client for the RemoteDesktop portal's libei socket (pure Rust).
+reis = "0.7.1"
+# wlroots virtual pointer + keyboard (L6). The virtual keyboard protocol ships
+# in the -misc crate of the same family.
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+# uinput virtual devices (opt-in fallback).
+input-linux = "0.7"
+# CLOCK_MONOTONIC for EI frame timestamps and memfd for the default keymap.
+# Already in the graph through x11rb and reis.
+rustix = { version = "1", features = ["time", "fs"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tempfile = "3"
+# Reads the daemon's items directly in tests/secret_daemon.rs. Same zbus runtime
+# (async-io) as the store, so the test exercises the production runtime.
+secret-service = { version = "5", features = ["rt-async-io-crypto-rust"] }
+# The golden streams, the decoder matrix and the encoder-output shape check
+# (task I5); dev-only, pure Rust.
+codec-goldens = { path = "../codec-goldens" }
+# Scripted input for the headless Wayland video-surface test: the wlroots
+# virtual pointer under headless sway.
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+# The X11 video-surface test opens its own Xlib display, as tao does for the
+# app (already in the tree through gdkx11/tao; MIT).
+x11 = { version = "2.21", features = ["xlib"] }
+
+# The video-surface tests drive GTK, which must own the process' main thread,
+# so they bring their own `main` (libtest runs tests on worker threads). Both
+# skip cleanly when Xvfb / sway is not installed.
+[[test]]
+name = "x11_surface"
+harness = false
+
+[[test]]
+name = "wayland_surface"
+harness = false

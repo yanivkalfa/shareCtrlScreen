@@ -220,6 +220,13 @@ impl Encoder {
         })
     }
 
+    /// Whether this encoder is a hardware MFT, i.e. `new` did not fall back
+    /// to the Microsoft software encoder. Golden streams named after a
+    /// hardware encoder must come from one (task I5).
+    pub fn is_hardware(&self) -> bool {
+        !self.software
+    }
+
     /// Update the CBR target from the transport's BWE (§6 adaptive bitrate).
     pub fn set_bitrate(&mut self, bps: u32) -> Result<(), Error> {
         self.cfg.bitrate_bps = bps;
@@ -483,12 +490,27 @@ impl Encoder {
 /// Cheap probe: is there a hardware encoder for `codec` on this machine? Counts
 /// `MFTEnumEx` results without activating them (Plan 04 §3 negotiation).
 pub fn can_encode(codec: Codec) -> bool {
+    can_encode_with(codec, MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER)
+}
+
+/// Is there any Media Foundation encoder for `codec` — hardware or Microsoft's
+/// software one? `false` when the software H.264 encoder is missing or blocked
+/// (an administrator can disable MFTs) and there is no hardware one. `MFTEnumEx`
+/// accepts the hardware and synchronous-MFT flags together (`_MFT_ENUM_FLAG`)
+/// and nothing is activated.
+pub fn can_encode_any(codec: Codec) -> bool {
+    can_encode_with(
+        codec,
+        MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
+    )
+}
+
+fn can_encode_with(codec: Codec, flags: MFT_ENUM_FLAG) -> bool {
     ensure_mf_startup();
     let output_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: output_subtype(codec),
     };
-    let flags = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER;
     let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
     let mut count: u32 = 0;
     // SAFETY: out-array/count pair per MFTEnumEx; we free the array below.

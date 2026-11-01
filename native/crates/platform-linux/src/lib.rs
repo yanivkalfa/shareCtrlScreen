@@ -1,0 +1,268 @@
+//! Linux implementation of `platform-api` (plan lane L: portal ScreenCast +
+//! PipeWire or XShm/XDamage capture, VA-API/NVENC/NVDEC codecs, an X11 child
+//! window or Wayland subsurface, XTest / portal-libei / uinput injection,
+//! Secret Service, XDG autostart).
+//!
+//! Status: paths, session-type detection, the clipboard (text and file
+//! lists), Secret Service passwords (L9), XDG autostart (L10), the
+//! permissions preflight (L12), shortcut capture (L7), hardware video encode
+//! (L3) and decode (L4) ([`LinuxCodecs`]), the Cisco OpenH264 fallback (D2),
+//! X11 screen capture with display enumeration (L2, [`X11Capture`]), Wayland
+//! screen capture through the portal and PipeWire (L1), the video surface +
+//! wgpu presenter (L5: X11 child window, Wayland subsurface) and remote-control
+//! input injection (L6: XTest, wlroots virtual input, the RemoteDesktop
+//! portal's libei, opt-in uinput) are real; every other capability fails
+//! safely with a clear message until its task lands (see `plans/05-TASKS.md`,
+//! lane L).
+
+#![cfg(target_os = "linux")]
+
+mod capture;
+mod codec;
+pub mod secret;
+mod uinput_access;
+mod x11_connect;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+mod autostart;
+mod clipboard;
+
+pub use capture::{x11_displays, X11Capture};
+pub use codec::LinuxCodecs;
+use codec_openh264::{OpenH264, WithSoftwareH264};
+use platform_api::unavailable::NoAutostart;
+use platform_api::{
+    Autostart, CaptureError, Clipboard, CodecFactory, DisplayInfo, InputError, InputInjector,
+    OsPermission, Paths, PermissionReport, Platform, PlatformInfo, RawDisplayHandle,
+    RawWindowHandle, ScreenCapture, SecretStore, ShortcutHook, SurfaceError, VideoSurface,
+};
+pub use x11_connect::x11_connect;
+
+mod input;
+mod permissions;
+mod portal_capture;
+mod portal_monitor;
+mod portal_session;
+mod portal_shared;
+mod portal_token;
+mod shortcuts;
+mod surface;
+
+/// Private X servers for the unit tests (clipboard, shortcuts, input), declared
+/// once here so the shared file is one module (`tests/x11_capture.rs` includes
+/// it separately, as its own crate).
+#[cfg(test)]
+#[path = "../tests/support/xserver.rs"]
+mod test_xserver;
+
+pub use uinput_access::{
+    install_uinput_access, InstallMode, UinputInstallError, UinputInstallOutcome,
+    UinputInstallPlan, UINPUT_GROUP, UINPUT_MODULES_LOAD_PATH, UINPUT_RULE_PATH,
+};
+
+/// The display server this session runs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionType {
+    X11,
+    Wayland,
+}
+
+impl SessionType {
+    /// From the environment the desktop session sets. Wayland wins when both are
+    /// present (XWayland exports `DISPLAY` too, but root-window capture under
+    /// rootless XWayland only sees X clients).
+    pub fn detect() -> Self {
+        Self::from_env(
+            std::env::var_os("WAYLAND_DISPLAY").is_some(),
+            std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
+        )
+    }
+
+    fn from_env(wayland_display: bool, xdg_session_type: Option<&str>) -> Self {
+        match xdg_session_type {
+            Some("wayland") => SessionType::Wayland,
+            Some("x11") if !wayland_display => SessionType::X11,
+            _ if wayland_display => SessionType::Wayland,
+            _ => SessionType::X11,
+        }
+    }
+}
+
+pub struct LinuxPlatform {
+    session: SessionType,
+    /// NVENC / NVDEC / VA-API first; wherever they are missing (no GPU, libva
+    /// < 2.20 — decision #7) `LinuxCodecs` returns NoEncoder / NoDecoder for
+    /// H.264 and Cisco OpenH264 takes over.
+    codecs: WithSoftwareH264<LinuxCodecs>,
+}
+
+impl LinuxPlatform {
+    pub fn new() -> Self {
+        let openh264 = Arc::new(OpenH264::new(config_dir().join("codecs")));
+        Self {
+            session: SessionType::detect(),
+            codecs: WithSoftwareH264::new(LinuxCodecs::new(), openh264),
+        }
+    }
+
+    pub fn session_type(&self) -> SessionType {
+        self.session
+    }
+
+    /// The Cisco OpenH264 handle behind the Settings → Advanced toggle.
+    pub fn openh264(&self) -> Arc<OpenH264> {
+        self.codecs.openh264().clone()
+    }
+}
+
+impl Default for LinuxPlatform {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn home() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(std::env::temp_dir)
+}
+
+/// `$XDG_CONFIG_HOME/sharectrl` (default `~/.config/sharectrl`).
+fn config_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| home().join(".config"))
+        .join("sharectrl")
+}
+
+impl Platform for LinuxPlatform {
+    fn info(&self) -> PlatformInfo {
+        PlatformInfo {
+            name: match self.session {
+                SessionType::X11 => "linux-x11",
+                SessionType::Wayland => "linux-wayland",
+            },
+            start_at_login_label: "Start at sign-in",
+            shortcut_capture_hint: "System shortcuts act on the remote machine while the \
+                                    session window is focused, where the desktop allows it.",
+            login_screen_supported: false,
+        }
+    }
+
+    fn paths(&self) -> Paths {
+        Paths {
+            config_dir: config_dir(),
+            log_dir: dirs::state_dir()
+                .unwrap_or_else(|| home().join(".local/state"))
+                .join("sharectrl"),
+            downloads_dir: dirs::download_dir()
+                .unwrap_or_else(|| home().join("Downloads"))
+                .join("ShareCtrlScreen"),
+        }
+    }
+
+    fn displays(&self) -> Vec<DisplayInfo> {
+        match self.session {
+            SessionType::X11 => x11_displays(None).unwrap_or_else(|e| {
+                tracing::warn!("cannot list displays: {e}");
+                Vec::new()
+            }),
+            // The portal picks the monitor in its own dialog (task L1).
+            SessionType::Wayland => Vec::new(),
+        }
+    }
+
+    fn permissions(&self) -> PermissionReport {
+        permissions::report(self.session, &self.paths().log_dir)
+    }
+
+    fn request_permission(&self, p: OsPermission) {
+        permissions::request(self.session, &self.paths().log_dir, p);
+    }
+
+    fn create_capture(
+        &self,
+        display: Option<&str>,
+    ) -> Result<Box<dyn ScreenCapture>, CaptureError> {
+        match self.session {
+            SessionType::X11 => Ok(Box::new(X11Capture::open(None, display)?)),
+            // Never X11 capture here: under Xwayland the root window shows
+            // only X11 apps, not the desktop (plans/02 §1).
+            SessionType::Wayland => portal_capture::create(display, &self.paths().log_dir)
+                .map(|c| Box::new(c) as Box<dyn ScreenCapture>),
+        }
+    }
+
+    fn codecs(&self) -> &dyn CodecFactory {
+        &self.codecs
+    }
+
+    fn create_surface(
+        &self,
+        window: RawWindowHandle,
+        display: RawDisplayHandle,
+    ) -> Result<Arc<dyn VideoSurface>, SurfaceError> {
+        surface::create(window, display)
+    }
+
+    fn create_injector(&self) -> Result<Box<dyn InputInjector>, InputError> {
+        input::create(self.session, &self.paths().log_dir)
+    }
+
+    fn create_shortcut_hook(&self) -> Option<Box<dyn ShortcutHook>> {
+        // Available on X11 and Wayland alike; whether it can work on this
+        // desktop is `install`'s answer (L7).
+        Some(Box::new(shortcuts::LinuxShortcutHook::default()))
+    }
+
+    fn create_clipboard(&self) -> Box<dyn Clipboard> {
+        Box::new(clipboard::LinuxClipboard::new(
+            self.session == SessionType::Wayland,
+        ))
+    }
+
+    fn secrets(&self) -> Arc<dyn SecretStore> {
+        Arc::new(secret::SecretServiceStore)
+    }
+
+    fn autostart(&self) -> Arc<dyn Autostart> {
+        match autostart::XdgAutostart::for_current_user() {
+            Ok(entry) => Arc::new(entry),
+            Err(e) => {
+                tracing::warn!("start at login unavailable: {e}");
+                Arc::new(NoAutostart {
+                    reason: "start at login is unavailable: this program's file path could not be used (see app.log)",
+                })
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_type_detection() {
+        assert_eq!(
+            SessionType::from_env(true, Some("wayland")),
+            SessionType::Wayland
+        );
+        assert_eq!(SessionType::from_env(false, Some("x11")), SessionType::X11);
+        // XWayland exports DISPLAY and some launchers set x11 wrongly.
+        assert_eq!(
+            SessionType::from_env(true, Some("x11")),
+            SessionType::Wayland
+        );
+        assert_eq!(SessionType::from_env(true, None), SessionType::Wayland);
+        assert_eq!(SessionType::from_env(false, None), SessionType::X11);
+        assert_eq!(SessionType::from_env(false, Some("tty")), SessionType::X11);
+    }
+
+    #[test]
+    fn paths_are_per_user_and_distinct() {
+        let p = LinuxPlatform::new().paths();
+        assert!(p.config_dir.ends_with("sharectrl"));
+        assert!(p.downloads_dir.ends_with("ShareCtrlScreen"));
+        assert_ne!(p.config_dir, p.downloads_dir);
+    }
+}

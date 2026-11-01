@@ -1,7 +1,9 @@
 # cargo-about config — Plan 04 §10/§11. Generates third-party-licenses.html.
-# Run: `cargo about generate about.hbs > third-party-licenses.html`
+# Run per OS by native/scripts/release-assets.sh (`--target` per OS, output
+# app/THIRD-PARTY-LICENSES.html, bundled into each installer and attached to the release).
 accepted = [
     "MIT",
+    "MIT-0",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
@@ -13,5 +15,17 @@ accepted = [
     "MPL-2.0",
     "CC0-1.0",
     "BSL-1.0",
+    "CDLA-Permissive-2.0",
 ]
-targets = ["x86_64-pc-windows-msvc"]
+# Our own workspace crates are `license = "Proprietary"` + `publish = false`: skip
+# them, as deny.toml does (`[licenses] private`). The notices page lists third-party
+# code only, and `cargo about generate --fail` would otherwise reject "Proprietary".
+private = { ignore = true }
+# Same triples and licences as deny.toml, so every crate that passes the gate
+# also gets a notice.
+targets = [
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+]

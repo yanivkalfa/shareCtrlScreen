@@ -163,7 +163,7 @@ impl Decoder {
         timestamp: i64,
     ) -> Result<Option<DecodedFrame>, Error> {
         self.fed_count += 1;
-        if self.fed_count <= 10 || self.fed_count % 120 == 0 {
+        if self.fed_count <= 10 || self.fed_count.is_multiple_of(120) {
             tracing::debug!(
                 "decoder: feeding AU #{} ({} bytes, keyframe={keyframe}, pts={timestamp})",
                 self.fed_count,
@@ -327,7 +327,7 @@ impl Decoder {
     /// visible trail in the log instead of an unexplained black screen.
     fn log_drain(&mut self, attempt: u32, why: &str, status: u32) {
         self.no_output_count += 1;
-        if self.no_output_count <= 10 || self.no_output_count % 120 == 0 {
+        if self.no_output_count <= 10 || self.no_output_count.is_multiple_of(120) {
             tracing::debug!(
                 "decoder: no output #{} ({why}, attempt {attempt}, status={status:#x})",
                 self.no_output_count

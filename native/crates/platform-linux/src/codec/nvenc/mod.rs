@@ -37,7 +37,6 @@
 //!   reconfigure-for-bitrate); Sunshine `src/nvenc/nvenc_base.cpp` (low-latency
 //!   parameter choices for game/desktop streaming).
 
-mod cuda;
 mod ffi;
 
 use std::ffi::{c_void, CStr};
@@ -49,8 +48,8 @@ use platform_api::{
     Codec, CodecError, EncodedUnit, EncoderConfig, Frame, FrameData, PixelFormat, VideoEncoder,
 };
 
-use self::cuda::{Context, Cuda, DeviceFrame};
 use self::ffi::*;
+use super::cuda::{self, Context, Cuda, DeviceFrame};
 use super::level::{h264_level, hevc_level};
 use super::scale::{self, Plane};
 use super::zeroed::Zeroed;
@@ -76,7 +75,7 @@ pub(crate) struct Probe {
 /// Takes ~100–300 ms; the factory runs it once.
 pub(crate) fn probe() -> Result<Probe, String> {
     let api = Api::shared()?;
-    let cuda = shared_cuda()?;
+    let cuda = Cuda::shared()?;
     let ctx = Rc::new(Context::new(&cuda, CUDA_DEVICE)?);
     let session = Session::open(&api, &ctx)?;
     let guids = session.encode_guids()?;
@@ -213,11 +212,6 @@ impl Api {
             max_version,
         })
     }
-}
-
-fn shared_cuda() -> Result<Arc<Cuda>, String> {
-    static CUDA: OnceLock<Result<Arc<Cuda>, String>> = OnceLock::new();
-    CUDA.get_or_init(Cuda::load).clone()
 }
 
 /// An open NVENC session on a CUDA context; destroyed on drop.
@@ -458,7 +452,7 @@ impl NvencEncoder {
         let backend = |e: String| CodecError::Backend(format!("NVENC: {e}"));
         let (codec_guid, _) = codec_guids(cfg.codec)?;
         let api = Api::shared().map_err(backend)?;
-        let cuda = shared_cuda().map_err(backend)?;
+        let cuda = Cuda::shared().map_err(backend)?;
         let ctx = Rc::new(Context::new(&cuda, CUDA_DEVICE).map_err(backend)?);
         let session = Session::open(&api, &ctx).map_err(backend)?;
         let _current = ctx.current().map_err(backend)?;

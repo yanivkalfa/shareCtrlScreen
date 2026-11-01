@@ -1,45 +1,67 @@
 //! Linux codec factory: hardware H.264/HEVC encode through NVENC (NVIDIA) and
-//! VA-API (Intel/AMD), both loaded at run time (task L3).
+//! VA-API (Intel/AMD) (task L3), hardware decode through NVDEC and VA-API
+//! (task L4) — every library loaded at run time.
 //!
-//! Discovery is a real probe, run once on first use and logged:
+//! Discovery is a real probe, run once on first use and logged; encode and
+//! decode are probed separately (a viewer never opens an encoder session):
 //! * NVENC — `dlopen` the driver's `libnvidia-encode.so.1` + `libcuda.so.1`,
 //!   `NvEncodeAPIGetMaxSupportedVersion`, open a session, list codec GUIDs.
+//! * NVDEC — `dlopen` `libnvcuvid.so.1` + `libcuda.so.1`,
+//!   `cuvidGetDecoderCaps` for 8-bit 4:2:0 H.264, HEVC and AV1.
 //! * VA-API — `dlopen` `libva.so.2` + `libva-drm.so.2`, `vaInitialize` each
 //!   `/dev/dri/renderD*` node (libva ≥ 2.20 only, decision #7), then
-//!   `vaQueryConfigProfiles` / `vaQueryConfigEntrypoints` for H.264 encode.
+//!   `vaQueryConfigProfiles` / `vaQueryConfigEntrypoints` for H.264 encode
+//!   (`EncSlice[LP]`) or decode (`VLD`).
 //!
-//! Selection: NVENC first when present (better quality per bit at this latency
-//! than VDEnc/VCN, and it is the only HEVC encoder here), VA-API next. A backend
-//! that probes fine but fails to build an encoder (sessions exhausted, size out
-//! of range) falls through to the next one.
+//! Selection: the NVIDIA engine first when present (for encode, better quality
+//! per bit at this latency than VDEnc/VCN and the only HEVC encoder here; for
+//! decode, the only HEVC/AV1 decoder here, and direct rather than through a
+//! VA-API shim), VA-API next. A backend that probes fine but fails to build a
+//! codec (sessions exhausted, size out of range) falls through to the next.
 //!
-//! The contract says `host_encodable` always contains H.264 (the protocol's
-//! guaranteed fallback), so it does even with no hardware; `new_encoder` then
-//! returns [`CodecError::NoEncoder`] — the seam where the software encoder
-//! (task D2) slots in. Decoding is task L4; until it lands the decoder side is
-//! the scaffold's fail-safe [`NoCodecs`].
+//! The contract says `host_encodable` and `viewer_decodable` always contain
+//! H.264 (the protocol's guaranteed fallback), so they do even with no
+//! hardware; `new_encoder` / `new_decoder` then return
+//! [`CodecError::NoEncoder`] / [`CodecError::NoDecoder`] — the seam where Cisco
+//! OpenH264 (task D2, `WithSoftwareH264`) takes over. HEVC and AV1 are
+//! advertised for decoding only when the hardware decodes them.
 
-#[cfg(any(feature = "vaapi", feature = "nvenc"))]
+#[cfg(any(feature = "vaapi", feature = "nvenc", feature = "nvdec"))]
+#[cfg_attr(not(any(feature = "vaapi", feature = "nvenc")), allow(dead_code))]
 mod annexb;
+// The encoder half (NVENC) and the decoder half (NVDEC) share the loader; a
+// build with only one of them leaves the other half's helpers unused.
+#[cfg(any(feature = "nvenc", feature = "nvdec"))]
+#[cfg_attr(not(all(feature = "nvenc", feature = "nvdec")), allow(dead_code))]
+mod cuda;
+#[cfg(all(test, any(feature = "vaapi", feature = "nvdec")))]
+mod golden;
 // Only VA-API writes headers; NVENC's tests reuse its SPS reader.
 #[cfg(any(feature = "vaapi", all(test, feature = "nvenc")))]
 #[cfg_attr(not(feature = "vaapi"), allow(dead_code))]
 mod h264;
+#[cfg(feature = "vaapi")]
+mod h264dec;
 #[cfg(any(feature = "vaapi", feature = "nvenc"))]
 mod level;
+// VA-API copies mapped images, NVDEC writes the planes from the device.
+#[cfg(any(feature = "vaapi", feature = "nvdec"))]
+#[cfg_attr(not(all(feature = "vaapi", feature = "nvdec")), allow(dead_code))]
+mod nv12;
+#[cfg(feature = "nvdec")]
+mod nvdec;
 #[cfg(feature = "nvenc")]
 mod nvenc;
 #[cfg(feature = "nvenc")]
 mod scale;
 #[cfg(feature = "vaapi")]
 mod vaapi;
-#[cfg(any(feature = "vaapi", feature = "nvenc"))]
+#[cfg(any(feature = "vaapi", feature = "nvenc", feature = "nvdec"))]
 mod zeroed;
 
 use std::any::Any;
 use std::sync::OnceLock;
 
-use platform_api::unavailable::NoCodecs;
 use platform_api::{Codec, CodecError, CodecFactory, EncoderConfig, VideoDecoder, VideoEncoder};
 
 /// Quality floor: the worst quantizer any picture may use — the same value and
@@ -208,19 +230,129 @@ impl Capabilities {
     }
 }
 
+/// A hardware decoder the probe found.
+#[derive(Debug, Clone)]
+enum DecodeBackend {
+    #[cfg(feature = "nvdec")]
+    Nvdec(nvdec::Probe),
+    #[cfg(feature = "vaapi")]
+    Vaapi(vaapi::DecodeProbe),
+}
+
+impl DecodeBackend {
+    // With no backend compiled in, `DecodeBackend` has no variants and the
+    // arguments are never read.
+    #[cfg_attr(
+        not(any(feature = "vaapi", feature = "nvdec")),
+        allow(unused_variables)
+    )]
+    fn decodes(&self, codec: Codec) -> bool {
+        match *self {
+            #[cfg(feature = "nvdec")]
+            DecodeBackend::Nvdec(ref p) => p.limits(codec).is_some(),
+            // VA-API decoding is H.264 only in this version.
+            #[cfg(feature = "vaapi")]
+            DecodeBackend::Vaapi(_) => codec == Codec::H264,
+        }
+    }
+
+    #[cfg_attr(
+        not(any(feature = "vaapi", feature = "nvdec")),
+        allow(unused_variables)
+    )]
+    fn create(
+        &self,
+        codec: Codec,
+        width: u32,
+        height: u32,
+    ) -> Result<Box<dyn VideoDecoder>, CodecError> {
+        match *self {
+            #[cfg(feature = "nvdec")]
+            DecodeBackend::Nvdec(ref p) => {
+                Ok(Box::new(nvdec::NvdecDecoder::new(p, codec, width, height)?))
+            }
+            #[cfg(feature = "vaapi")]
+            DecodeBackend::Vaapi(ref p) => {
+                Ok(Box::new(vaapi::VaapiDecoder::new(p, codec, width, height)?))
+            }
+        }
+    }
+
+    fn describe(&self) -> String {
+        match *self {
+            #[cfg(feature = "nvdec")]
+            DecodeBackend::Nvdec(ref p) => p.describe(),
+            #[cfg(feature = "vaapi")]
+            DecodeBackend::Vaapi(ref p) => p.describe(),
+        }
+    }
+}
+
+/// Decode probe results, in preference order, and why each missing backend
+/// is missing.
+#[derive(Debug, Default)]
+struct DecodeCapabilities {
+    found: Vec<DecodeBackend>,
+    missing: Vec<String>,
+}
+
+impl DecodeCapabilities {
+    fn detect() -> Self {
+        let mut caps = DecodeCapabilities::default();
+        #[cfg(feature = "nvdec")]
+        match nvdec::probe() {
+            Ok(p) => caps.found.push(DecodeBackend::Nvdec(p)),
+            Err(e) => caps.missing.push(format!("NVDEC: {e}")),
+        }
+        #[cfg(feature = "vaapi")]
+        match vaapi::decode_probe() {
+            Ok(p) => caps.found.push(DecodeBackend::Vaapi(p)),
+            Err(e) => caps.missing.push(format!("VA-API: {e}")),
+        }
+        if cfg!(not(any(feature = "vaapi", feature = "nvdec"))) {
+            caps.missing
+                .push("built without hardware decoders (features `vaapi`, `nvdec`)".into());
+        }
+        caps
+    }
+
+    fn log(&self) {
+        for b in &self.found {
+            tracing::info!("hardware decoder: {}", b.describe());
+        }
+        for m in &self.missing {
+            tracing::info!("hardware decoder unavailable — {m}");
+        }
+        if self.found.is_empty() {
+            tracing::warn!(
+                "no hardware video decoder; the viewer decodes H.264 with Cisco OpenH264 \
+                 (enable it under Settings → Advanced if it is off)"
+            );
+        }
+    }
+
+    fn decodable(&self) -> Vec<Codec> {
+        let mut out: Vec<Codec> = [Codec::Av1, Codec::Hevc]
+            .into_iter()
+            .filter(|&c| self.found.iter().any(|b| b.decodes(c)))
+            .collect();
+        // Always: the protocol's guaranteed fallback (see the module docs).
+        out.push(Codec::H264);
+        out
+    }
+}
+
 /// The Linux [`CodecFactory`].
 pub struct LinuxCodecs {
     caps: OnceLock<Capabilities>,
-    decode: NoCodecs,
+    decode_caps: OnceLock<DecodeCapabilities>,
 }
 
 impl LinuxCodecs {
     pub fn new() -> Self {
         Self {
             caps: OnceLock::new(),
-            decode: NoCodecs {
-                reason: "video decoding is not available on Linux in this version",
-            },
+            decode_caps: OnceLock::new(),
         }
     }
 
@@ -229,6 +361,15 @@ impl LinuxCodecs {
     fn caps(&self) -> &Capabilities {
         self.caps.get_or_init(|| {
             let caps = Capabilities::detect();
+            caps.log();
+            caps
+        })
+    }
+
+    /// The decode probe, likewise on first use (a host never decodes).
+    fn decode_caps(&self) -> &DecodeCapabilities {
+        self.decode_caps.get_or_init(|| {
+            let caps = DecodeCapabilities::detect();
             caps.log();
             caps
         })
@@ -247,7 +388,7 @@ impl CodecFactory for LinuxCodecs {
     }
 
     fn viewer_decodable(&self) -> Vec<Codec> {
-        self.decode.viewer_decodable()
+        self.decode_caps().decodable()
     }
 
     /// `device` is unused: v1 takes CPU frames on every backend. A capture
@@ -281,14 +422,35 @@ impl CodecFactory for LinuxCodecs {
         }))
     }
 
+    /// `device` is unused: v1 decoders hand out CPU NV12 frames, which every
+    /// presenter uploads. A presenter that imports DMA-BUFs or CUDA memory
+    /// (task L4b) passes its device here for zero-copy.
     fn new_decoder(
         &self,
-        device: Option<&dyn Any>,
+        _device: Option<&dyn Any>,
         codec: Codec,
         width: u32,
         height: u32,
     ) -> Result<Box<dyn VideoDecoder>, CodecError> {
-        self.decode.new_decoder(device, codec, width, height)
+        let caps = self.decode_caps();
+        let mut last_err = None;
+        for backend in caps.found.iter().filter(|b| b.decodes(codec)) {
+            match backend.create(codec, width, height) {
+                Ok(dec) => return Ok(dec),
+                Err(e) => {
+                    tracing::warn!("{} could not start: {e}", backend.describe());
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            tracing::warn!(
+                "no hardware {} decoder ({})",
+                codec.as_caps_str(),
+                caps.missing.join("; ")
+            );
+            CodecError::NoDecoder(codec)
+        }))
     }
 }
 
@@ -407,6 +569,309 @@ mod tests {
             .map(|e| e.to_string());
         assert_eq!(err.as_deref(), Some("no H264 encoder on this system"));
         assert_eq!(f.host_encodable(), vec![Codec::H264]);
+    }
+
+    /// A machine with no usable decoder (no /dev/dri, no NVIDIA driver):
+    /// H.264 is still advertised and `new_decoder` says "no decoder", which
+    /// is what makes `WithSoftwareH264` engage Cisco OpenH264.
+    #[test]
+    fn no_backend_means_no_decoder() {
+        let f = LinuxCodecs::new();
+        assert!(f.decode_caps.set(DecodeCapabilities::default()).is_ok());
         assert_eq!(f.viewer_decodable(), vec![Codec::H264]);
+        let err = f
+            .new_decoder(None, Codec::H264, 1920, 1080)
+            .err()
+            .map(|e| e.to_string());
+        assert_eq!(err.as_deref(), Some("no H264 decoder on this system"));
+        assert!(matches!(
+            f.new_decoder(None, Codec::Hevc, 1920, 1080),
+            Err(CodecError::NoDecoder(Codec::Hevc))
+        ));
+    }
+
+    #[cfg(feature = "vaapi")]
+    #[test]
+    fn vaapi_decodes_h264_only() {
+        let probe = vaapi::DecodeProbe {
+            node: "/dev/dri/renderD128".into(),
+            vendor: "test".into(),
+            version: (1, 20),
+            profiles: vec![7],
+        };
+        let caps = DecodeCapabilities {
+            found: vec![DecodeBackend::Vaapi(probe)],
+            missing: vec![],
+        };
+        assert_eq!(caps.decodable(), vec![Codec::H264]);
+    }
+
+    #[cfg(feature = "nvdec")]
+    #[test]
+    fn hevc_and_av1_only_when_nvdec_decodes_them() {
+        let limits = nvdec::Limits {
+            max_width: 4096,
+            max_height: 4096,
+            max_mb_count: 65536,
+            min_width: 48,
+            min_height: 16,
+        };
+        let probe = nvdec::Probe {
+            device: "test".into(),
+            h264: Some(limits),
+            hevc: Some(limits),
+            av1: None,
+        };
+        let caps = DecodeCapabilities {
+            found: vec![DecodeBackend::Nvdec(probe.clone())],
+            missing: vec![],
+        };
+        assert_eq!(caps.decodable(), vec![Codec::Hevc, Codec::H264]);
+        let caps = DecodeCapabilities {
+            found: vec![DecodeBackend::Nvdec(nvdec::Probe {
+                av1: Some(limits),
+                ..probe
+            })],
+            missing: vec![],
+        };
+        assert_eq!(caps.decodable(), vec![Codec::Av1, Codec::Hevc, Codec::H264]);
+    }
+
+    /// The real decode probe on whatever machine runs the tests (CI: nothing;
+    /// WSL2: NVDEC, no /dev/dri). It must report, never fail hard.
+    #[test]
+    fn real_decode_probe_degrades_gracefully() {
+        let caps = DecodeCapabilities::detect();
+        for b in &caps.found {
+            eprintln!("found: {}", b.describe());
+        }
+        for m in &caps.missing {
+            eprintln!("missing: {m}");
+        }
+        let compiled = cfg!(feature = "nvdec") as usize + cfg!(feature = "vaapi") as usize;
+        assert_eq!(caps.found.len() + caps.missing.len(), compiled.max(1));
+        assert!(caps.decodable().contains(&Codec::H264));
+    }
+
+    /// A smooth moving BGRA picture (gradients plus a moving block), so the
+    /// decoded luma can be compared with the source within coding error.
+    #[cfg(all(feature = "nvenc", feature = "nvdec"))]
+    fn gradient(w: usize, h: usize, t: usize) -> Vec<u8> {
+        let mut px = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                let block = (x / 32 + t).is_multiple_of(8) && y / 32 == 2;
+                px[i] = (x * 255 / w) as u8;
+                px[i + 1] = (y * 255 / h) as u8;
+                px[i + 2] = if block {
+                    240
+                } else {
+                    ((x + y) * 255 / (w + h)) as u8
+                };
+                px[i + 3] = 255;
+            }
+        }
+        px
+    }
+
+    /// Mean absolute difference between a decoded frame's luma and the
+    /// BT.709 limited-range luma of the BGRA source.
+    #[cfg(all(feature = "nvenc", feature = "nvdec"))]
+    fn luma_error(frame: &platform_api::Frame<'_>, bgra: &[u8]) -> f64 {
+        let platform_api::FrameData::Cpu { plane0, .. } = frame.data else {
+            panic!("CPU frame expected");
+        };
+        let (w, h) = (frame.width as usize, frame.height as usize);
+        let mut sum = 0f64;
+        for y in 0..h {
+            for x in 0..w {
+                let p = &bgra[(y * w + x) * 4..];
+                let l = 0.2126 * p[2] as f64 + 0.7152 * p[1] as f64 + 0.0722 * p[0] as f64;
+                let want = 16.0 + l * 219.0 / 255.0;
+                sum += (plane0.data[y * plane0.stride + x] as f64 - want).abs();
+            }
+        }
+        sum / (w * h) as f64
+    }
+
+    /// NVENC (task L3) → NVDEC on this machine's GPU: every access unit yields
+    /// its picture immediately, the pixels match the source within coding
+    /// error, a delta before any keyframe yields nothing, HEVC works where
+    /// both engines do it, and a new resolution on the same decoder reports
+    /// the new size. Skips (passes) where the driver libraries are absent.
+    #[cfg(all(feature = "nvenc", feature = "nvdec"))]
+    #[test]
+    fn nvenc_to_nvdec_round_trip() {
+        let (enc_probe, dec_probe) = match (nvenc::probe(), nvdec::probe()) {
+            (Ok(e), Ok(d)) => (e, d),
+            (Err(e), _) | (_, Err(e)) if e.contains("not loadable") => {
+                eprintln!("skipping NVENC → NVDEC round trip: {e}");
+                return;
+            }
+            (Err(e), _) | (_, Err(e)) => panic!("NVIDIA libraries load but a probe failed: {e}"),
+        };
+        eprintln!("{} / {}", dec_probe.describe(), enc_probe.device);
+        let mut codecs = vec![Codec::H264];
+        if enc_probe.hevc && dec_probe.hevc.is_some() {
+            codecs.push(Codec::Hevc);
+        }
+        for codec in codecs {
+            let cfg = EncoderConfig {
+                width: 640,
+                height: 360,
+                fps_num: 30,
+                fps_den: 1,
+                bitrate_bps: 4_000_000,
+                codec,
+            };
+            let mut enc = nvenc::NvencEncoder::new(cfg).expect("encoder");
+            let mut dec = nvdec::NvdecDecoder::new(&dec_probe, codec, 640, 360).expect("decoder");
+            let mut first_delta = None;
+            for t in 0..12 {
+                if t == 6 {
+                    enc.force_keyframe();
+                }
+                let src = gradient(640, 360, t);
+                let units = enc
+                    .encode(&platform_api::Frame::bgra(640, 360, &src, 640 * 4))
+                    .expect("encode");
+                assert_eq!(units.len(), 1);
+                let u = &units[0];
+                assert_eq!(u.keyframe, t == 0 || t == 6, "{codec:?} frame {t}");
+                if t == 1 {
+                    first_delta = Some(u.data.clone());
+                }
+                let frame = dec
+                    .decode(&u.data, u.keyframe, t as i64 * 333_333)
+                    .expect("decode")
+                    .unwrap_or_else(|| panic!("{codec:?} AU {t} gave no picture"));
+                assert_eq!((frame.width, frame.height), (640, 360));
+                let err = luma_error(&frame, &src);
+                assert!(err < 4.0, "{codec:?} frame {t}: mean luma error {err:.2}");
+                assert_eq!(dec.dimensions(), (640, 360));
+            }
+            // A fresh decoder fed a delta first has nothing to show.
+            let mut fresh = nvdec::NvdecDecoder::new(&dec_probe, codec, 640, 360).expect("decoder");
+            let delta = first_delta.expect("a delta frame");
+            assert!(fresh.decode(&delta, false, 0).expect("decode").is_none());
+
+            // Resolution change on the same decoder.
+            let mut small = nvenc::NvencEncoder::new(EncoderConfig {
+                width: 320,
+                height: 240,
+                ..cfg
+            })
+            .expect("encoder");
+            for t in 0..3 {
+                let src = gradient(320, 240, t);
+                let units = small
+                    .encode(&platform_api::Frame::bgra(320, 240, &src, 320 * 4))
+                    .expect("encode");
+                let frame = dec
+                    .decode(&units[0].data, units[0].keyframe, 0)
+                    .expect("decode after the size change")
+                    .expect("picture after the size change");
+                assert_eq!((frame.width, frame.height), (320, 240));
+                assert!(luma_error(&frame, &src) < 4.0);
+                assert_eq!(dec.dimensions(), (320, 240));
+            }
+        }
+    }
+
+    /// Writes the golden streams of the encoders on this machine into
+    /// `native/testdata/golden` (stream + `.aus` index); FFmpeg then writes
+    /// the `.sha256` reference (see `testdata/golden/README.md`). Needs the
+    /// NVIDIA driver and network access (Cisco's OpenH264 download).
+    #[cfg(all(feature = "nvenc", feature = "nvdec"))]
+    #[test]
+    #[ignore = "regenerates testdata/golden; run by hand"]
+    fn regenerate_golden_streams() {
+        use codec_openh264::{OpenH264, SoftwareEncoder};
+        use std::fmt::Write as _;
+
+        fn write(name: &str, ext: &str, units: &[platform_api::EncodedUnit]) {
+            let dir = golden::dir();
+            let mut stream = Vec::new();
+            let mut index = String::new();
+            for u in units {
+                let _ = writeln!(
+                    index,
+                    "{} {} {}",
+                    stream.len(),
+                    u.data.len(),
+                    u.keyframe as u8
+                );
+                stream.extend_from_slice(&u.data);
+            }
+            std::fs::write(dir.join(format!("{name}.{ext}")), &stream).expect("write stream");
+            std::fs::write(dir.join(format!("{name}.aus")), index).expect("write index");
+            eprintln!(
+                "wrote {name}.{ext}: {} AUs, {} bytes",
+                units.len(),
+                stream.len()
+            );
+        }
+
+        fn run(
+            enc: &mut dyn VideoEncoder,
+            w: usize,
+            h: usize,
+            frames: usize,
+        ) -> Vec<platform_api::EncodedUnit> {
+            let mut out = Vec::new();
+            for t in 0..frames {
+                if t == frames / 2 {
+                    enc.force_keyframe();
+                }
+                if t == frames * 3 / 4 {
+                    enc.set_bitrate(1_000_000).expect("bitrate");
+                }
+                let src = gradient(w, h, t);
+                out.extend(
+                    enc.encode(&platform_api::Frame::bgra(w as u32, h as u32, &src, w * 4))
+                        .expect("encode"),
+                );
+            }
+            out
+        }
+
+        let cfg = EncoderConfig {
+            width: 640,
+            height: 360,
+            fps_num: 30,
+            fps_den: 1,
+            bitrate_bps: 3_000_000,
+            codec: Codec::H264,
+        };
+        let mut enc = nvenc::NvencEncoder::new(cfg).expect("NVENC H.264");
+        write(
+            "nvenc-h264-main-640x360",
+            "h264",
+            &run(&mut enc, 640, 360, 30),
+        );
+        let mut enc = nvenc::NvencEncoder::new(EncoderConfig {
+            codec: Codec::Hevc,
+            ..cfg
+        })
+        .expect("NVENC HEVC");
+        write(
+            "nvenc-hevc-main-640x360",
+            "hevc",
+            &run(&mut enc, 640, 360, 30),
+        );
+
+        let openh264 = OpenH264::new(std::env::temp_dir().join("sct-golden-openh264"));
+        let mut enc = SoftwareEncoder::new(
+            &openh264,
+            EncoderConfig {
+                width: 320,
+                height: 240,
+                ..cfg
+            },
+            None,
+        )
+        .expect("OpenH264 (needs network for the Cisco download)");
+        write("openh264-cb-320x240", "h264", &run(&mut enc, 320, 240, 30));
     }
 }

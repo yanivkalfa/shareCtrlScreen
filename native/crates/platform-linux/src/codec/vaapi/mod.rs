@@ -1,5 +1,7 @@
 //! VA-API H.264 encoder (feature `vaapi`) for Intel (iHD/i965) and AMD
-//! (Mesa radeonsi) GPUs, with libva loaded at run time.
+//! (Mesa radeonsi) GPUs, with libva loaded at run time. The decoder (task
+//! L4) is [`decode`]; it shares this module's display, node probing and
+//! object wrappers.
 //!
 //! ## Why an in-tree binding, not `cros-libva` / `cros-codecs`
 //! Both were evaluated (task L3, first step):
@@ -51,7 +53,10 @@
 //!   HRD window, derive-or-put upload in `hwcontext_vaapi.c`).
 //! * ITU-T H.264 (see `super::h264`).
 
+mod decode;
 mod ffi;
+
+pub(crate) use decode::{decode_probe, DecodeProbe, VaapiDecoder};
 
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
 use std::fs::File;
@@ -163,6 +168,12 @@ impl Probe {
 
 /// Probe every render node; the first with a usable H.264 encoder wins.
 pub(crate) fn probe() -> Result<Probe, String> {
+    first_node(probe_node)
+}
+
+/// Run `probe_node` on each DRM render node in card order; the first success
+/// wins, otherwise every node's reason is reported.
+fn first_node<T>(probe_node: impl Fn(&Arc<Va>, &Path) -> Result<T, String>) -> Result<T, String> {
     let va = Va::shared()?;
     let names = std::fs::read_dir("/dev/dri")
         .map_err(|e| format!("no /dev/dri ({e}) — no GPU driver loaded"))?
@@ -293,7 +304,7 @@ impl Display {
         }
         if !version_supported(major, minor) {
             return Err(format!(
-                "libva 2.{minor} (VA-API {major}.{minor}) is older than 2.20 — hardware encode \
+                "libva 2.{minor} (VA-API {major}.{minor}) is older than 2.20 — hardware video \
                  stays off on this version (decision #7); the software codec is used"
             ));
         }

@@ -1,15 +1,15 @@
 //! Linux implementation of `platform-api` (plan lane L: portal ScreenCast +
-//! PipeWire or XShm/XDamage capture, VA-API/NVENC codecs, an X11 child window or
-//! Wayland subsurface, XTest / portal-libei / uinput injection, Secret Service,
-//! XDG autostart).
+//! PipeWire or XShm/XDamage capture, VA-API/NVENC/NVDEC codecs, an X11 child
+//! window or Wayland subsurface, XTest / portal-libei / uinput injection,
+//! Secret Service, XDG autostart).
 //!
 //! Status: paths, session-type detection, the clipboard (text and file
 //! lists), Secret Service passwords (L9), XDG autostart (L10), the
-//! permissions preflight (L12), hardware
-//! video encode (L3, [`LinuxCodecs`]), the Cisco OpenH264 fallback (D2) and
-//! X11 screen capture with display enumeration (L2, [`X11Capture`]) are real;
-//! every other capability fails safely with a clear message until its task
-//! lands (see `plans/05-TASKS.md`, lane L).
+//! permissions preflight (L12), hardware video encode (L3) and decode (L4)
+//! ([`LinuxCodecs`]), the Cisco OpenH264 fallback (D2) and X11 screen
+//! capture with display enumeration (L2, [`X11Capture`]) are real; every
+//! other capability fails safely with a clear message until its task lands
+//! (see `plans/05-TASKS.md`, lane L).
 
 #![cfg(target_os = "linux")]
 
@@ -76,9 +76,9 @@ impl SessionType {
 
 pub struct LinuxPlatform {
     session: SessionType,
-    /// NVENC / VA-API first; wherever they are missing (no GPU, libva < 2.20 —
-    /// decision #7) `LinuxCodecs` returns NoEncoder and Cisco OpenH264 takes
-    /// over. Decoding is software until task L4.
+    /// NVENC / NVDEC / VA-API first; wherever they are missing (no GPU, libva
+    /// < 2.20 — decision #7) `LinuxCodecs` returns NoEncoder / NoDecoder for
+    /// H.264 and Cisco OpenH264 takes over.
     codecs: WithSoftwareH264<LinuxCodecs>,
 }
 

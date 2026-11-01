@@ -39,7 +39,8 @@
 | M3 VideoToolbox decoder | **done** `a90ddfb` (Opus, Opus-reviewed; type-checked for aarch64-apple-darwin, device-pending) | H.264/HEVC/AV1 → IOSurface `420v` `CvPixelBufferFrame`; format changes keep or rebuild the session; synthetic I_PCM streams test it bit-exact on CI; encode→decode PSNR test is `#[ignore]`d until T2 runs it on a Mac. **Device-pending** (checklists/M3.md) |
 | M6 shortcut tap | **done** (Opus) | session `CGEventTap` on the hook thread; Cmd+Tab/Cmd+\`/Cmd+Space/Ctrl+arrows while the video view has the keyboard (focus published by the view into `SurfaceState::key_focus`); Cmd+Q left to the view's key monitor; macOS `input_monitoring` now needs Input Monitoring **and** Accessibility. **Device-pending** (checklists/M6.md); the Cmd+Tab acceptance is **blocked** on the owner's host-modifier-mapping decision |
 | L2 X11 capture | **done** (Opus) | `platform_linux::X11Capture`: Damage `NonEmpty` → `DamageSubtract`/`FetchRegion` dirty rects (≤ 16, disjoint), MIT-SHM 1.2 segment read via its fd (core `GetImage` fallback), cursor out of band (`QueryPointer` + XFixes), RandR monitors as `x11:<name>` ids in `Platform::displays()`, refuses Xwayland; abstract-socket connect fallback (`x11_connect`). Xvfb/Xephyr tests in `tests/x11_capture.rs`. **Device-pending** (checklists/L2.md) |
-| L1, L4, L7 | queued (Opus cap) | start in wave 2, warm caches |
+| L1, L7 | queued (Opus cap) | start in wave 2, warm caches |
+| L4 VA-API + NVDEC decode | **done** (Opus) | in-tree H.264 header parser + reference model (POC, MMCO, LTR, list modification, frame-num gaps) for stateless VA-API VLD; NVDEC through the driver parser (H.264/HEVC/AV1 per caps); CPU NV12 out; golden streams + FFmpeg hashes in `native/testdata/golden`. NVDEC bit-exact vs FFmpeg on the GTX 1080 Ti; **VA-API device-pending** (checklists/L4.md). MF (W1) and macOS (M2) goldens → I5 |
 | W3 keymap switch | **done** `e2d6b1c` (Sonnet, Opus-reviewed) | `input::scancode` is an adapter over the generated keymap; NumLock is E0 45 (plain 45 is Pause). Device check: NumLock LED toggles, Pause does nothing |
 | W2 software codec selection | **done** (Sonnet, Opus-reviewed) | H.264 policy on Windows: hardware → MF software decoder → OpenH264 (only while `useOpenH264` is on); `h264_problem()` gives an actionable report when Media Foundation has no H.264 MFTs (N editions without the Media Feature Pack fail at launch — documented). Machine-B check: ignored test + log line "no hardware H264 decoder — using software decode" |
 | D7 release pipeline | **done** `448df49` (Opus, Opus-reviewed) | tag-triggered `release.yml` → reusable `build-assets.yml` → `scripts/release-assets.sh` (one recipe); NSIS/DMG/AppImage/deb/rpm, SHA256SUMS, per-OS third-party notices generated and attached (never committed), version read from cargo metadata, actions pinned to SHAs; macOS: certificate required when the secrets exist, ad-hoc only without them. macOS leg + AppImage verified only on GitHub |
@@ -334,6 +335,14 @@ to run (TCC). Use `objc2` 0.6-family crates throughout (`objc2-app-kit`,
   (v1) / DMA-BUF export (L4b stretch, pairs with L5b). NVDEC via `libnvcuvid` (feature).
 * Acceptance: decodes the M2/W1/D2 encoder outputs (golden `.h264` files committed from
   each encoder); 1080p60 ≤ 4 ms/frame on Intel iGPU.
+* As built: `cros-codecs` was not used (it links libva at build time, which decision #7
+  rules out — same finding as L3); the stateless H.264 half is in-tree
+  (`platform-linux/src/codec/h264dec`). VA-API decodes H.264 only (CB/Main/High, 8-bit
+  4:2:0, progressive, no B-frames); HEVC/AV1 decode comes from NVDEC where the GPU has
+  it. Goldens in `native/testdata/golden`: NVENC (L3), OpenH264 (D2) and an x264
+  High-profile reference, checked bit-exactly against FFmpeg hashes. **The W1 (Media
+  Foundation) and M2 (VideoToolbox) goldens cannot be produced in L4 and move to I5**;
+  the tests pick up any stream dropped into that folder.
 
 ### L5-spike — Wayland subsurface under WebKitGTK  (size M, **time-boxed to 3 days**, GNOME + KDE + Sway VMs)
 * Prove: `wl_subsurface` of `gdk_wayland_window_get_wl_surface(gtk_window().window())`

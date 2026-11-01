@@ -1,0 +1,30 @@
+#format: frame checksums
+#version: 2
+#hash: SHA256
+#software: Lavf60.16.100
+#tb 0: 1/30
+#media_type 0: video
+#codec_id 0: rawvideo
+#dimensions 0: 352x288
+#sar 0: 1/1
+#stream#, dts,        pts, duration,     size, hash
+0,          0,          0,        1,   152064, 2929a57e8ce345b097638d70b93f9ae4254553fc0a175600abf898f934682a44
+0,          1,          1,        1,   152064, 2edff448182a2c5e1acc90286cb0b0e327b2284e1f8bbe630e100b4d81ef227c
+0,          2,          2,        1,   152064, 3fe7a7c5ec397dbc324eccfa4b91b7fe3b980a2c05fc617b2c10c227984839a7
+0,          3,          3,        1,   152064, a553810a82c2127d7c07ae15731b1e2b194d1a3e4cff18e9a9118c93a32fab72
+0,          4,          4,        1,   152064, d21ac174027e6cf59cd33d76c1bde22bd04f96767d46fea2c98f2b2887065c97
+0,          5,          5,        1,   152064, b7d902a911a6c3f9883c8dabf2bfa32ef1cbece6e30a467e93643d7d8caa6078
+0,          6,          6,        1,   152064, 62c2493f9eabc3529a970c66a4586d2052510aad63368514d2a1e5399687cb50
+0,          7,          7,        1,   152064, 99a58f9f0a1eabdd9456c43425387e2ba84e6e9bafcde5e64247898f416f8521
+0,          8,          8,        1,   152064, 8187f0aa16e0eb52466a3548e603b919cd973e7e1dbda98c4bf4e6f0d56eded4
+0,          9,          9,        1,   152064, 1c9d03caf6f4ee6cbf7ffd03a16f84aac4e5f7c9b55cc92b9d11978e07ff596a
+0,         10,         10,        1,   152064, c3d999fd259a43943b0194c05e01f8394767e74b55098865e7d08ed8a2d716ea
+0,         11,         11,        1,   152064, 72c1a7f8191f9119d039d1d4bd4ec25fb3e3a220c7e3b7f1a9a84bcfce9560ab
+0,         12,         12,        1,   152064, 30dfc8538a94b473ae56f516fb5011e203a845e118887bbfef840c9a024a301c
+0,         13,         13,        1,   152064, 7faad2bb00b68576f838e2030a8734c4bebd7e35e33c4cf5617ae7336fde701f
+0,         14,         14,        1,   152064, 73b83b48d33418f3f801d4d4a558963ce5e7832442926a07a53ae916498c1814
+0,         15,         15,        1,   152064, 923c1bb24f9bc286451ebf4210a84a433163158a2a62d0d20969db50665a1f10
+0,         16,         16,        1,   152064, 4e5ad37ba5ecb61da17f7bd67e6776ed5e7c0911d78ef83c0b240fa43c635dfe
+0,         17,         17,        1,   152064, ee163720bed72093170691b6a9a9f877405c70ac4423f34e8af29adec8d5bd34
+0,         18,         18,        1,   152064, 4ffde29e0a6aa21346181a8e295076c0fdcc8a086199cf0757f4cdac5b57479e
+0,         19,         19,        1,   152064, 02ef332d89345675ae196b866188a8599c7356228d8c7cab66148f6eaf500537

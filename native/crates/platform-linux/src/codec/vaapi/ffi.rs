@@ -1,5 +1,6 @@
 //! Minimal runtime binding of libva (`va.h`, `va_drm.h`, `va_enc_h264.h`,
-//! `va_vpp.h`; libva is MIT-licensed).
+//! `va_vpp.h`; libva is MIT-licensed): the encoder (task L3) and the H.264
+//! decoder (task L4, `VAEntrypointVLD` + the `va.h` H.264 decode buffers).
 //!
 //! Loaded with `dlopen("libva.so.2")` + `dlopen("libva-drm.so.2")` instead of
 //! linking, so the binary has no `DT_NEEDED` on libva and starts on machines
@@ -39,8 +40,10 @@ pub(crate) const VA_INVALID_SURFACE: VASurfaceID = VA_INVALID_ID;
 // VAProfile
 pub(crate) const VA_PROFILE_NONE: VAProfile = -1;
 pub(crate) const VA_PROFILE_H264_MAIN: VAProfile = 6;
+pub(crate) const VA_PROFILE_H264_HIGH: VAProfile = 7;
 pub(crate) const VA_PROFILE_H264_CONSTRAINED_BASELINE: VAProfile = 13;
 // VAEntrypoint
+pub(crate) const VA_ENTRYPOINT_VLD: VAEntrypoint = 1;
 pub(crate) const VA_ENTRYPOINT_ENC_SLICE: VAEntrypoint = 6;
 pub(crate) const VA_ENTRYPOINT_ENC_SLICE_LP: VAEntrypoint = 8;
 pub(crate) const VA_ENTRYPOINT_VIDEO_PROC: VAEntrypoint = 10;
@@ -63,6 +66,10 @@ pub(crate) const VA_SURFACE_ATTRIB_MAX_HEIGHT: u32 = 5;
 pub(crate) const VA_SURFACE_ATTRIB_SETTABLE: u32 = 0x2;
 pub(crate) const VA_GENERIC_VALUE_TYPE_INTEGER: u32 = 1;
 // VABufferType
+pub(crate) const VA_PICTURE_PARAMETER_BUFFER_TYPE: VABufferType = 0;
+pub(crate) const VA_IQ_MATRIX_BUFFER_TYPE: VABufferType = 1;
+pub(crate) const VA_SLICE_PARAMETER_BUFFER_TYPE: VABufferType = 4;
+pub(crate) const VA_SLICE_DATA_BUFFER_TYPE: VABufferType = 5;
 pub(crate) const VA_ENC_CODED_BUFFER_TYPE: VABufferType = 21;
 pub(crate) const VA_ENC_SEQUENCE_PARAMETER_BUFFER_TYPE: VABufferType = 22;
 pub(crate) const VA_ENC_PICTURE_PARAMETER_BUFFER_TYPE: VABufferType = 23;
@@ -81,6 +88,10 @@ pub(crate) const VA_ENC_PACKED_HEADER_TYPE_PICTURE: u32 = 2;
 // VAPictureH264 flags
 pub(crate) const VA_PICTURE_H264_INVALID: u32 = 0x1;
 pub(crate) const VA_PICTURE_H264_SHORT_TERM_REFERENCE: u32 = 0x8;
+pub(crate) const VA_PICTURE_H264_LONG_TERM_REFERENCE: u32 = 0x10;
+/// `VASliceParameterBufferH264::slice_data_flag`: the whole slice is in the
+/// buffer.
+pub(crate) const VA_SLICE_DATA_FLAG_ALL: u32 = 0x0;
 // Coded buffer status
 pub(crate) const VA_CODED_BUF_STATUS_SLICE_OVERFLOW_MASK: u32 = 0x200;
 // VPP
@@ -111,6 +122,26 @@ pub(crate) const PIC_IDR: u32 = 1 << 0;
 pub(crate) const PIC_REFERENCE_SHIFT: u32 = 1;
 pub(crate) const PIC_ENTROPY_CODING_MODE: u32 = 1 << 3;
 pub(crate) const PIC_DEBLOCKING_FILTER_CONTROL_PRESENT: u32 = 1 << 9;
+// VAPictureParameterBufferH264.seq_fields
+pub(crate) const DEC_SEQ_CHROMA_FORMAT_IDC_SHIFT: u32 = 0;
+pub(crate) const DEC_SEQ_GAPS_IN_FRAME_NUM_ALLOWED: u32 = 1 << 3;
+pub(crate) const DEC_SEQ_FRAME_MBS_ONLY: u32 = 1 << 4;
+pub(crate) const DEC_SEQ_DIRECT_8X8_INFERENCE: u32 = 1 << 6;
+pub(crate) const DEC_SEQ_MIN_LUMA_BI_PRED_SIZE_8X8: u32 = 1 << 7;
+pub(crate) const DEC_SEQ_LOG2_MAX_FRAME_NUM_MINUS4_SHIFT: u32 = 8;
+pub(crate) const DEC_SEQ_PIC_ORDER_CNT_TYPE_SHIFT: u32 = 12;
+pub(crate) const DEC_SEQ_LOG2_MAX_POC_LSB_MINUS4_SHIFT: u32 = 14;
+pub(crate) const DEC_SEQ_DELTA_PIC_ORDER_ALWAYS_ZERO: u32 = 1 << 18;
+// VAPictureParameterBufferH264.pic_fields
+pub(crate) const DEC_PIC_ENTROPY_CODING_MODE: u32 = 1 << 0;
+pub(crate) const DEC_PIC_WEIGHTED_PRED: u32 = 1 << 1;
+pub(crate) const DEC_PIC_WEIGHTED_BIPRED_IDC_SHIFT: u32 = 2;
+pub(crate) const DEC_PIC_TRANSFORM_8X8_MODE: u32 = 1 << 4;
+pub(crate) const DEC_PIC_CONSTRAINED_INTRA_PRED: u32 = 1 << 6;
+pub(crate) const DEC_PIC_PIC_ORDER_PRESENT: u32 = 1 << 7;
+pub(crate) const DEC_PIC_DEBLOCKING_FILTER_CONTROL_PRESENT: u32 = 1 << 8;
+pub(crate) const DEC_PIC_REDUNDANT_PIC_CNT_PRESENT: u32 = 1 << 9;
+pub(crate) const DEC_PIC_REFERENCE: u32 = 1 << 10;
 // VAEncMiscParameterRateControl.rc_flags
 pub(crate) const RC_DISABLE_FRAME_SKIP: u32 = 1 << 1;
 pub(crate) const RC_DISABLE_BIT_STUFFING: u32 = 1 << 2;
@@ -409,9 +440,79 @@ pub(crate) struct VAProcPipelineParameterBuffer {
     pub va_reserved: [u32; 16],
 }
 
+#[repr(C)]
+pub(crate) struct VAPictureParameterBufferH264 {
+    pub curr_pic: VAPictureH264,
+    pub reference_frames: [VAPictureH264; 16],
+    pub picture_width_in_mbs_minus1: u16,
+    pub picture_height_in_mbs_minus1: u16,
+    pub bit_depth_luma_minus8: u8,
+    pub bit_depth_chroma_minus8: u8,
+    pub num_ref_frames: u8,
+    pub seq_fields: u32,
+    /// Deprecated FMO fields (`va_deprecated`); always 0 here.
+    pub num_slice_groups_minus1: u8,
+    pub slice_group_map_type: u8,
+    pub slice_group_change_rate_minus1: u16,
+    pub pic_init_qp_minus26: i8,
+    pub pic_init_qs_minus26: i8,
+    pub chroma_qp_index_offset: i8,
+    pub second_chroma_qp_index_offset: i8,
+    pub pic_fields: u32,
+    pub frame_num: u16,
+    /// `VA_PADDING_MEDIUM`.
+    pub va_reserved: [u32; 8],
+}
+
+#[repr(C)]
+pub(crate) struct VAIQMatrixBufferH264 {
+    /// Raster order (the header's documentation).
+    pub scaling_list_4x4: [[u8; 16]; 6],
+    pub scaling_list_8x8: [[u8; 64]; 2],
+    pub va_reserved: [u32; 4],
+}
+
+#[repr(C)]
+pub(crate) struct VASliceParameterBufferH264 {
+    pub slice_data_size: u32,
+    pub slice_data_offset: u32,
+    pub slice_data_flag: u32,
+    pub slice_data_bit_offset: u16,
+    pub first_mb_in_slice: u16,
+    pub slice_type: u8,
+    pub direct_spatial_mv_pred_flag: u8,
+    pub num_ref_idx_l0_active_minus1: u8,
+    pub num_ref_idx_l1_active_minus1: u8,
+    pub cabac_init_idc: u8,
+    pub slice_qp_delta: i8,
+    pub disable_deblocking_filter_idc: u8,
+    pub slice_alpha_c0_offset_div2: i8,
+    pub slice_beta_offset_div2: i8,
+    pub ref_pic_list0: [VAPictureH264; 32],
+    pub ref_pic_list1: [VAPictureH264; 32],
+    pub luma_log2_weight_denom: u8,
+    pub chroma_log2_weight_denom: u8,
+    pub luma_weight_l0_flag: u8,
+    pub luma_weight_l0: [i16; 32],
+    pub luma_offset_l0: [i16; 32],
+    pub chroma_weight_l0_flag: u8,
+    pub chroma_weight_l0: [[i16; 2]; 32],
+    pub chroma_offset_l0: [[i16; 2]; 32],
+    pub luma_weight_l1_flag: u8,
+    pub luma_weight_l1: [i16; 32],
+    pub luma_offset_l1: [i16; 32],
+    pub chroma_weight_l1_flag: u8,
+    pub chroma_weight_l1: [[i16; 2]; 32],
+    pub chroma_offset_l1: [[i16; 2]; 32],
+    pub va_reserved: [u32; 4],
+}
+
 // SAFETY (all impls): plain C data; all-zero is valid and is the documented
 // default ("must be zero") for every field the encoder does not set.
 unsafe impl Zeroed for VAImage {}
+unsafe impl Zeroed for VAPictureParameterBufferH264 {}
+unsafe impl Zeroed for VAIQMatrixBufferH264 {}
+unsafe impl Zeroed for VASliceParameterBufferH264 {}
 unsafe impl Zeroed for VAEncSequenceParameterBufferH264 {}
 unsafe impl Zeroed for VAEncPictureParameterBufferH264 {}
 unsafe impl Zeroed for VAEncSliceParameterBufferH264 {}
@@ -501,6 +602,15 @@ pub(crate) struct Va {
     pub create_image:
         unsafe extern "C" fn(VADisplay, *mut VAImageFormat, c_int, c_int, *mut VAImage) -> VAStatus,
     pub destroy_image: unsafe extern "C" fn(VADisplay, VAImageID) -> VAStatus,
+    pub get_image: unsafe extern "C" fn(
+        VADisplay,
+        VASurfaceID,
+        c_int,
+        c_int,
+        c_uint,
+        c_uint,
+        VAImageID,
+    ) -> VAStatus,
     pub put_image: unsafe extern "C" fn(
         VADisplay,
         VASurfaceID,
@@ -573,6 +683,7 @@ impl Va {
             derive_image: sym!(va, b"vaDeriveImage\0"),
             create_image: sym!(va, b"vaCreateImage\0"),
             destroy_image: sym!(va, b"vaDestroyImage\0"),
+            get_image: sym!(va, b"vaGetImage\0"),
             put_image: sym!(va, b"vaPutImage\0"),
             _va: va,
             _drm: drm,
@@ -680,6 +791,49 @@ mod layout {
     const _: () = assert!(offset_of!(Proc, processing_mode) == 148);
     const _: () = assert!(offset_of!(Proc, output_hdr_metadata) == 152);
     const _: () = assert!(offset_of!(Proc, va_reserved) == 160);
+    // Decode (task L4): same method, libva 2.20 headers, gcc 13.3 x86_64.
+    type DecPic = VAPictureParameterBufferH264;
+    const _: () = assert!(size_of::<DecPic>() == 672);
+    const _: () = assert!(offset_of!(DecPic, reference_frames) == 36);
+    const _: () = assert!(offset_of!(DecPic, picture_width_in_mbs_minus1) == 612);
+    const _: () = assert!(offset_of!(DecPic, bit_depth_luma_minus8) == 616);
+    const _: () = assert!(offset_of!(DecPic, num_ref_frames) == 618);
+    const _: () = assert!(offset_of!(DecPic, seq_fields) == 620);
+    const _: () = assert!(offset_of!(DecPic, num_slice_groups_minus1) == 624);
+    const _: () = assert!(offset_of!(DecPic, slice_group_change_rate_minus1) == 626);
+    const _: () = assert!(offset_of!(DecPic, pic_init_qp_minus26) == 628);
+    const _: () = assert!(offset_of!(DecPic, second_chroma_qp_index_offset) == 631);
+    const _: () = assert!(offset_of!(DecPic, pic_fields) == 632);
+    const _: () = assert!(offset_of!(DecPic, frame_num) == 636);
+    const _: () = assert!(offset_of!(DecPic, va_reserved) == 640);
+    const _: () = assert!(size_of::<VAIQMatrixBufferH264>() == 240);
+    const _: () = assert!(offset_of!(VAIQMatrixBufferH264, scaling_list_8x8) == 96);
+    const _: () = assert!(offset_of!(VAIQMatrixBufferH264, va_reserved) == 224);
+    type DecSlice = VASliceParameterBufferH264;
+    const _: () = assert!(size_of::<DecSlice>() == 3128);
+    const _: () = assert!(offset_of!(DecSlice, slice_data_flag) == 8);
+    const _: () = assert!(offset_of!(DecSlice, slice_data_bit_offset) == 12);
+    const _: () = assert!(offset_of!(DecSlice, first_mb_in_slice) == 14);
+    const _: () = assert!(offset_of!(DecSlice, slice_type) == 16);
+    const _: () = assert!(offset_of!(DecSlice, num_ref_idx_l0_active_minus1) == 18);
+    const _: () = assert!(offset_of!(DecSlice, cabac_init_idc) == 20);
+    const _: () = assert!(offset_of!(DecSlice, slice_beta_offset_div2) == 24);
+    const _: () = assert!(offset_of!(DecSlice, ref_pic_list0) == 28);
+    const _: () = assert!(offset_of!(DecSlice, ref_pic_list1) == 1180);
+    const _: () = assert!(offset_of!(DecSlice, luma_log2_weight_denom) == 2332);
+    const _: () = assert!(offset_of!(DecSlice, luma_weight_l0_flag) == 2334);
+    const _: () = assert!(offset_of!(DecSlice, luma_weight_l0) == 2336);
+    const _: () = assert!(offset_of!(DecSlice, luma_offset_l0) == 2400);
+    const _: () = assert!(offset_of!(DecSlice, chroma_weight_l0_flag) == 2464);
+    const _: () = assert!(offset_of!(DecSlice, chroma_weight_l0) == 2466);
+    const _: () = assert!(offset_of!(DecSlice, chroma_offset_l0) == 2594);
+    const _: () = assert!(offset_of!(DecSlice, luma_weight_l1_flag) == 2722);
+    const _: () = assert!(offset_of!(DecSlice, luma_weight_l1) == 2724);
+    const _: () = assert!(offset_of!(DecSlice, luma_offset_l1) == 2788);
+    const _: () = assert!(offset_of!(DecSlice, chroma_weight_l1_flag) == 2852);
+    const _: () = assert!(offset_of!(DecSlice, chroma_weight_l1) == 2854);
+    const _: () = assert!(offset_of!(DecSlice, chroma_offset_l1) == 2982);
+    const _: () = assert!(offset_of!(DecSlice, va_reserved) == 3112);
 }
 
 #[cfg(test)]
@@ -696,6 +850,30 @@ mod tests {
         assert_eq!(0x3 << PIC_REFERENCE_SHIFT, 0x6);
         assert_eq!(PIC_DEBLOCKING_FILTER_CONTROL_PRESENT, 0x200);
         assert_eq!(PIC_ENTROPY_CODING_MODE, 0x8);
+    }
+
+    #[test]
+    fn decode_bitfield_positions_match_gcc() {
+        // gcc's value of `seq_fields.value` / `pic_fields.value` with each
+        // field set to its maximum in the real VAPictureParameterBufferH264.
+        assert_eq!(3 << DEC_SEQ_CHROMA_FORMAT_IDC_SHIFT, 0x3);
+        assert_eq!(DEC_SEQ_GAPS_IN_FRAME_NUM_ALLOWED, 0x8);
+        assert_eq!(DEC_SEQ_FRAME_MBS_ONLY, 0x10);
+        assert_eq!(DEC_SEQ_DIRECT_8X8_INFERENCE, 0x40);
+        assert_eq!(DEC_SEQ_MIN_LUMA_BI_PRED_SIZE_8X8, 0x80);
+        assert_eq!(0xf << DEC_SEQ_LOG2_MAX_FRAME_NUM_MINUS4_SHIFT, 0xf00);
+        assert_eq!(0x3 << DEC_SEQ_PIC_ORDER_CNT_TYPE_SHIFT, 0x3000);
+        assert_eq!(0xf << DEC_SEQ_LOG2_MAX_POC_LSB_MINUS4_SHIFT, 0x3c000);
+        assert_eq!(DEC_SEQ_DELTA_PIC_ORDER_ALWAYS_ZERO, 0x40000);
+        assert_eq!(DEC_PIC_ENTROPY_CODING_MODE, 0x1);
+        assert_eq!(DEC_PIC_WEIGHTED_PRED, 0x2);
+        assert_eq!(0x3 << DEC_PIC_WEIGHTED_BIPRED_IDC_SHIFT, 0xc);
+        assert_eq!(DEC_PIC_TRANSFORM_8X8_MODE, 0x10);
+        assert_eq!(DEC_PIC_CONSTRAINED_INTRA_PRED, 0x40);
+        assert_eq!(DEC_PIC_PIC_ORDER_PRESENT, 0x80);
+        assert_eq!(DEC_PIC_DEBLOCKING_FILTER_CONTROL_PRESENT, 0x100);
+        assert_eq!(DEC_PIC_REDUNDANT_PIC_CNT_PRESENT, 0x200);
+        assert_eq!(DEC_PIC_REFERENCE, 0x400);
     }
 
     #[test]

@@ -10,15 +10,19 @@ publish.workspace = true
 workspace = true
 
 [features]
-# Hardware encoders (task L3). Both are loaded with dlopen at run time — nothing
-# is linked and no SDK or headers are needed to build — so enabling them never
-# stops the app starting on a machine without the libraries: the probe simply
-# reports them absent.
-default = ["vaapi", "nvenc"]
-# Intel / AMD (any VA-API driver): libva.so.2 + libva-drm.so.2.
+# Hardware encoders (task L3) and decoders (task L4). All are loaded with
+# dlopen at run time — nothing is linked and no SDK or headers are needed to
+# build — so enabling them never stops the app starting on a machine without
+# the libraries: the probe simply reports them absent.
+default = ["vaapi", "nvenc", "nvdec"]
+# Intel / AMD (any VA-API driver), H.264 encode and decode: libva.so.2 +
+# libva-drm.so.2.
 vaapi = []
-# NVIDIA: libnvidia-encode.so.1 + libcuda.so.1 from the proprietary driver.
+# NVIDIA encode: libnvidia-encode.so.1 + libcuda.so.1 from the proprietary driver.
 nvenc = []
+# NVIDIA decode (H.264, HEVC, AV1 where the GPU has it): libnvcuvid.so.1 +
+# libcuda.so.1 from the proprietary driver.
+nvdec = []
 
 # Linux implementation of `platform-api` (plan lane L). Empty on other targets.
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -38,7 +42,7 @@ uuid.workspace = true
 ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "screencast", "remote_desktop"] }
 tokio = { workspace = true }
 # ISC. dlopen/dlsym: the permissions preflight's libva probe and the VA-API /
-# NVENC / CUDA runtime bindings (decision #7: libva is dlopen'd, never linked).
+# NVENC / NVDEC / CUDA runtime bindings (decision #7: libva is dlopen'd, never linked).
 # Always on because the preflight needs it whatever the encoder features.
 libloading = "0.8"
 # Clipboard text (X11 + Wayland). No `image-data`: images are out of scope and the
@@ -56,3 +60,7 @@ tempfile = "3"
 # Reads the daemon's items directly in tests/secret_daemon.rs. Same zbus runtime
 # (async-io) as the store, so the test exercises the production runtime.
 secret-service = { version = "5", features = ["rt-async-io-crypto-rust"] }
+# Per-frame SHA-256 of decoded pictures, compared with FFmpeg's `framehash`
+# of the golden streams (src/codec/golden.rs). Already workspace dependencies.
+sha2.workspace = true
+hex.workspace = true

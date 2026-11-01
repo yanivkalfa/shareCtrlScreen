@@ -1,16 +1,19 @@
-//! The handful of CUDA driver-API calls NVENC's CUDA device needs, loaded from
+//! The handful of CUDA driver-API calls the NVIDIA codecs need, loaded from
 //! `libcuda.so.1` (part of the NVIDIA driver; no CUDA toolkit involved).
 //!
-//! NVENC on Linux takes a CUDA context as its "device" and CUDA device memory
-//! as input. v1 copies each host frame into one pitched device allocation with
-//! `cuMemcpy2D`; the seam for zero-copy (a DMA-BUF imported with
-//! `cuImportExternalMemory`) is the same [`DeviceFrame`] slot.
+//! NVENC and NVDEC on Linux both take a CUDA context as their "device".
+//! * NVENC takes CUDA device memory as input. v1 copies each host frame into
+//!   one pitched device allocation with `cuMemcpy2D`; the seam for zero-copy
+//!   (a DMA-BUF imported with `cuImportExternalMemory`) is the same
+//!   [`DeviceFrame`] slot.
+//! * NVDEC lends each decoded picture out as a mapped, pitched device
+//!   pointer; v1 reads it back with [`Current::copy_to_host`].
 //!
 //! Signatures follow `dynlink_cuda.h` from nv-codec-headers n12.0.16.1 (the
 //! `_v2` entry points are the ones with 64-bit `CUdeviceptr`/`size_t`).
 
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use libloading::Library;
 
@@ -72,9 +75,16 @@ pub(crate) struct Cuda {
 }
 
 impl Cuda {
+    /// The process-wide binding, loaded (and `cuInit` run) on first use; the
+    /// encoder and the decoder share it.
+    pub(crate) fn shared() -> Result<Arc<Self>, String> {
+        static CUDA: OnceLock<Result<Arc<Cuda>, String>> = OnceLock::new();
+        CUDA.get_or_init(Self::load).clone()
+    }
+
     /// `dlopen("libcuda.so.1")` + `cuInit`. Fails with a readable reason when the
     /// NVIDIA driver (or a usable GPU) is absent.
-    pub(crate) fn load() -> Result<Arc<Self>, String> {
+    fn load() -> Result<Arc<Self>, String> {
         // SAFETY: loading the driver's CUDA library runs only its initialisers.
         let lib = unsafe { Library::new("libcuda.so.1") }
             .map_err(|e| format!("libcuda.so.1 not loadable ({e}) — no NVIDIA driver"))?;
@@ -109,7 +119,7 @@ impl Cuda {
         Ok(Arc::new(cuda))
     }
 
-    fn check(&self, r: CuResult, what: &str) -> Result<(), String> {
+    pub(crate) fn check(&self, r: CuResult, what: &str) -> Result<(), String> {
         if r == CUDA_SUCCESS {
             return Ok(());
         }
@@ -206,6 +216,58 @@ impl Drop for Context {
 /// The context is current on this thread while this lives.
 pub(crate) struct Current<'a> {
     ctx: &'a Context,
+}
+
+impl Current<'_> {
+    /// Copy `rows` rows of `width_bytes` from device memory at `src` (`src_pitch`
+    /// apart) into `dst` (`dst_pitch` apart). Synchronous: `dst` holds the
+    /// pixels when this returns. The device span is the caller's mapping (a
+    /// read past it is a CUDA error, never host memory); the host span is
+    /// checked here.
+    pub(crate) fn copy_to_host(
+        &self,
+        src: CuDevicePtr,
+        src_pitch: usize,
+        dst: &mut [u8],
+        dst_pitch: usize,
+        width_bytes: usize,
+        rows: usize,
+    ) -> Result<(), String> {
+        if rows == 0 {
+            return Ok(());
+        }
+        if width_bytes > dst_pitch.min(src_pitch)
+            || dst.len() < dst_pitch * (rows - 1) + width_bytes
+        {
+            return Err(format!(
+                "host buffer too small: {} bytes for {rows} rows of {width_bytes} (pitch {dst_pitch}, device pitch {src_pitch})",
+                dst.len()
+            ));
+        }
+        let copy = CudaMemcpy2d {
+            src_x_in_bytes: 0,
+            src_y: 0,
+            src_memory_type: CU_MEMORYTYPE_DEVICE,
+            src_host: std::ptr::null(),
+            src_device: src,
+            src_array: std::ptr::null_mut(),
+            src_pitch,
+            dst_x_in_bytes: 0,
+            dst_y: 0,
+            dst_memory_type: CU_MEMORYTYPE_HOST,
+            dst_host: dst.as_mut_ptr().cast(),
+            dst_device: 0,
+            dst_array: std::ptr::null_mut(),
+            dst_pitch,
+            width_in_bytes: width_bytes,
+            height: rows,
+        };
+        let cuda = &self.ctx.cuda;
+        // SAFETY: the host span was bounds-checked above; the context is
+        // current (this guard); cuMemcpy2D on pageable host memory returns
+        // only once the copy is complete.
+        cuda.check(unsafe { (cuda.memcpy_2d)(&copy) }, "cuMemcpy2D")
+    }
 }
 
 impl Drop for Current<'_> {

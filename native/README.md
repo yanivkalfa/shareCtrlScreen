@@ -126,15 +126,17 @@ workflow, so they run on Ubuntu 22.04 and newer, Fedora 40 and comparable distri
 **Runtime dependencies.** Required (declared as package `Depends`): WebKitGTK 4.1, GTK 3,
 PipeWire 0.3 client library, libxkbcommon. Recommended (not required): `libva2` +
 `libva-drm2` (hardware H.264 through VA-API; loaded with `dlopen`, so the app starts and
-falls back to software encoding without them) and `xdg-desktop-portal` with a backend for
+falls back to software encoding and decoding without them) and `xdg-desktop-portal` with a backend for
 your desktop (`-gnome`, `-kde`, `-wlr`, `-hyprland`), which Wayland screen sharing needs.
 
 **GPU video acceleration.** The driver comes from your distribution, not from this app:
 Intel `intel-media-va-driver-non-free` (or `intel-media-va-driver`), AMD `mesa-va-drivers`,
 NVIDIA proprietary driver. Check with `vainfo` (package `vainfo` / `libva-utils`): it must
 list `VAProfileH264Main` or `VAProfileH264High` with `VAEntrypointEncSlice` (or
-`VAEntrypointEncSliceLP`). `Failed to initialize display` or no H.264 encode entrypoint
-means the app uses software H.264.
+`VAEntrypointEncSliceLP`) for hosting and with `VAEntrypointVLD` for viewing.
+`Failed to initialize display` or no H.264 entrypoint means the app uses software H.264
+for that side. NVIDIA GPUs encode with NVENC and decode with NVDEC (`libnvcuvid.so.1`,
+part of the proprietary driver); NVDEC also decodes HEVC/AV1 where the GPU supports it.
 
 **AppImage caveats.** The AppImage bundles WebKitGTK, GTK and their data but not glibc,
 the GPU/VA drivers or the PipeWire daemon, which always come from the host. GStreamer media

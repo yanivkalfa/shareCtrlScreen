@@ -92,7 +92,7 @@ impl<T: Send + Sync + 'static> Shared<T> {
     where
         S: FnOnce(Abandon) -> Handshake<T>,
         C: FnOnce(T) -> CF + Send + 'static,
-        CF: Future<Output = ()> + Send,
+        CF: Future<Output = ()> + Send + 'static,
     {
         let outcome = Arc::new(Outcome {
             result: OnceLock::new(),

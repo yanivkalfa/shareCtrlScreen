@@ -58,6 +58,9 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSTrackingArea",
     "NSView",
     "NSWindow",
+    # Toolbar reveal in native full screen: the screen's top safe-area inset
+    # (task M12 follow-up).
+    "NSScreen",
     "block2",
     "objc2-quartz-core",
 ] }

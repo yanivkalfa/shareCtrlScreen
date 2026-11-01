@@ -52,7 +52,7 @@ use objc2_app_kit::{
     NSEventMask, NSEventPhase, NSEventType, NSPasteboardTypeFileURL,
     NSPasteboardURLReadingFileURLsOnlyKey, NSResponder, NSTrackingArea, NSTrackingAreaOptions,
     NSView, NSWindow, NSWindowDidBecomeKeyNotification, NSWindowDidResignKeyNotification,
-    NSWindowOrderingMode,
+    NSWindowOrderingMode, NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSDictionary, NSNotification, NSNotificationCenter, NSNumber,
@@ -61,10 +61,19 @@ use objc2_foundation::{
 use objc2_quartz_core::{kCAGravityBottom, kCAGravityTop, CAMetalLayer, CATransaction};
 use platform_api::{FileDrop, SurfaceError};
 use surface_wgpu::input::WheelAccumulator;
-use surface_wgpu::reveal::{Reveal, RevealChange};
+use surface_wgpu::reveal::{exited_through_top, Reveal, RevealChange};
 use surface_wgpu::SurfaceState;
 
-use crate::keymap;
+use crate::{keymap, shortcut_filter};
+
+/// `s` if it is exactly one character.
+fn single_char(s: &str) -> Option<char> {
+    let mut chars = s.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => Some(c),
+        _ => None,
+    }
+}
 
 /// Windows wheel units per Cocoa scroll line (one classic mouse-wheel notch).
 const UNITS_PER_LINE: f64 = 120.0;
@@ -72,12 +81,19 @@ const UNITS_PER_LINE: f64 = 120.0;
 /// per 40 px, the pixel distance Chromium/WebKit scroll per Cocoa line, so a
 /// trackpad swipe moves the remote about as far as it moves a local page.
 const UNITS_PER_PIXEL: f64 = 3.0;
+/// The macOS menu bar's height in points on a display without a camera
+/// housing (macOS 11 and later); a notched display reports more through its
+/// safe-area inset, which then wins.
+const MENU_BAR_PT: f64 = 24.0;
 
 pub(crate) struct ViewIvars {
     state: Arc<SurfaceState>,
     layer: Retained<CAMetalLayer>,
     reveal: Cell<Reveal>,
     wheel: Cell<WheelAccumulator>,
+    /// A pointer event reached the view since it was last shown or hidden
+    /// (for the one-time "events arrive" debug line).
+    pointer_seen: Cell<bool>,
 }
 
 define_class!(
@@ -232,6 +248,7 @@ define_class!(
         #[unsafe(method(mouseMoved:))]
         fn mouse_moved(&self, event: &NSEvent) {
             let (px, py) = self.pointer_px(event);
+            self.note_pointer("move", py);
             self.feed_reveal(py);
             let (nx, ny) = self.ivars().state.normalize(px, py);
             self.ivars().state.input().moved(nx, ny);
@@ -239,12 +256,18 @@ define_class!(
 
         /// The pointer left the view. Leaving through the top edge counts as
         /// reaching it: a quick flick upwards can skip the top 2 px between
-        /// two coalesced move events.
+        /// two coalesced move events, and when a window covers the top under
+        /// the pointer (the full-screen menu bar sliding down) the exit is
+        /// reported a little *below* the edge (`exited_through_top`).
         #[unsafe(method(mouseExited:))]
         fn mouse_exited(&self, event: &NSEvent) {
-            let (_, py) = self.pointer_px(event);
-            if py < 0.0 {
-                self.feed_reveal(py);
+            let (px, py) = self.pointer_px(event);
+            self.note_pointer("exit", py);
+            let (w, h) = self.ivars().state.size();
+            let scale = self.ivars().state.scale();
+            if exited_through_top(px, py, f64::from(w), f64::from(h), scale) {
+                // Counts as reaching the edge, wherever exactly it was seen.
+                self.feed_reveal(py.min(0.0));
             }
         }
 
@@ -427,6 +450,7 @@ impl VideoView {
             state,
             layer: layer.clone(),
             reveal: Cell::new(Reveal::default()),
+            pointer_seen: Cell::new(false),
             wheel: Cell::new(WheelAccumulator::default()),
         });
         // SAFETY: NSView's designated initializer.
@@ -504,7 +528,10 @@ impl VideoView {
     /// Keyboard for the remote. Consumes the event (returns `true`) only
     /// while it is meant for the remote: we are visible, focused in the key
     /// window, and a session with control has installed an input sink.
-    /// Otherwise local shortcuts (Cmd+Q, Cmd+,) keep working.
+    /// Otherwise local shortcuts (Cmd+Q, Cmd+,) keep working; Cmd+Q always
+    /// does (the escape hatch), even while the remote has the keyboard.
+    /// With shortcut capture on, the tap (`shortcut_hook.rs`) takes every
+    /// other Command chord before it gets here.
     fn handle_key(&self, event: &NSEvent) -> bool {
         if self.isHidden() || !self.ivars().state.input().has_sink() {
             return false;
@@ -522,10 +549,31 @@ impl VideoView {
         let mut input = self.ivars().state.input();
         match event.r#type() {
             NSEventType::KeyDown | NSEventType::KeyUp => {
+                let down = event.r#type() == NSEventType::KeyDown;
+                let code = keymap::dom_code(key_code);
+                // Cmd+Q is the local escape hatch (M12): its key-down goes on
+                // to the menu bar's Quit, and its key-up too unless the remote
+                // got the press. The shortcut tap passes it on for the same
+                // reason (`shortcut_filter::is_local_quit`).
+                let held = code.is_some_and(|c| input.is_key_held(c));
+                if !held {
+                    let flags = event.modifierFlags().0 as u64;
+                    let ch = event
+                        .charactersIgnoringModifiers()
+                        .and_then(|s| single_char(&s.to_string()));
+                    let quit = if down {
+                        shortcut_filter::is_local_quit(key_code, flags, ch)
+                    } else {
+                        shortcut_filter::is_q(key_code, ch)
+                    };
+                    if quit {
+                        return false;
+                    }
+                }
                 // Unmapped keys (Fn) are consumed too: they mean nothing
                 // locally while the remote has focus.
-                if let Some(code) = keymap::dom_code(key_code) {
-                    input.key(code, event.r#type() == NSEventType::KeyDown);
+                if let Some(code) = code {
+                    input.key(code, down);
                 }
             }
             NSEventType::FlagsChanged => {
@@ -605,17 +653,64 @@ impl VideoView {
     }
 
     fn feed_reveal(&self, y_px: f64) {
+        let scale = self.ivars().state.scale();
+        let cover_px = self.system_cover_pt() * scale;
         let mut reveal = self.ivars().reveal.get();
-        let change = reveal.on_pointer(y_px, self.ivars().state.scale());
+        let change = reveal.on_pointer_under_cover(y_px, scale, cover_px);
         self.ivars().reveal.set(reveal);
-        if change.is_some() {
+        if let Some(change) = change {
             self.apply_layout();
+            // WHY at debug: the device pass (checklists/M6.md §6) reads this
+            // to tell "the transition never fired" (no line) from "it fired
+            // but nothing moved" (frames unchanged).
+            tracing::debug!(
+                "toolbar reveal: {change:?} at y={y_px:.1}px (scale {scale}, system cover \
+                 {cover_px:.0}px); view frame {:?}, layer frame {:?}",
+                self.frame(),
+                self.ivars().layer.frame(),
+            );
         }
+    }
+
+    /// Log, once per show, that pointer events reach the view at all.
+    fn note_pointer(&self, what: &str, y_px: f64) {
+        if !self.ivars().pointer_seen.replace(true) {
+            tracing::debug!("video view: pointer events arrive (first {what} at y={y_px:.1}px)");
+        }
+    }
+
+    /// Height in points of what macOS draws over the window's top while the
+    /// pointer is up there: in native full screen, the menu bar (taller on a
+    /// display with a camera housing: the screen's top safe-area inset) plus
+    /// the title bar that slides down with it. Zero outside full screen,
+    /// where the title bar is above the content, not over it.
+    fn system_cover_pt(&self) -> f64 {
+        let Some(window) = self.window() else {
+            return 0.0;
+        };
+        if !window.styleMask().contains(NSWindowStyleMask::FullScreen) {
+            return 0.0;
+        }
+        let menu_bar = window
+            .screen()
+            .map_or(0.0, |s| s.safeAreaInsets().top)
+            .max(MENU_BAR_PT);
+        // The title bar's height for a standard titled window, as AppKit
+        // computes it (what the full-screen overlay shows).
+        let content = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(100.0, 100.0));
+        let frame = NSWindow::frameRectForContentRect_styleMask(
+            content,
+            NSWindowStyleMask::Titled,
+            self.mtm(),
+        );
+        let title_bar = (frame.size.height - content.size.height).max(0.0);
+        menu_bar + title_bar
     }
 
     /// Forget the reveal (show / hide) and restore the full frame if the bar
     /// was up.
     pub(crate) fn reset_reveal(&self) {
+        self.ivars().pointer_seen.set(false);
         let mut reveal = self.ivars().reveal.get();
         let change = reveal.reset();
         self.ivars().reveal.set(reveal);
@@ -698,6 +793,28 @@ impl VideoView {
         without_animation(|| {
             if self.frame() != frame {
                 self.setFrame(frame);
+            }
+            // WHY set the layer's frame too: this is a layer-hosting view
+            // (we own the layer), and the shrink only uncovers the toolbar if
+            // the layer shrinks with the view. AppKit normally keeps a view's
+            // root layer at the view's frame; if it ever does not, the strip
+            // stays painted by us while hit-testing already goes to the page
+            // below (bar invisible but clickable). The parent's layer uses
+            // its view's coordinates (AppKit flips layer geometry to match),
+            // so the view's frame is also the layer's — but only when our
+            // layer sits directly in the parent's layer (AppKit may insert a
+            // container layer, whose coordinates we do not know). A no-op
+            // when AppKit already did it.
+            let in_parent_layer = layer
+                .superlayer()
+                .zip(parent.layer())
+                .is_some_and(|(sup, own)| Retained::as_ptr(&sup) == Retained::as_ptr(&own));
+            if in_parent_layer && layer.frame() != frame {
+                tracing::debug!(
+                    "video view: layer frame {:?} did not follow the view frame {frame:?}; set it",
+                    layer.frame()
+                );
+                layer.setFrame(frame);
             }
             layer.setContentsScale(scale);
             // "bottom" is the layer's minimum Y. Unflipped layer geometry

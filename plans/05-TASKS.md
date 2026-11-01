@@ -49,7 +49,7 @@
 | W2 software codec selection | **done** (Sonnet, Opus-reviewed) | H.264 policy on Windows: hardware → MF software decoder → OpenH264 (only while `useOpenH264` is on); `h264_problem()` gives an actionable report when Media Foundation has no H.264 MFTs (N editions without the Media Feature Pack fail at launch — documented). Machine-B check: ignored test + log line "no hardware H264 decoder — using software decode" |
 | D7 release pipeline | **done** `448df49` (Opus, Opus-reviewed) | tag-triggered `release.yml` → reusable `build-assets.yml` → `scripts/release-assets.sh` (one recipe); NSIS/DMG/AppImage/deb/rpm, SHA256SUMS, per-OS third-party notices generated and attached (never committed), version read from cargo metadata, actions pinned to SHAs; macOS: certificate required when the secrets exist, ad-hoc only without them. macOS leg + AppImage verified only on GitHub |
 | D8 modifier translation | **done** (Opus, Opus-reviewed; I2 device pass pending) | viewer-side `KeyTranslator` (`engine/src/modifiers.rs`): Cmd ↔ Ctrl swap and Cmd+Tab→Alt+Tab (Mac → PC), Ctrl ↔ Cmd and Alt+Tab→Cmd+Tab (PC → Mac), sent-code tracking; host OS via new optional `connect-response.os`; `translateModifiers` toggle (default on) in Settings → Advanced; unit + loopback-tested. **Device-pending** (I2 Mac↔Windows); closes M6's blocked Cmd+Tab line |
-| M12 take every Cmd shortcut (macOS viewer) | **in progress** (Opus) | M6 tap takes all Cmd combinations while the video has the keyboard; Cmd+Q stays local; owner feedback from the Mac→Ubuntu live test |
+| M12 take every Cmd shortcut (macOS viewer) | **in review** (Opus, branch `task/M12`; type-checked for aarch64-apple-darwin, device-pending) | M6 tap takes every Cmd chord + Ctrl+arrows while the video has the keyboard; Cmd+Q stays local (tap and key monitor); Force Quit / Lock Screen never claimed; every modifier synchronised before a taken key; hook keys now share the surface's FIFO input channel (D8 ordering risk closed); focus loss releases at once. Also: toolbar-reveal diagnostics + layer-frame sync + full-screen cover (owner's "top edge does nothing"). **Device-pending** (checklists/M6.md §6–§7) |
 | D9 host cursor sprite on the viewer | **in progress** (Opus) | additive cursor-shape message, host sends on change, viewer draws the real sprite at position−hotspot in both presenters; replaces the synthetic triangle |
 | T4 Wayland CI | **done** (Haiku, Opus-reviewed; jobs unverified until pushed; GNOME portal tests are device-pass items) | `native-ci.yml` jobs `wayland-sway` (ubuntu-24.04: sway + xdg-desktop-portal-wlr + pipewire + wireplumber; runs L5 `wayland_surface`, L1 `portal_capture --ignored`, and L6 `input::tests` minus uinput and `xtest_*`) and `wayland-gnome` (ubuntu-24.04: mutter 46 + xdg-desktop-portal-gnome; proves the stack, runs no test: the consent dialog has no headless pre-authorization, so the libei and GNOME portal-capture tests are device-pass items). Scripts in `.github/wayland/`. Local (lane, WSL): `wayland_surface` PASS (T4-02); `input::tests` wlroots and EIS pass, uinput fails under REQUIRED as designed (T4-03). Owner verification after the push: see the T4 card |
 | L5 video surface | **done** (Opus, Opus-reviewed; device-pending per checklists/L5.md) | X11: child window of the GTK toplevel on our own x11rb connection, XShape reveal clip, XDND drops via `XdndProxy`, Expose → redraw of the last frame. Wayland: the spike's area+video subsurface tree on GDK's connection (re-attached when GDK re-creates the toplevel surface), `wp_viewporter` crop + fractional scale, drops through GDK's own data device (sink window); decision-#3 separate window when there is no `wp_viewporter` or `SHARECTRL_VIDEO_WINDOW=separate`. Keys from the GTK toplevel on both (keymap: XKB − 8 = evdev). One wgpu presenter (Vulkan, GL fallback) over `surface-wgpu`. Headless tests: `tests/x11_surface.rs` (Xvfb), `tests/wayland_surface.rs` (headless sway). **Device-pending** (checklists/L5.md) |
@@ -651,6 +651,8 @@ to run (TCC). Use `objc2` 0.6-family crates throughout (`objc2-app-kit`,
   * Risks: on a Mac viewer, Cmd comes through the surface path and Tab through the M6 tap.
     Their relative order is M6's guarantee (it forwards Cmd itself when the surface has
     not). If Tab ever reached the translator first, the host would get Tab, then Ctrl.
+    (Closed by M12: hook keys now join the surface's FIFO channel, and the tap forwards
+    every modifier the surface has not sent yet.)
     A Mac user's habits around Control change meaning on a PC host: a lone Control tap is a
     Win/Super tap (Start menu, GNOME Activities), and Control+click is Win+click, not the
     macOS secondary click (nothing maps it to a right-click).
@@ -684,6 +686,71 @@ to run (TCC). Use `objc2` 0.6-family crates throughout (`objc2-app-kit`,
 * Acceptance (I2, real Mac → Ubuntu/Windows): Cmd+Enter, Cmd+Shift+4, Cmd+Opt+D, Cmd+C/V
   arrive on the host (translated or literal per the toggle); Cmd+Q still quits the viewer;
   clicking the desktop restores local shortcuts; nothing stuck.
+* **As built (branch `task/M12`, in review; type-checked for aarch64-apple-darwin, the pure
+  filter tests run on every OS; device-pending, checklists/M6.md §6):**
+  * What is taken (`platform-macos/src/shortcut_filter.rs`, pure): every key-down carrying
+    Command, with any other modifiers, plus Ctrl+arrows (with any other modifiers), while
+    the video view has the keyboard (M6's focus rule, unchanged). WHY a tap for all of them:
+    AppKit offers a Command chord to `performKeyEquivalent:` down the key window's views
+    (WKWebView takes Cmd+C/V/A/Z) and then to the menu bar before `keyDown:`, and the Dock,
+    Spotlight, Mission Control and the screenshot service act on theirs before the app sees
+    them (Cocoa Event Handling Guide, "The Path of Key Events"); only a session tap is ahead
+    of all of them.
+  * **Cmd+Q stays local**: Command alone + the key the layout types as "q" (AppKit matches
+    menu key equivalents by character; physical ANSI Q when the layout types no Latin letter
+    there). The tap passes it, and the video view's key monitor (`view.rs`), which used to
+    send Cmd+Q to the remote, now lets it through to the menu bar's Quit (Tauri's default
+    macOS menu) — with or without shortcut capture. Cmd+Shift+Q and Cmd+Option+Q go to the
+    remote.
+  * **Cannot be taken** (listed in `NEVER_TAKEN`, never claimed even if delivered): Force
+    Quit Cmd+Option+Esc (also with Shift), Lock Screen Cmd+Ctrl+Q. Never delivered to a
+    tap at all: Touch ID / power, media and brightness keys (system-defined events below
+    the tap's mask; "Lower levels of the system trap and handle some events early"), and
+    every key while Secure Input is on. Screenshots (Cmd+Shift+3/4/5) are now taken — M6
+    left them local; the M12 acceptance wants Cmd+Shift+4 on the host.
+  * Sentinel (own injected events, `Key::own`) and the `kCGEventTapDisabledByTimeout`
+    re-enable + health check are unchanged; the sentinel decision moved into the pure
+    filter so it is tested.
+  * **Ordering (the D8 reviewer's open risk), two parts.** (1) The engine's shortcut-hook
+    forwarder no longer locks the translator from the hook thread: it sends
+    `VideoInput::Key` into the **same FIFO channel** as the surface (`engine/src/session/mod.rs`
+    `hook_forwarder`). Before, a surface Cmd waiting in that channel (behind the input
+    thread's up-to-10 ms move pacing) could reach the translator after the hook's C. Codes
+    outside the shared keymap, and sends after the input thread ended, fall back to the
+    translator directly; the input loop now drains queued keys when the session stops.
+    (2) M6's "forward the chord's modifier unless the surface already holds it" now covers
+    all eight modifier keys (Cmd, Ctrl, Option, Shift, both sides) both ways: a modifier
+    down in the event's flags that the surface has not sent is forwarded first (and released
+    by the tap later); one the surface still holds but the flags no longer carry is released
+    first (a later duplicate up from the surface is harmless). Cmd+Shift+4 can no longer
+    reach the host as Cmd+4.
+  * Focus loss: besides the view's `release_all` (surface-held keys), the filter releases
+    every key and modifier it holds the moment focus goes (checked on every tap event and
+    every 50 ms run-loop turn); a taken key still physically held stays swallowed, silently,
+    until its key-up (the app that now has the keyboard never saw it go down). Key-ups of
+    keys pressed before capture pass (the monitor forwards them). No new setting.
+  * D8 still applies downstream: with "Translate modifiers" on (Settings → Advanced), Cmd
+    arrives on Windows/Linux as Ctrl (Cmd+C = Ctrl+C, Cmd+Tab = Alt+Tab); off, as Super/Win.
+  * Tests: `tests/shortcut_filter.rs` (runs on Windows/Linux too): any Cmd chord taken
+    (incl. Cmd+Enter, Cmd+Shift+4, Cmd+Opt+D, Cmd+Ctrl+F, F3, Esc), Ctrl+arrows with extra
+    modifiers, plain/non-Cmd chords untouched, Cmd+Q and its layout rule, reserved combos
+    listed and never claimed, sentinel ignored (also for flagsChanged and key-up), modifier
+    synchronisation both ways, a Cmd pressed before capture released on the host, focus loss
+    releases at once with orphans swallowed, stale orphans, release_all. Engine:
+    `hook_keys_queue_behind_the_surface_keys_sent_before_them`, the fallback, the stop drain.
+    macOS unit test pins the filter's modifier table to `keymap::MODIFIERS`.
+  * Toolbar reveal (scope addition, owner: "hovering the top edge does nothing", window not
+    full screen, flick out the top does nothing): not reproducible here. Added (a) a debug
+    line on every reveal transition with the view and layer frames, and a once-per-show
+    "pointer events arrive" line, so app.log tells "events never arrive" from "transition
+    fires but nothing moves"; (b) `apply_layout` now sets the layer's frame to the view's
+    when it did not follow (layer-hosting view; only when the layer sits directly in the
+    parent's layer); (c) `exited_through_top` (surface-wgpu, pure, tested): an exit within
+    8 CSS px of the top and nearer it than any side counts; (d) native full screen: the
+    menu bar + title bar overlay (`system_cover_pt`) moves the hide depth below it
+    (`Reveal::on_pointer_under_cover`, tested), otherwise the bar hid in the move that
+    uncovered it. Diagnosis and device steps: checklists/M6.md §7.
+  * platform-api: no change. New objc2-app-kit feature `NSScreen` (no new crate).
 
 ### D9 — Draw the host's real cursor sprite on the viewer  (size M, all OSes; owner feedback 2026-11-01)
 * Problem: every viewer draws a synthetic white triangle at the out-of-band pointer position

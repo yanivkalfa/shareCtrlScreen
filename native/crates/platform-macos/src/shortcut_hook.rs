@@ -1,8 +1,18 @@
 //! `impl ShortcutHook` for macOS: a Quartz event tap that, while the video
-//! view has the keyboard, takes the shortcuts macOS would act on itself
-//! (Cmd+Tab, Cmd+\`, Cmd+Space, Ctrl+arrows) and sends them to the remote
-//! instead. Which events are taken, and what is forwarded, is decided by the
-//! pure [`ShortcutFilter`]; this module is the OS plumbing around it.
+//! view has the keyboard, takes every Command chord (except Cmd+Q, the local
+//! escape hatch) and Ctrl+arrows — the shortcuts macOS, the menu bar or
+//! WebKit would act on before the video view sees them — and sends them to
+//! the remote instead. Which events are taken, and what is forwarded, is
+//! decided by the pure [`ShortcutFilter`]; this module is the OS plumbing
+//! around it.
+//!
+//! ## Why a tap for every Command chord (M12)
+//! AppKit hands a key-down carrying Command to `performKeyEquivalent:` down
+//! the key window's view hierarchy (the `WKWebView` claims Cmd+C/V/A/Z…) and
+//! then to the menu bar, and the Dock, Spotlight, Mission Control and the
+//! screenshot service act on their own chords before the app sees them at
+//! all. A session tap sits ahead of every one of them: what it drops never
+//! reaches the window server's hot-key handling, the menu bar or WebKit.
 //!
 //! ## The tap
 //! An **active** tap (`kCGEventTapOptionDefault`: it may drop events) at the
@@ -37,8 +47,10 @@
 //!   thread on every focus change (first responder, key window, hidden), and
 //!   nothing is taken without it. Clicking another window or app clears it
 //!   before the next key event arrives.
-//! * Force Quit (Cmd+Option+Esc) is never taken, even if our main thread
-//!   hangs with the flag still set.
+//! * Focus loss is also polled on every run-loop turn (≤ 50 ms), so what the
+//!   tap holds on the host is released even when no key follows the click.
+//! * Force Quit (Cmd+Option+Esc), Lock Screen (Cmd+Ctrl+Q) and Cmd+Q are
+//!   never taken, even if our main thread hangs with the flag still set.
 //! * Accessibility revoked while the tap runs: macOS may then block input,
 //!   and `AXIsProcessTrusted` keeps answering `true`. The health check
 //!   therefore probes by creating a throwaway active tap (`NULL` = no longer
@@ -66,7 +78,18 @@
 //!   <https://developer.apple.com/documentation/coregraphics/cgeventtype/tapdisabledbytimeout>
 //! * `CGEventTapEnable`, `CGEventTapIsEnabled`:
 //!   <https://developer.apple.com/documentation/coregraphics/cgevent/tapenable(tap:enable:)>
-//! * `kCGKeyboardEventKeycode`, `kCGEventSourceUserData`, `CGEventGetFlags`:
+//! * `CGEventKeyboardGetUnicodeString` (the character a key event types,
+//!   used to find the layout's "q"):
+//!   <https://developer.apple.com/documentation/coregraphics/cgevent/keyboardgetunicodestring(maxstringlength:actualstringlength:unicodestring:)>
+//! * Key equivalents go down the key window's views via
+//!   `performKeyEquivalent:`, then to the menu bar, before `keyDown:`; some
+//!   reserved keys are handled below the app and never routed to it
+//!   (Cocoa Event Handling Guide, "The Path of Key Events" and "How an Event
+//!   Enters a Cocoa Application"):
+//!   <https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/EventOverview/EventArchitecture/EventArchitecture.html>,
+//!   <https://developer.apple.com/documentation/appkit/nsresponder/performkeyequivalent(_:)>
+//! * `kCGKeyboardEventKeycode`, `kCGKeyboardEventAutorepeat`,
+//!   `kCGEventSourceUserData`, `CGEventGetFlags`:
 //!   <https://developer.apple.com/documentation/coregraphics/cgeventfield>,
 //!   <https://developer.apple.com/documentation/coregraphics/cgeventflags>
 //! * `CFMachPortCreateRunLoopSource`, `CFMachPortInvalidate`:
@@ -105,7 +128,7 @@ use platform_api::{KeyForwarder, ShortcutHook, VideoSurface};
 use surface_wgpu::SurfaceState;
 
 use crate::inject_state::INJECT_SENTINEL;
-use crate::shortcut_filter::{KeyEvent, ShortcutFilter, Verdict};
+use crate::shortcut_filter::{self, Key, KeyEvent, ShortcutFilter, Verdict};
 use crate::surface::MacVideoSurface;
 use crate::{keymap, permissions};
 
@@ -181,6 +204,15 @@ impl TapContext {
         })
     }
 
+    /// Follow the view's keyboard focus between key events: a click on
+    /// another window releases what the tap holds on the host at once.
+    fn sync_focus(&self) {
+        if let Ok(mut filter) = self.filter.try_borrow_mut() {
+            let focused = self.state.has_key_focus();
+            filter.set_focus(focused, &mut |key, down| self.forward_key(key, down));
+        }
+    }
+
     /// Send every release still owed (the tap missed, or will miss, them).
     fn release_owed(&self) {
         if let Ok(mut filter) = self.filter.try_borrow_mut() {
@@ -213,29 +245,67 @@ impl TapContext {
             _ => return Verdict::Pass,
         };
         // Our own injector's events (a host on this same Mac) are not the
-        // user's keys; taking them would feed the remote its own input.
-        if CGEvent::integer_value_field(Some(event), CGEventField::EventSourceUserData)
-            == INJECT_SENTINEL
-        {
-            return Verdict::Pass;
-        }
+        // user's keys; the filter passes them untouched (`Key::own`).
+        let own = CGEvent::integer_value_field(Some(event), CGEventField::EventSourceUserData)
+            == INJECT_SENTINEL;
         let raw_key = CGEvent::integer_value_field(Some(event), CGEventField::KeyboardEventKeycode);
         let Ok(key) = u16::try_from(raw_key) else {
             return Verdict::Pass;
         };
         let flags = CGEvent::flags(Some(event)).0;
+        let down = kind == KeyEvent::Down && !own;
+        // Only a key-down's decision needs the character ("is this Q?").
+        let ch = if down { typed_char(event) } else { None };
+        let repeat = down
+            && CGEvent::integer_value_field(Some(event), CGEventField::KeyboardEventAutorepeat)
+                != 0;
         let focused = self.state.has_key_focus();
+        if down && focused {
+            if let Some(reserved) = shortcut_filter::never_taken(key, flags, ch) {
+                tracing::debug!("{} stays with macOS", reserved.name);
+            }
+        }
         let Ok(mut filter) = self.filter.try_borrow_mut() else {
             return Verdict::Pass;
         };
         filter.on_event(
-            kind,
-            key,
-            flags,
+            Key {
+                kind,
+                code: key,
+                flags,
+                ch,
+                repeat,
+                own,
+            },
             focused,
             |k| self.surface_holds(k),
             &mut |k, down| self.forward_key(k, down),
         )
+    }
+}
+
+/// The single character a key event types on the current layout, if it
+/// types exactly one (dead keys and ligatures yield `None`).
+fn typed_char(event: &CGEvent) -> Option<char> {
+    // `UniChar` (a UTF-16 unit) and `UniCharCount` (`unsigned long`), as
+    // `MacTypes.h` defines them; objc2 keeps its aliases crate-private.
+    let mut buf: [u16; 4] = [0; 4];
+    let mut len: std::ffi::c_ulong = 0;
+    // SAFETY: `len` and `buf` are valid for writes, and `max_string_length`
+    // is `buf`'s length, so Quartz writes at most that many UTF-16 units.
+    unsafe {
+        CGEvent::keyboard_get_unicode_string(
+            Some(event),
+            buf.len() as std::ffi::c_ulong,
+            &mut len,
+            buf.as_mut_ptr(),
+        );
+    }
+    let units = buf.get(..usize::try_from(len).ok()?)?;
+    let mut chars = char::decode_utf16(units.iter().copied());
+    match (chars.next(), chars.next()) {
+        (Some(Ok(c)), None) => Some(c),
+        _ => None,
     }
 }
 
@@ -395,7 +465,7 @@ impl ShortcutHook for EventTapHook {
         let port = ctx.port.get_or_init(|| port);
         run_loop.add_source(Some(&source), Some(mode));
         CGEvent::tap_enable(port, true);
-        tracing::info!("shortcut capture on: Cmd+Tab, Cmd+`, Cmd+Space and Ctrl+arrows go to the remote while its window has the keyboard");
+        tracing::info!("shortcut capture on: every Cmd shortcut except Cmd+Q, and Ctrl+arrows, go to the remote while its window has the keyboard");
         // WHY install anyway under Secure Input: it is often on only briefly
         // (a password manager, a background Terminal with Secure Keyboard
         // Entry). The tap exists but sees no keys until it ends, and the
@@ -428,6 +498,7 @@ impl ShortcutHook for EventTapHook {
                 // spin on it.
                 std::thread::sleep(POLL);
             }
+            tap.ctx.sync_focus();
             if Instant::now() >= next_check {
                 next_check = Instant::now() + HEALTH_EVERY;
                 if !Self::check_health(tap) {
@@ -466,21 +537,44 @@ mod tests {
     use crate::shortcut_filter::kvk;
 
     #[test]
-    fn every_key_the_filter_forwards_has_a_dom_code() {
+    fn the_filter_key_codes_have_the_dom_codes_they_stand_for() {
         for (key, dom) in [
-            (kvk::TAB, "Tab"),
-            (kvk::SPACE, "Space"),
-            (kvk::GRAVE, "Backquote"),
             (kvk::COMMAND, "MetaLeft"),
             (kvk::RIGHT_COMMAND, "MetaRight"),
             (kvk::CONTROL, "ControlLeft"),
             (kvk::RIGHT_CONTROL, "ControlRight"),
+            (kvk::OPTION, "AltLeft"),
+            (kvk::RIGHT_OPTION, "AltRight"),
+            (kvk::SHIFT, "ShiftLeft"),
+            (kvk::RIGHT_SHIFT, "ShiftRight"),
             (kvk::LEFT_ARROW, "ArrowLeft"),
             (kvk::RIGHT_ARROW, "ArrowRight"),
             (kvk::DOWN_ARROW, "ArrowDown"),
             (kvk::UP_ARROW, "ArrowUp"),
+            (kvk::ESCAPE, "Escape"),
+            (kvk::ANSI_Q, "KeyQ"),
         ] {
             assert_eq!(keymap::dom_code(key), Some(dom), "{key:#04x}");
+        }
+    }
+
+    /// The filter keeps its own copy of the eight modifier keys (it must stay
+    /// std-only to run on every OS); it must agree with the surface's table,
+    /// or the tap and the view would disagree about which key is down.
+    #[test]
+    fn the_filter_modifiers_match_the_keymap() {
+        assert_eq!(
+            keymap::MODIFIERS.len(),
+            shortcut_filter::MODIFIER_KEYS.len()
+        );
+        for m in shortcut_filter::MODIFIER_KEYS {
+            let k = keymap::modifier(m.code);
+            assert_eq!(
+                k.map(|k| (k.flag, k.device_bit)),
+                Some((m.flag, m.side_bit)),
+                "{:#04x}",
+                m.code
+            );
         }
     }
 

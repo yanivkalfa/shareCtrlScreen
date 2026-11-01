@@ -44,7 +44,7 @@ in `plans/`; `plans/00-DECISIONS.md` overrides everything, including this file.
    "in progress" rows name the branch, tier and agent.
 3. Prove the base is green on both local OSes before handing anything out:
    - Windows: `cd native && cargo test --workspace`
-   - Linux: `wsl -e bash -lc 'source $HOME/.cargo/env; cd /mnt/c/Yanivs/shareCtrlScreen/native && CARGO_TARGET_DIR=/tmp/sct-base cargo test --workspace'`
+   - Linux: `wsl -e bash -lc 'source $HOME/.cargo/env; cd /mnt/c/Yanivs/shareCtrlScreen/native && CARGO_TARGET_DIR=$HOME/sct/base cargo test --workspace'`
 4. Verify `rustup target list --installed` includes `aarch64-apple-darwin` and
    `x86_64-unknown-linux-gnu` (macOS code is type-checked with
    `cargo check -p platform-macos --target aarch64-apple-darwin`).
@@ -52,10 +52,10 @@ in `plans/`; `plans/00-DECISIONS.md` overrides everything, including this file.
    19 cold worktrees each recompiled ~400 dependencies, 15–30 min apiece under
    contention). On `port/multi-os` run the full gate once so `native/target`
    holds debug + test artifacts, and in WSL build once into
-   `/tmp/sct-base`. Then, right after the harness creates a builder's worktree
+   `$HOME/sct/base`. Then, right after the harness creates a builder's worktree
    (its path is in the launch result), copy the caches in before the builder
    gets far: `robocopy native\target <worktree>\native\target /E /NFL /NDL /NJH /NJS`
-   on Windows and `cp -r /tmp/sct-base /tmp/sct-<ID>` in WSL (tell the builder
+   on Windows and `cp -r $HOME/sct/base $HOME/sct/<ID>` in WSL (tell the builder
    to use that `CARGO_TARGET_DIR`). Cargo reuses the artifacts; a warm
    worktree builds in under a minute.
 
@@ -129,7 +129,7 @@ Standard of work — production grade, long term:
 
 Building: use `CARGO_BUILD_JOBS=4` (other builders share this machine) and
 `cargo check -p <crate>` while iterating. Linux: run in WSL with
-`wsl -e bash -lc 'source $HOME/.cargo/env; cd <your worktree under /mnt/c>/native && CARGO_TARGET_DIR=/tmp/sct-<ID> ...'`.
+`wsl -e bash -lc 'source $HOME/.cargo/env; cd <your worktree under /mnt/c>/native && CARGO_TARGET_DIR=$HOME/sct/<ID> ...'`.
 macOS code cannot run here; type-check with
 `cargo check -p platform-macos --target aarch64-apple-darwin` and
 `cargo clippy -p platform-macos --target aarch64-apple-darwin -- -D warnings`.
@@ -200,13 +200,22 @@ APPROVE.
    **reclaim the disk** — each worktree carries a 3–5 GB `target/` and the WSL
    build another 2–4 GB: `git worktree remove --force <path>`,
    `git branch -d task/<ID> worktree-agent-<id>`, and in WSL
-   `rm -rf /tmp/sct-<ID>`. At session end, `git worktree prune`, check
-   `.claude/worktrees` holds only live tasks, and `wsl -e bash -lc 'du -sh /tmp/sct-*'`
+   `rm -rf $HOME/sct/<ID>`. At session end, `git worktree prune`, check
+   `.claude/worktrees` holds only live tasks, and `wsl -e bash -lc 'du -sh $HOME/sct/*'`
    for strays. A worktree whose removal fails with "Permission denied" (a
    finished agent still holds a file) is `rm -rf`'d once the agent is idle,
    then `git worktree prune`. The owner's expectation: when the orchestration
    is complete, no worktree and no per-task cache remains — only the main
-   checkout, `native/target` and `/tmp/sct-base`.
+   checkout, `native/target` and `$HOME/sct/base`.
+   Caches live under `$HOME/sct/` on purpose: Ubuntu wipes `/tmp` on every WSL
+   restart (`wsl --shutdown` erased a 13 GB warm cache in wave 1).
+   **WSL disk:** deleting `$HOME/sct/<ID>` frees space inside WSL only; the
+   `ext4.vhdx` under `%LOCALAPPDATA%\wsl\` keeps its grown size (wave 1 left it
+   at 92 GB for 19 GB of content). After each wave's sweep: in WSL `fstrim /`,
+   then `wsl --shutdown`, then elevated `diskpart` (`select vdisk file=…`,
+   `attach vdisk readonly`, `compact vdisk`, `detach vdisk`) — via
+   `Start-Process cmd -Verb RunAs`, which needs the owner's UAC click. Do not
+   use `--set-sparse --allow-unsafe`.
 
 Findings always go to the original builder. After two rejected rounds on the
 same point, escalate the task one tier up with the full history attached.
@@ -249,7 +258,7 @@ recommendation. Never call something done that the gate did not pass here.
 - `cargo check --target …` of the *whole workspace* from Windows fails in
   `aws-lc-sys`; per-crate checks of `platform-macos`/`platform-linux` work.
 - Shared `target/` dirs serialize cargo; one target dir per worktree, and
-  `CARGO_TARGET_DIR=/tmp/sct-<ID>` in WSL.
+  `CARGO_TARGET_DIR=$HOME/sct/<ID>` in WSL.
 - WSL `git` leaves Windows `git status` showing phantom changes until the next
   Windows-side `git status`; stat-cache noise.
 - LF→CRLF commit warnings are harmless.

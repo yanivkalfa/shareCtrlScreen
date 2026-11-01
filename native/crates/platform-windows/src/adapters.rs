@@ -79,7 +79,13 @@ const SHAPE_MASKED_COLOR: u32 = 4;
 ///   transparent.
 /// * Monochrome: two stacked 1-bpp masks (AND above XOR), so the real height is
 ///   half. AND=1,XOR=0 is transparent; AND=0 is black/white by XOR; AND=1,XOR=1
-///   (invert) is drawn black so it stays visible.
+///   (invert) is drawn black with a 1-px white outline (see [`outline_inverting`]).
+///
+/// ## References
+/// * `DXGI_OUTDUPL_POINTER_SHAPE_TYPE`:
+///   <https://learn.microsoft.com/windows/win32/api/dxgi1_2/ne-dxgi1_2-dxgi_outdupl_pointer_shape_type>
+/// * WebRTC `modules/desktop_capture/win/cursor.cc` (`AddCursorOutline`): the same
+///   black-plus-white-outline stand-in for inverting pixels.
 pub(crate) fn pointer_shape_to_bgra(
     kind: u32,
     width: u32,
@@ -117,10 +123,12 @@ pub(crate) fn pointer_shape_to_bgra(
             }
             let bit = |row: usize, x: usize| (data[row * pitch + x / 8] >> (7 - (x % 8))) & 1;
             let mut out = Vec::with_capacity(w * h * 4);
+            let mut inverting = vec![false; w * h];
             for y in 0..h {
                 for x in 0..w {
                     let and = bit(y, x);
                     let xor = bit(y + h, x);
+                    inverting[y * w + x] = and == 1 && xor == 1;
                     out.extend_from_slice(match (and, xor) {
                         (0, 0) => &[0, 0, 0, 255],
                         (0, _) => &[255, 255, 255, 255],
@@ -129,9 +137,32 @@ pub(crate) fn pointer_shape_to_bgra(
                     });
                 }
             }
+            outline_inverting(&mut out, &inverting, w, h);
             Some((width, h as u32, out))
         }
         _ => None,
+    }
+}
+
+/// Inverting pixels (screen XOR) cannot be reproduced on the viewer, which
+/// only blends. Drawn plain black, the standard Windows I-beam (an inverting
+/// monochrome cursor) disappears on a dark terminal, so every transparent pixel
+/// touching an inverting one (8-neighbourhood) becomes opaque white: a black
+/// line with a white rim reads on any background. `out` is straight BGRA,
+/// `inverting` one flag per pixel, both `w * h` row-major.
+fn outline_inverting(out: &mut [u8], inverting: &[bool], w: usize, h: usize) {
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            if out[i * 4 + 3] != 0 {
+                continue; // only transparent pixels become outline
+            }
+            let near = (y.saturating_sub(1)..(y + 2).min(h))
+                .any(|ny| (x.saturating_sub(1)..(x + 2).min(w)).any(|nx| inverting[ny * w + nx]));
+            if near {
+                out[i * 4..i * 4 + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
+        }
     }
 }
 
@@ -194,6 +225,9 @@ impl ScreenCapture for DdaCapture {
                     },
                 )
             });
+            // A shape DXGI reported but we could not convert (unknown type,
+            // short buffer) leaves the previous hotspot and the viewer's
+            // previous image in place: the best guess we have.
             if let Some(s) = &shape {
                 self.hotspot = s.hotspot;
             }
@@ -668,15 +702,43 @@ mod tests {
     fn monochrome_uses_stacked_and_xor_masks() {
         // 8x1 cursor: AND row then XOR row, 1 byte pitch.
         // px0: and=0,xor=0 black; px1: and=0,xor=1 white; px2: and=1,xor=0 clear;
-        // px3: and=1,xor=1 invert → black.
-        let and = 0b0011_0000u8;
+        // px3: and=1,xor=1 invert → black; px6: clear, far from any invert.
+        let and = 0b0011_1111u8;
         let xor = 0b0101_0000u8;
         let (w, h, px) = pointer_shape_to_bgra(SHAPE_MONOCHROME, 8, 2, 1, &[and, xor]).unwrap();
         assert_eq!((w, h), (8, 1));
         assert_eq!(&px[0..4], &[0, 0, 0, 255]);
         assert_eq!(&px[4..8], &[255, 255, 255, 255]);
-        assert_eq!(&px[8..12], &[0, 0, 0, 0]);
         assert_eq!(&px[12..16], &[0, 0, 0, 255]);
+        assert_eq!(&px[24..28], &[0, 0, 0, 0]);
+        // px2 and px4 are clear but touch the inverting px3: white outline.
+        assert_eq!(&px[8..12], &[255, 255, 255, 255]);
+        assert_eq!(&px[16..20], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn inverting_i_beam_gets_a_white_rim_so_it_shows_on_dark_backgrounds() {
+        // 5x5 monochrome cursor: an inverting vertical line at x = 2, rows 1..=3,
+        // everything else transparent (AND=1, XOR=0). 1-byte pitch, AND rows then
+        // XOR rows.
+        let and = [0b1111_1000u8; 5];
+        let mut xor = [0u8; 5];
+        for row in &mut xor[1..=3] {
+            *row = 0b0010_0000;
+        }
+        let data: Vec<u8> = and.iter().chain(xor.iter()).copied().collect();
+        let (w, h, px) = pointer_shape_to_bgra(SHAPE_MONOCHROME, 5, 10, 1, &data).unwrap();
+        assert_eq!((w, h), (5, 5));
+        let at = |x: usize, y: usize| &px[(y * 5 + x) * 4..(y * 5 + x) * 4 + 4];
+        for y in 1..=3 {
+            assert_eq!(at(2, y), &[0, 0, 0, 255], "the line itself is black");
+            assert_eq!(at(1, y), &[255, 255, 255, 255], "rim left");
+            assert_eq!(at(3, y), &[255, 255, 255, 255], "rim right");
+            assert_eq!(at(0, y), &[0, 0, 0, 0], "beyond the rim stays clear");
+        }
+        assert_eq!(at(2, 0), &[255, 255, 255, 255], "rim above");
+        assert_eq!(at(2, 4), &[255, 255, 255, 255], "rim below");
+        assert_eq!(at(0, 0), &[0, 0, 0, 0]);
     }
 
     #[test]

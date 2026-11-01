@@ -404,7 +404,12 @@ impl Renderer {
     /// image when one is installed, the built-in arrow otherwise.
     fn draw_cursor(&mut self, nx: f64, ny: f64, vp: &D3D11_VIEWPORT) -> Result<(), Error> {
         let image = self.sprite.as_ref().map(|s| &s.image);
-        let rect = cursor_quad(image, (nx, ny), (vp.Width, vp.Height));
+        let rect = cursor_quad(
+            image,
+            (nx, ny),
+            (vp.TopLeftX, vp.TopLeftY),
+            (vp.Width, vp.Height),
+        );
         let cb = [rect[0], rect[1], rect[2], rect[3], 0.0, 0.0, 0.0, 0.0];
         let sprite = self.sprite.as_ref().map(|s| s.srv.clone());
 
@@ -617,9 +622,31 @@ fn compile_cursor_shaders(
 /// [`CursorSprite::placement`] (hotspot on the pointer, scaled with the video).
 /// Without: the arrow, tip on the pointer, a constant [`ARROW_PX`] on screen
 /// whatever the viewport size (`video_px`, presenter pixels).
-fn cursor_quad(image: Option<&CursorSprite>, cursor: (f64, f64), video_px: (f32, f32)) -> [f32; 4] {
-    if let Some(r) = image.and_then(|i| i.placement(cursor)) {
-        return r.map(|v| v as f32);
+///
+/// At an on-screen scale of exactly 1 the image's origin is moved onto a whole
+/// target pixel (`video_origin` is the viewport's top-left, which a centred
+/// letterbox can put at x.5): otherwise the bilinear sampler would smear every
+/// texel over two pixels. Same rule as `surface_wgpu::geometry::snap_unscaled`.
+fn cursor_quad(
+    image: Option<&CursorSprite>,
+    cursor: (f64, f64),
+    video_origin: (f32, f32),
+    video_px: (f32, f32),
+) -> [f32; 4] {
+    if let Some((img, r)) = image.and_then(|i| Some((i, i.placement(cursor)?))) {
+        let (vx, vy) = (f64::from(video_origin.0), f64::from(video_origin.1));
+        let (vw, vh) = (
+            f64::from(video_px.0.max(1.0)),
+            f64::from(video_px.1.max(1.0)),
+        );
+        let mut q = r;
+        let unscaled = (r[2] * vw - f64::from(img.width)).abs() < 1e-3
+            && (r[3] * vh - f64::from(img.height)).abs() < 1e-3;
+        if unscaled {
+            q[0] = ((vx + r[0] * vw).round() - vx) / vw;
+            q[1] = ((vy + r[1] * vh).round() - vy) / vh;
+        }
+        return q.map(|v| v as f32);
     }
     [
         cursor.0.clamp(0.0, 1.0) as f32,
@@ -761,7 +788,7 @@ mod tests {
             bgra: vec![0; 9 * 16 * 4],
             frame: (1920, 1080),
         };
-        let q = cursor_quad(Some(&beam), (0.5, 0.5), (960.0, 540.0));
+        let q = cursor_quad(Some(&beam), (0.5, 0.5), (0.0, 0.0), (960.0, 540.0));
         // In viewport pixels (a half-size video): top-left (478, 266), 4.5x8.
         let px = [q[0] * 960.0, q[1] * 540.0, q[2] * 960.0, q[3] * 540.0];
         let want = [478.0, 266.0, 4.5, 8.0];
@@ -772,11 +799,32 @@ mod tests {
 
     #[test]
     fn without_an_image_the_arrow_has_a_constant_on_screen_size() {
-        let q = cursor_quad(None, (0.25, 2.0), (1000.0, 500.0));
+        let q = cursor_quad(None, (0.25, 2.0), (0.0, 0.0), (1000.0, 500.0));
         assert_eq!(q[0], 0.25);
         assert_eq!(q[1], 1.0, "pointer clamped into the video");
         assert!((q[2] * 1000.0 - ARROW_PX.0).abs() < 1e-4);
         assert!((q[3] * 500.0 - ARROW_PX.1).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_1_to_1_image_snaps_to_whole_target_pixels() {
+        let img = CursorSprite {
+            width: 8,
+            height: 8,
+            hotspot: Point { x: 0, y: 0 },
+            bgra: vec![0; 8 * 8 * 4],
+            frame: (640, 360),
+        };
+        // 1:1 video whose viewport starts at x = 0.5 (one spare column).
+        let q = cursor_quad(Some(&img), (0.25, 0.5), (0.5, 0.0), (640.0, 360.0));
+        let x = 0.5 + q[0] * 640.0;
+        let y = q[1] * 360.0;
+        assert!((x - x.round()).abs() < 1e-3, "x = {x}");
+        assert!((y - 180.0).abs() < 1e-3);
+        assert!((x - 160.5).abs() <= 0.5 + 1e-3);
+        // Shown at 1.5x the exact position is kept.
+        let q = cursor_quad(Some(&img), (0.25, 0.5), (0.5, 0.0), (960.0, 540.0));
+        assert!((q[0] - 0.25).abs() < 1e-6);
     }
 
     #[test]

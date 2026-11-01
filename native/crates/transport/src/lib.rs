@@ -233,13 +233,17 @@ impl Transport {
         }
     }
 
-    /// Send a reliable control payload (input event / perm / bye).
-    pub fn send_ctl(&mut self, bytes: &[u8]) -> Result<(), Error> {
+    /// Send a reliable control payload (input event / perm / bye / cursor
+    /// image part). `Ok(false)` = **not accepted**: str0m's send buffer
+    /// (128 KiB across all channels, freed as the peer acknowledges) has no
+    /// room for it right now. The caller must keep it and retry, in order;
+    /// treating `false` as sent silently loses a "reliable" message.
+    pub fn send_ctl(&mut self, bytes: &[u8]) -> Result<bool, Error> {
         let id = self.ctl.ok_or(Error::ChannelClosed("ctl"))?;
-        if let Some(mut ch) = self.rtc.channel(id) {
-            ch.write(true, bytes)?;
+        match self.rtc.channel(id) {
+            Some(mut ch) => Ok(ch.write(true, bytes)?),
+            None => Err(Error::ChannelClosed("ctl")),
         }
-        Ok(())
     }
 
     /// Send a cursor position update on the unreliable-latest cursor channel.

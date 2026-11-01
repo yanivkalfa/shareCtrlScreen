@@ -266,8 +266,13 @@ impl Renderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            // Non-sRGB: the bytes are the host's display values, blended as-is
-            // like the video (no transfer curve applied twice).
+            // Non-sRGB: the bytes are the host's display (gamma-encoded) values,
+            // sampled as-is like the video. The render target is always a
+            // non-sRGB format or view (`Renderer::new`), so the premultiplied
+            // blend also runs on encoded values, as the host's own compositor
+            // blends its cursor. Were a backend to render into an sRGB view,
+            // this texture would need the matching sRGB format too, or edges
+            // would blend in linear space against gamma-encoded texels.
             format: wgpu::TextureFormat::Bgra8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],

@@ -65,6 +65,10 @@ pub struct MockCaptureConfig {
     /// The pointer image, reported with the first frame and again with the
     /// first frame after a `reinit` (as DXGI does). Default: [`mock_cursor_shape`].
     pub cursor_shape: Option<CursorShape>,
+    /// Further pointer images, reported one per frame right after the first
+    /// (a busy cursor animating, or a pointer crossing several widgets within
+    /// one round trip). The last one stays current. Default: none.
+    pub cursor_burst: Vec<CursorShape>,
 }
 
 impl Default for MockCaptureConfig {
@@ -76,6 +80,7 @@ impl Default for MockCaptureConfig {
             static_after: None,
             lose_at: None,
             cursor_shape: Some(mock_cursor_shape()),
+            cursor_burst: Vec::new(),
         }
     }
 }
@@ -115,6 +120,8 @@ pub struct MockCapture {
     /// Whether the next frame reports the pointer image (first frame, and
     /// the first after a reinit).
     shape_due: bool,
+    /// Next entry of `cfg.cursor_burst` to report.
+    burst_next: usize,
     /// Counts `release` calls that actually released a held frame (tests use it
     /// to check the release-on-every-path invariant).
     pub releases: u64,
@@ -131,6 +138,7 @@ impl MockCapture {
             bar_x: None,
             lost_fired: false,
             shape_due: true,
+            burst_next: 0,
             releases: 0,
             reinits: 0,
             cfg,
@@ -241,6 +249,9 @@ impl ScreenCapture for MockCapture {
             },
             shape: if std::mem::take(&mut self.shape_due) {
                 self.cfg.cursor_shape.clone()
+            } else if let Some(next) = self.cfg.cursor_burst.get(self.burst_next) {
+                self.burst_next += 1;
+                Some(next.clone())
             } else {
                 None
             },
@@ -736,6 +747,13 @@ impl Presenter for MockPresenter {
 /// video into `surface`, place the image with [`CursorSprite::placement`],
 /// and for every surface pixel whose centre falls inside it take the nearest
 /// texel; return the bounding box of those with alpha > 0.
+///
+/// Differs from the GPU presenters on purpose: they filter bilinearly and, at
+/// an on-screen scale of exactly 1, snap the image origin to a whole pixel
+/// (a centred letterbox can start at x.5). Nearest-texel sampling without the
+/// snap gives the same box whenever the origin is whole, which holds for every
+/// surface the loopback uses (client size = frame size); it checks placement,
+/// not filtering.
 fn visible_bounds(
     sprite: &CursorSprite,
     cursor: (f64, f64),

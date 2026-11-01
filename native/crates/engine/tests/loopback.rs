@@ -142,9 +142,14 @@ fn start_peer(name: &str, relay: &str) -> Peer {
 ///
 /// [`PlatformInfo::name`]: platform_api::PlatformInfo::name
 fn start_peer_on(name: &str, relay: &str, os: &'static str) -> Peer {
+    start_peer_with(name, relay, |p| p.os_name = os)
+}
+
+/// A peer whose mock platform `configure` adjusts before the engine starts.
+fn start_peer_with(name: &str, relay: &str, configure: impl FnOnce(&mut MockPlatform)) -> Peer {
     let root = temp_root(name);
     let mut platform = MockPlatform::new(&root);
-    platform.os_name = os;
+    configure(&mut platform);
     let platform = Arc::new(platform);
     // Seed the config before the engine loads it: our relay, no public STUN.
     let cfg = Config {
@@ -428,6 +433,85 @@ async fn host_cursor_image_reaches_the_viewer_and_lands_on_the_hotspot() {
         }
         assert!(checked >= 5, "only {checked} unclipped frames to check");
     }
+
+    viewer.engine.end_session();
+    eventually("both idle", t, || {
+        host.engine.role() == Role::Idle && viewer.engine.role() == Role::Idle
+    })
+    .await;
+}
+
+/// A 256×256 pointer image (the wire maximum: 8 parts of ~33 KiB, more than
+/// SCTP's whole 128 KiB send buffer), distinct per `seed`.
+fn big_cursor(seed: u8) -> platform_api::CursorShape {
+    let side = 256u32;
+    let mut bgra = Vec::with_capacity((side * side * 4) as usize);
+    for i in 0..side * side {
+        let v = (i as u8).wrapping_mul(31).wrapping_add(seed);
+        // Straight alpha 255 everywhere, so premultiplying keeps the bytes.
+        bgra.extend_from_slice(&[v, seed, v ^ seed, 255]);
+    }
+    platform_api::CursorShape {
+        width: side,
+        height: side,
+        hotspot: platform_api::Point {
+            x: i32::from(seed),
+            y: 255 - i32::from(seed),
+        },
+        bgra,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn maximum_size_cursor_images_in_a_burst_all_arrive_intact() {
+    // Before ctl had a send queue, str0m refused every part past its 128 KiB
+    // send buffer and the driver dropped them: any image of 128 px or more
+    // lost its tail, was counted as sent, and never showed. Five maximum-size
+    // images back to back (≈ 1.3 MB on ctl, queued before the channel opens
+    // and flushed at open) must all get through, in order, the last one
+    // complete and current.
+    let relay = start_relay().await;
+    let burst: Vec<_> = (2..=6).map(big_cursor).collect();
+    let last = burst[burst.len() - 1].clone();
+    let host = start_peer_with("bigcur-host", &relay, |p| {
+        p.capture.cursor_shape = Some(big_cursor(1));
+        p.capture.cursor_burst = burst;
+    });
+    let viewer = start_peer("bigcur-viewer", &relay);
+    let t = Duration::from_secs(20);
+    eventually("both registered", t, || {
+        host.engine.server_connected() && viewer.engine.server_connected()
+    })
+    .await;
+    viewer.engine.connect_to(host.uuid.clone());
+
+    eventually("the last 256×256 image installed and drawn", t, || {
+        let s = viewer.platform.surface.state();
+        let installed = s
+            .cursor_sprites
+            .last()
+            .and_then(|s| s.as_ref())
+            .is_some_and(|s| s.hotspot == last.hotspot);
+        installed
+            && s.presented
+                .last()
+                .is_some_and(|p| p.cursor_image_at.is_some())
+    })
+    .await;
+    {
+        let s = viewer.platform.surface.state();
+        let Some(Some(sprite)) = s.cursor_sprites.last() else {
+            panic!("no image installed");
+        };
+        assert_eq!((sprite.width, sprite.height), (256, 256));
+        assert_eq!(sprite.frame, (640, 360));
+        assert!(
+            sprite.bgra == last.bgra,
+            "every byte of all 8 parts arrived"
+        );
+    }
+    // The session survived the 1.3 MB on ctl (pings queued behind it).
+    assert!(matches!(viewer.engine.role(), Role::Viewer { .. }));
 
     viewer.engine.end_session();
     eventually("both idle", t, || {

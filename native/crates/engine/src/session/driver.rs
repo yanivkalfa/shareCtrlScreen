@@ -174,18 +174,18 @@ pub(super) fn transport_driver(d: Driver) {
         tp.set_desired_bitrate(DESIRED_BITRATE);
     }
 
-    // ctl messages are BUFFERED until the ctl channel opens (they're control
-    // state like the initial Perm — losing them desyncs the session). Video is a
+    // ctl messages are QUEUED until the ctl channel opens (they're control
+    // state like the initial Perm — losing them desyncs the session) and again
+    // whenever SCTP's send buffer is full, in order (see `ctl_queue`). Video is a
     // media track: `send_video` no-ops until it's negotiated + connected, and a
     // keyframe is forced on connect so the first delivered frame is decodable.
-    let mut ctl_open = false;
+    let mut ctl = super::ctl_queue::CtlQueue::default();
     let mut cursor_open = false;
     let mut bulk_open = false;
     // Host: the file transfer currently being received, if any, and where on
     // this screen the sender aimed it.
     let mut incoming: Option<crate::transfer::Incoming> = None;
     let mut incoming_drop_at: Option<(f64, f64)> = None;
-    let mut ctl_backlog: Vec<Vec<u8>> = Vec::new();
 
     // Liveness watchdog: if NOTHING arrives from the peer for this long, the
     // connection is dead even if ICE hasn't declared it yet. str0m's ICE consent
@@ -245,16 +245,19 @@ pub(super) fn transport_driver(d: Driver) {
         // Application-level keepalive: ping on a timer, and give up if the peer
         // has not answered within the grace period. Best-effort Bye first so the
         // other end tears down promptly instead of waiting out its own timer.
-        if connected && ctl_open {
+        if connected && ctl.is_open() {
             if last_ping_sent.elapsed() >= PING_EVERY {
                 last_ping_sent = std::time::Instant::now();
                 ping_seq = ping_seq.wrapping_add(1);
-                let _ = tp.send_ctl(&serialize(&protocol::ControlMsg::Ping { seq: ping_seq }));
+                ctl.send(
+                    serialize(&protocol::ControlMsg::Ping { seq: ping_seq }),
+                    |b| tp.send_ctl(b),
+                );
             }
             let silent = last_pong.elapsed();
             if silent > PONG_GRACE {
                 tracing::warn!("transport: no pong for {PONG_GRACE:?} — declaring dead");
-                let _ = tp.send_ctl(&serialize(&protocol::ControlMsg::Bye));
+                ctl.send(serialize(&protocol::ControlMsg::Bye), |b| tp.send_ctl(b));
                 notify_dead("the peer stopped responding");
                 break;
             } else if silent >= TROUBLE_AFTER {
@@ -281,7 +284,9 @@ pub(super) fn transport_driver(d: Driver) {
                 if let Some(s) = &surface {
                     s.show();
                     // The stream may have advanced without us; get a clean start.
-                    let _ = tp.send_ctl(&serialize(&protocol::ControlMsg::KeyframeRequest));
+                    ctl.send(serialize(&protocol::ControlMsg::KeyframeRequest), |b| {
+                        tp.send_ctl(b)
+                    });
                 }
                 let _ = ui.send(crate::UiEvent::LinkRestored);
             }
@@ -347,12 +352,11 @@ pub(super) fn transport_driver(d: Driver) {
         }
 
         // 2) Outbound control + encoded video from the media threads.
+        // Whatever the transport refused last pass goes first (the peer may have
+        // acknowledged since), then the new messages behind it.
+        ctl.flush(|b| tp.send_ctl(b));
         while let Ok(bytes) = ctl_rx.try_recv() {
-            if ctl_open {
-                let _ = tp.send_ctl(&bytes);
-            } else {
-                ctl_backlog.push(bytes);
-            }
+            ctl.send(bytes, |b| tp.send_ctl(b));
         }
         if let Some(frame_rx) = &frame_rx {
             while let Ok((au, keyframe)) = frame_rx.try_recv() {
@@ -492,13 +496,11 @@ pub(super) fn transport_driver(d: Driver) {
                             tracing::info!("data channel open: {label}");
                             match label.as_str() {
                                 "ctl" => {
-                                    ctl_open = true;
+                                    ctl.open();
                                     // Ping/pong only starts now — don't count the
                                     // channel-setup time against the grace period.
                                     last_pong = std::time::Instant::now();
-                                    for bytes in ctl_backlog.drain(..) {
-                                        let _ = tp.send_ctl(&bytes);
-                                    }
+                                    ctl.flush(|b| tp.send_ctl(b));
                                 }
                                 "cursor" => cursor_open = true,
                                 "bulk" => bulk_open = true,
@@ -535,9 +537,10 @@ pub(super) fn transport_driver(d: Driver) {
                                     stat_dropped += 1;
                                     if last_pli.elapsed() >= std::time::Duration::from_millis(500) {
                                         tp.request_keyframe();
-                                        let _ = tp.send_ctl(&serialize(
-                                            &protocol::ControlMsg::KeyframeRequest,
-                                        ));
+                                        ctl.send(
+                                            serialize(&protocol::ControlMsg::KeyframeRequest),
+                                            |b| tp.send_ctl(b),
+                                        );
                                         last_pli = std::time::Instant::now();
                                     }
                                     continue; // NEVER feed a broken delta
@@ -593,8 +596,9 @@ pub(super) fn transport_driver(d: Driver) {
                                 // proof the peer is alive.
                                 Ok(protocol::ControlMsg::Ping { seq }) => {
                                     last_pong = std::time::Instant::now();
-                                    let _ = tp
-                                        .send_ctl(&serialize(&protocol::ControlMsg::Pong { seq }));
+                                    ctl.send(serialize(&protocol::ControlMsg::Pong { seq }), |b| {
+                                        tp.send_ctl(b)
+                                    });
                                     continue;
                                 }
                                 Ok(protocol::ControlMsg::Pong { .. }) => {
@@ -816,8 +820,8 @@ pub(super) fn transport_driver(d: Driver) {
     // as well. `Engine::end_session` announces over signaling, which is useless
     // when the signaling socket is itself the thing that broke — the peer would
     // then sit out the full grace period instead of dropping immediately.
-    if stop.load(Ordering::SeqCst) && ctl_open && connected {
-        let _ = tp.send_ctl(&serialize(&protocol::ControlMsg::Bye));
+    if stop.load(Ordering::SeqCst) && ctl.is_open() && connected {
+        ctl.send(serialize(&protocol::ControlMsg::Bye), |b| tp.send_ctl(b));
         // The loop is over, so nothing else will flush str0m's queue — pump it
         // briefly by hand, bounded so teardown can't hang on a dead socket.
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);

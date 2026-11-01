@@ -815,6 +815,27 @@ to run (TCC). Use `objc2` 0.6-family crates throughout (`objc2-app-kit`,
     (image delivered once with the host's geometry, and its opaque pixels cover exactly the
     expected 4×6 pixels at every unclipped pointer position, through the mock presenter's CPU
     compositor). No D3D11 pixel test: the `render` presenter needs an HWND swapchain.
+  * Review round 1 fixes:
+    * **ctl send queue** (`engine/src/session/ctl_queue.rs`): `Transport::send_ctl` now returns
+      `Ok(false)` when str0m refuses a message (its 128 KiB send buffer, shared by all
+      channels, is full until the peer acknowledges). Before, the driver ignored that and the
+      message was lost; every cursor image ≥ 128 px (4+ parts) lost its tail and was never
+      re-sent. Every ctl send (media-thread messages, ping/pong, keyframe requests, bye) now
+      goes through one ordered queue that keeps refused messages at its head and retries them
+      each driver pass, before newer ones; it also replaces the pre-open backlog. A message
+      larger than the whole buffer is dropped with a warning (it could never be accepted).
+      Loopback `maximum_size_cursor_images_in_a_burst_all_arrive_intact`: six 256×256 images
+      (≈ 1.6 MB on ctl) all arrive, the last byte-exact and drawn.
+    * Windows monochrome cursors: inverting pixels (the standard I-beam) are black with a 1-px
+      white rim (`outline_inverting`, as WebRTC's `AddCursorOutline`), so they show on a dark
+      terminal.
+    * A 1:1 image is snapped to whole target pixels in both presenters (a centred letterbox
+      can start at x.5 and the bilinear sampler would blur it); the mock compositor's doc says
+      it samples nearest and does not snap.
+  * Seen while fixing, not changed (outside D9): the viewer's file push sends `bulk` frames
+    while `bulk_buffered() < 256 KiB`, but `send_bulk` ignores the same `Ok(false)`, and str0m
+    refuses anything past 128 KiB buffered across all channels, so a large file transfer can
+    lose chunks silently. Needs the same treatment as ctl (follow-up).
   * Not verified: real sessions (I1–I3): arrow/I-beam/hand/resize on each host, DXGI top-left
     semantics on hardware, portal cursor scale under fractional scaling, Retina scale.
 

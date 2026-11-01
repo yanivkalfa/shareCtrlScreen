@@ -10,6 +10,7 @@
 //! * viewer only: input translation, file push, and optionally shortcut capture.
 
 mod clipboard;
+mod ctl_queue;
 mod driver;
 mod files;
 mod ice;

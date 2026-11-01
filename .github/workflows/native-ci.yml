@@ -187,13 +187,10 @@ jobs:
       # The cargo steps run as the runner user, not under `sudo -E`: cargo as root
       # leaves root-owned files in target/ and the cargo registry, which breaks
       # rust-cache's save and every later step that runs as the runner user.
-      # The order matters: kmod creates /dev/uinput (root 0600) and udevd then
-      # applies the rule's MODE. If setfacl ran before udev had applied its mode,
-      # the later chmod would rewrite the ACL mask and the runner user would lose
-      # rw. So: rule, reload, trigger, settle, then setfacl; the last two lines
-      # print the result. The rule shape follows the recipe in games-on-whales/wolf
-      # PR #554 (modprobe plus a udev 0666 rule; earlier research read it, the
-      # root-0600 default of /dev/uinput is the reviewer's note, not checked here).
+      # Settle runs before setfacl, so no later udev chmod can rewrite the ACL
+      # mask (a chmod on the node clears the named entry's rw). The rule shape
+      # follows the recipe in games-on-whales/wolf PR #554 (modprobe plus a udev
+      # 0666 rule). The last two lines print the result.
       - name: uinput access for the runner user (L6 read-back)
         run: |
           sudo modprobe uinput

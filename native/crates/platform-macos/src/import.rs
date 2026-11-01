@@ -318,7 +318,7 @@ mod tests {
                 match fill {
                     None => bytes.fill(y),
                     Some((cb, cr)) => {
-                        for pair in bytes.chunks_exact_mut(2) {
+                        for pair in bytes.as_chunks_mut::<2>().0 {
                             pair[0] = cb;
                             pair[1] = cr;
                         }

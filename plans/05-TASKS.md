@@ -49,6 +49,8 @@
 | W2 software codec selection | **done** (Sonnet, Opus-reviewed) | H.264 policy on Windows: hardware → MF software decoder → OpenH264 (only while `useOpenH264` is on); `h264_problem()` gives an actionable report when Media Foundation has no H.264 MFTs (N editions without the Media Feature Pack fail at launch — documented). Machine-B check: ignored test + log line "no hardware H264 decoder — using software decode" |
 | D7 release pipeline | **done** `448df49` (Opus, Opus-reviewed) | tag-triggered `release.yml` → reusable `build-assets.yml` → `scripts/release-assets.sh` (one recipe); NSIS/DMG/AppImage/deb/rpm, SHA256SUMS, per-OS third-party notices generated and attached (never committed), version read from cargo metadata, actions pinned to SHAs; macOS: certificate required when the secrets exist, ad-hoc only without them. macOS leg + AppImage verified only on GitHub |
 | D8 modifier translation | **done** (Opus, Opus-reviewed; I2 device pass pending) | viewer-side `KeyTranslator` (`engine/src/modifiers.rs`): Cmd ↔ Ctrl swap and Cmd+Tab→Alt+Tab (Mac → PC), Ctrl ↔ Cmd and Alt+Tab→Cmd+Tab (PC → Mac), sent-code tracking; host OS via new optional `connect-response.os`; `translateModifiers` toggle (default on) in Settings → Advanced; unit + loopback-tested. **Device-pending** (I2 Mac↔Windows); closes M6's blocked Cmd+Tab line |
+| M12 take every Cmd shortcut (macOS viewer) | **in progress** (Opus) | M6 tap takes all Cmd combinations while the video has the keyboard; Cmd+Q stays local; owner feedback from the Mac→Ubuntu live test |
+| D9 host cursor sprite on the viewer | **in progress** (Opus) | additive cursor-shape message, host sends on change, viewer draws the real sprite at position−hotspot in both presenters; replaces the synthetic triangle |
 | T4 Wayland CI | **done** (Haiku, Opus-reviewed; jobs unverified until pushed; GNOME portal tests are device-pass items) | `native-ci.yml` jobs `wayland-sway` (ubuntu-24.04: sway + xdg-desktop-portal-wlr + pipewire + wireplumber; runs L5 `wayland_surface`, L1 `portal_capture --ignored`, and L6 `input::tests` minus uinput and `xtest_*`) and `wayland-gnome` (ubuntu-24.04: mutter 46 + xdg-desktop-portal-gnome; proves the stack, runs no test: the consent dialog has no headless pre-authorization, so the libei and GNOME portal-capture tests are device-pass items). Scripts in `.github/wayland/`. Local (lane, WSL): `wayland_surface` PASS (T4-02); `input::tests` wlroots and EIS pass, uinput fails under REQUIRED as designed (T4-03). Owner verification after the push: see the T4 card |
 | L5 video surface | **done** (Opus, Opus-reviewed; device-pending per checklists/L5.md) | X11: child window of the GTK toplevel on our own x11rb connection, XShape reveal clip, XDND drops via `XdndProxy`, Expose → redraw of the last frame. Wayland: the spike's area+video subsurface tree on GDK's connection (re-attached when GDK re-creates the toplevel surface), `wp_viewporter` crop + fractional scale, drops through GDK's own data device (sink window); decision-#3 separate window when there is no `wp_viewporter` or `SHARECTRL_VIDEO_WINDOW=separate`. Keys from the GTK toplevel on both (keymap: XKB − 8 = evdev). One wgpu presenter (Vulkan, GL fallback) over `surface-wgpu`. Headless tests: `tests/x11_surface.rs` (Xvfb), `tests/wayland_surface.rs` (headless sway). **Device-pending** (checklists/L5.md) |
 | L1 Wayland capture | **done** (Opus, Opus-reviewed) | `portal_capture/`: portal ScreenCast (handshake shared with L12 in `portal_session.rs`, token scope kept: a combined token reopens a combined session) + pipewire-rs 0.10 stream thread, shared-memory BGRx/BGRA first (no modifiers → no DMA-BUF; L1b), cursor + damage metadata, pause/resize → `Lost` → resume; a stream-level failure → rebuild from the token on a background thread (reinit never blocks the host thread on a dialog); "Stop sharing" in the desktop indicator, a declined dialog or an unanswered one (120 s) end the hosted session (terminal, AnyDesk behaviour). The 120 s dialog wait on the host media thread happens only in the first `create_capture`. Monitor chosen in the portal dialog (Wayland `display` ids → `NoOutput`). Build needs `libpipewire-0.3-dev libspa-0.2-dev libclang-dev`. **Device-pending** (checklists/L1.md); acceptance test `tests/portal_capture.rs` (ignored) for T4. **Note for L6:** L6 layers a shared session slot over `portal_session::start(scope, previous, bound, abandon)` and extends `Granted` with the RemoteDesktop proxy; today the capture's `watch()` owns `granted.session` and closes it when the capture drops it. Once shared, that ownership moves into L6's slot, so only the last holder (capture or injector) closes the session. **Done in L6:** `portal_shared.rs` holds the combined session; the capture joins it (`Held::Shared`) when its token is combined, remote control already holds it, or remote control would use the portal, and owns only screen-only sessions itself |
@@ -652,6 +654,59 @@ to run (TCC). Use `objc2` 0.6-family crates throughout (`objc2-app-kit`,
     A Mac user's habits around Control change meaning on a PC host: a lone Control tap is a
     Win/Super tap (Start menu, GNOME Activities), and Control+click is Win+click, not the
     macOS secondary click (nothing maps it to a right-click).
+
+### M12 — macOS: take every Cmd shortcut while the video has the keyboard  (size S–M; owner feedback 2026-11-01 from a Mac viewer on an Ubuntu host)
+* Problem: M6's tap takes a fixed set (Cmd+Tab/`/Space, Ctrl+arrows). Everything else with Cmd
+  goes through the app's responder chain first (`performKeyEquivalent`: menu bar, WebKit's
+  own Cmd+C/V/W/Q…), so most Cmd combinations never reach the host at all ("Cmd key does
+  not work" in the live test), and the ones macOS itself owns (Cmd+Space variants, Cmd+Tab)
+  were the only ones working. The owner wants ALL macOS global shortcuts forwarded.
+* Deliverable: while our window is key AND the video view has the keyboard (same focus
+  rule as M6), the session CGEventTap takes **every key-down/up carrying Cmd** (any other
+  modifiers too) and every M6 combination, and forwards the DOM codes to the host via the
+  existing shortcut-hook channel; nothing Cmd-based reaches the menu bar or WebKit while
+  captured. Exceptions, documented on the card and in the M6/M11 checklists: (1) shortcuts
+  macOS never delivers to a tap at all (Cmd+Ctrl+Q lock screen, Cmd+Opt+Esc force quit,
+  Touch ID / power): list them as "cannot be taken"; (2) **Cmd+Q stays local** as the one
+  escape hatch (the user can always quit; document it in README's macOS passthrough row);
+  (3) the sentinel/own-injection rule and `kCGEventTapDisabledByTimeout` re-enable stay.
+  Clicking any other window, or the video losing the keyboard, releases everything held
+  (release_all through the same path M6 uses) and restores local behaviour instantly.
+  Plain key-ups for keys pressed before capture started are forwarded, not swallowed (the
+  M6 "already held" rule). A setting is NOT added: this is the behaviour the owner wants.
+* The D8 translation still applies downstream (Mac→Windows/Linux swaps Cmd↔Ctrl by default;
+  the toggle in Settings → Advanced makes Cmd arrive literally as Super/Win). The card must
+  say so and the README macOS row must explain the toggle in one sentence.
+* Tests: the pure filter (`shortcut_filter.rs`) gets table tests for: any Cmd+key taken,
+  Cmd+Q not taken, M6 set still taken, Ctrl+arrows taken, plain keys untouched, modifier
+  key-up for a Cmd pressed before capture forwarded, reserved combos listed. `cargo check`
+  and clippy for aarch64-apple-darwin in the lane; the live check is I2.
+* Acceptance (I2, real Mac → Ubuntu/Windows): Cmd+Enter, Cmd+Shift+4, Cmd+Opt+D, Cmd+C/V
+  arrive on the host (translated or literal per the toggle); Cmd+Q still quits the viewer;
+  clicking the desktop restores local shortcuts; nothing stuck.
+
+### D9 — Draw the host's real cursor sprite on the viewer  (size M, all OSes; owner feedback 2026-11-01)
+* Problem: every viewer draws a synthetic white triangle at the out-of-band pointer position
+  (`render/src/lib.rs` cur_ps, and the surface-wgpu presenter's cursor quad). The hosts
+  already produce `CursorShape` (W1 DDA shape, M1 ScreenCaptureKit, L1 portal metadata,
+  L2 XFixes) and `CursorUpdate.shape` reaches the engine, but no shape is ever sent to the
+  viewer, so the user sees an arrow-ish blob instead of the I-beam, hand, resize or
+  Yaru/macOS/Windows cursor the host shows ("the mouse looks weird").
+* Deliverable: (1) protocol: an additive cursor-shape message on the existing cursor channel
+  (BGRA premultiplied or straight alpha stated explicitly, width/height, hotspot; sent only
+  when the shape changes, capped at 256×256, dedup by content hash; older viewers ignore
+  it, older hosts never send it and the viewer keeps the current quad as fallback);
+  (2) host: send the shape when `CursorUpdate.shape` changes and once at session start;
+  (3) viewer: upload the sprite to a texture and draw it at `position - hotspot`, scaled
+  with the video (Retina/HiDPI aware: the hotspot and size are in host pixels), with
+  correct alpha; hidden when `visible == false`; (4) both presenters: surface-wgpu (macOS,
+  Linux, and Windows if it uses it) and the D3D11 `render` crate; (5) the loopback harness
+  proves shape delivery + a pixel check that the sprite's opaque pixels land at the right
+  place; unit tests for hotspot/scale math; (6) README feature table row.
+* Non-goals: cursor animation (animated cursors send their first frame), cursor trails,
+  software cursor smoothing. Keep the out-of-band position path untouched (latency).
+* Acceptance (CI + I1–I3): loopback test green on all three OS legs; on a real session the
+  viewer shows the host's actual cursor images including I-beam in a terminal.
 
 ## Lane T — tests & CI
 

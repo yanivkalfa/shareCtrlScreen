@@ -115,8 +115,10 @@ jobs:
   # socket. Packages: `xvfb` and `xserver-xephyr` (Xvfb(1) and Xephyr(1) man
   # pages; `-displayfd` is the readiness signal), `x11-xserver-utils` (xrandr),
   # `xterm` (the moving window of the L2 damage test), `xclip` (clipboard
-  # tests), `xdotool` (L6's XTest check reads window names with it; no current
-  # test calls it yet).
+  # tests), `xdotool` (installed because the T3 spec names it; no test calls it
+  # yet). `libegl-mesa0` and `libgl1-mesa-dri` are the EGL and GL drivers the
+  # x11_surface GL child needs under LIBGL_ALWAYS_SOFTWARE (llvmpipe): the
+  # mesa-vulkan-drivers line below does not provide them.
   # build-test's Linux leg runs the same tests WITHOUT SCT_X11_TESTS_REQUIRED,
   # so a tool it lacks is a printed skip there; this job is the one that forbids
   # skips.
@@ -146,7 +148,7 @@ jobs:
             build-essential pkg-config libssl-dev libdbus-1-dev libgtk-3-dev \
             libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev \
             libpipewire-0.3-dev libspa-0.2-dev libclang-dev \
-            mesa-vulkan-drivers \
+            mesa-vulkan-drivers libegl-mesa0 libgl1-mesa-dri \
             xvfb xserver-xephyr x11-xserver-utils xterm xclip xdotool acl
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -182,13 +184,27 @@ jobs:
       #   asynchronous processing.
       # The runner is a throwaway VM (GitHub-hosted runner reference: passwordless
       # sudo, a new VM per runner), so the permissive mode does not outlive the job.
+      # The cargo steps run as the runner user, not under `sudo -E`: cargo as root
+      # leaves root-owned files in target/ and the cargo registry, which breaks
+      # rust-cache's save and every later step that runs as the runner user.
+      # The order matters: kmod creates /dev/uinput (root 0600) and udevd then
+      # applies the rule's MODE. If setfacl ran before udev had applied its mode,
+      # the later chmod would rewrite the ACL mask and the runner user would lose
+      # rw. So: rule, reload, trigger, settle, then setfacl; the last two lines
+      # print the result. The rule shape follows the recipe in games-on-whales/wolf
+      # PR #554 (modprobe plus a udev 0666 rule; earlier research read it, the
+      # root-0600 default of /dev/uinput is the reviewer's note, not checked here).
       - name: uinput access for the runner user (L6 read-back)
         run: |
           sudo modprobe uinput
-          sudo setfacl -m "u:$(id -un):rw" /dev/uinput
-          echo 'KERNEL=="event*", SUBSYSTEM=="input", MODE="0666"' | sudo tee /etc/udev/rules.d/90-sharectrl-ci-input.rules
+          printf '%s\n' 'KERNEL=="uinput", MODE="0666"' 'KERNEL=="event*", SUBSYSTEM=="input", MODE="0666"' | sudo tee /etc/udev/rules.d/90-sharectrl-ci-input.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --subsystem-match=input
+          sudo udevadm trigger --subsystem-match=misc --sysname-match=uinput
+          sudo udevadm settle
+          sudo setfacl -m "u:$(id -un):rw" /dev/uinput
+          ls -l /dev/uinput
+          getfacl /dev/uinput
       - name: XTest injector (L6: private Xvfb)
         run: cargo test -p platform-linux --lib input::tests::xtest -- --nocapture
       - name: uinput read-back through evdev (L6)

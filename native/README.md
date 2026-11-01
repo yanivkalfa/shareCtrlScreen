@@ -40,7 +40,13 @@ On Linux the X11 tests start private `Xvfb` servers (`apt-get install xvfb`) and
 when a tool is missing. The `x11-tests` job in `.github/workflows/native-ci.yml` runs them
 on ubuntu-22.04 with `SCT_X11_TESTS_REQUIRED=1`, so a skip fails there; `cargo test
 --workspace` on the same runner is the lenient run. Packages for the X11 tests:
-`xvfb xserver-xephyr x11-xserver-utils xterm xclip xdotool`.
+`xvfb xserver-xephyr x11-xserver-utils xterm xclip xdotool` (`xdotool` is installed as the
+T3 spec names it; no test calls it yet). The uinput read-back (`input::tests::uinput`)
+needs evdev and write access to `/dev/uinput`; it skips on a machine without them, and
+`SCT_LINUX_INPUT_TESTS_REQUIRED=1` turns that skip into a failure. The job sets up access
+with `modprobe uinput`, an ACL on `/dev/uinput` and a udev rule for the event nodes (see
+the job comments). WSL2 has no evdev, so the read-back fails there under that variable,
+which is expected.
 
 Two shippable binaries: `sharectrl.exe` (the Tauri app/engine) and
 `sharectrl-service.exe` (the SYSTEM service).

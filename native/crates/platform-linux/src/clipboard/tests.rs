@@ -71,6 +71,10 @@ fn start_private_x() -> Option<PrivateX> {
     // use: arboard and the selection owner read `DISPLAY`, and arboard keeps
     // a process-wide connection. Every test that can touch X11 calls
     // `x11_available` first, so nothing has read it before this point.
+    // Known hazard: Rust's own env access is locked, but C code calling
+    // `getenv` on another thread at this instant could race; that is why
+    // `set_var` becomes `unsafe` in edition 2024 (this crate is 2021). Only
+    // these tests set it, once, before any X11 use.
     std::env::set_var("DISPLAY", &server.name);
     Some(PrivateX {
         _server: server,

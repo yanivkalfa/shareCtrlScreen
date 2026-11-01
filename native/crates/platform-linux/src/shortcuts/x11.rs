@@ -15,8 +15,13 @@
 //! session window loses focus or the video is hidden: a grab cannot pass a key
 //! through, so dropping it is the only way to let XTEST-driven typing (our
 //! injector, or a user driving this machine through Synergy / VNC) reach the
-//! app. The XTEST keys that arrived under the grab are replayed through XTEST
-//! after the ungrab, so none is lost; from then on they reach GTK like any key.
+//! app. A press the grab took is replayed through XTEST after the ungrab,
+//! following the key's state at that moment: the focused window gets the press
+//! and, unless the key is still held, a release, so the key ends up in the
+//! state its sender left it in. The guarantee is "no stuck key and no lost
+//! press"; a tap whose release raced the stand-down can arrive twice, and a
+//! still-held key gets an extra release before its press. From then on XTEST
+//! keys reach GTK like any key.
 //!
 //! ## Not under XWayland
 //!
@@ -469,7 +474,7 @@ impl X11Grab {
             // landed. An XTEST key of the stand-down is replayed like the one
             // that triggered it; others are not ours to forward any more.
             if virtual_keyboard && self.stand_down == Some(StandDown::VirtualKeyboard) {
-                self.replay(keycode, down);
+                self.replay(keycode, down, false);
             }
             return;
         }
@@ -479,8 +484,8 @@ impl X11Grab {
                  session window is focused again"
             );
             self.stand_down = Some(StandDown::VirtualKeyboard);
-            self.release();
-            self.replay(keycode, down);
+            // The ungrab goes out inside the replay's server grab: see `replay`.
+            self.replay(keycode, down, true);
             return;
         }
         let pressed_before_grab = self.down_at_grab.contains(&keycode);
@@ -507,30 +512,69 @@ impl X11Grab {
         }
     }
 
-    /// Send a key we took under the grab back through XTEST, now that the
-    /// keyboard is no longer grabbed, so it reaches the focused window as if we
-    /// had never been there.
-    fn replay(&self, keycode: u32, down: bool) {
-        let Ok(keycode) = u8::try_from(keycode) else {
+    /// Give a key event the grab took back to the desktop through XTEST, after
+    /// the ungrab, so the focused window ends up with a press/release pair and
+    /// the key's state is what the sender left it at.
+    ///
+    /// WHY it reads the key state first: XTEST's `FakeInput` acts on the XTEST
+    /// device's key state, which the taken event already changed. A press
+    /// replayed onto a key still down is dropped (modifiers) or turned into an
+    /// auto-repeat; a release onto a key already up is dropped. So the replay
+    /// follows the server's state right after the ungrab ([`replay_plan`]).
+    ///
+    /// WHY under a server grab: between reading the state and faking the
+    /// events, another XTEST client (the sender itself) could change it; a
+    /// release landing in that gap would leave our replayed press stuck down.
+    /// `GrabServer` holds every other client's requests for the few requests
+    /// of the replay; the pending ungrab is sent inside the same grab.
+    ///
+    /// `ungrab`: drop our keyboard grab first, inside the same server grab
+    /// (the stand-down itself); `false` for events taken before an ungrab that
+    /// already happened.
+    fn replay(&mut self, keycode: u32, down: bool, ungrab: bool) {
+        if !down {
+            // A taken release is never replayed: by the time we see it the key
+            // is up (a release onto it would be dropped) or pressed anew (a
+            // release would cut that press). When its press was taken too, the
+            // press's replay already included a release.
+            if ungrab {
+                self.release();
+            }
             return;
-        };
-        let kind = if down {
-            KEY_PRESS_EVENT
-        } else {
-            KEY_RELEASE_EVENT
-        };
-        // XTEST is present: the key came from one of its devices. Device 0 =
-        // the core keyboard, like the injector's own events.
-        // Sent after the ungrab on the same connection, so the server handles
-        // it ungrabbed.
-        let sent = self
-            .conn
-            .xtest_fake_input(kind, keycode, CURRENT_TIME, self.root, 0, 0, 0)
-            .map(|_| ())
-            .and_then(|()| self.conn.flush());
-        if let Err(e) = sent {
+        }
+        let _ = self.conn.grab_server();
+        if ungrab {
+            self.drop_grab();
+        }
+        let outcome = self.replay_press(keycode);
+        // Whatever the replay did: the server must never stay grabbed. (A send
+        // that failed means the connection is gone, and the server drops a
+        // dead client's grab itself.)
+        let _ = self.conn.ungrab_server();
+        let _ = self.conn.flush();
+        if let Err(e) = outcome {
             tracing::debug!("shortcut capture: could not replay a virtual key: {e}");
         }
+    }
+
+    /// The press half of [`replay`](Self::replay), run inside the server grab.
+    fn replay_press(&self, keycode: u32) -> Result<(), String> {
+        let key = u8::try_from(keycode).map_err(|_| format!("keycode {keycode} out of range"))?;
+        // Its round trip is ordered after the ungrab sent before it.
+        let still_down = self
+            .conn
+            .query_keymap()
+            .map_err(|e| format!("X11 request failed: {e}"))?
+            .reply()
+            .map_err(x11_err("key state query"))
+            .map(|r| keycodes_down(&r.keys).contains(&keycode))?;
+        for &kind in replay_plan(still_down) {
+            // Device 0 = the core keyboard, like the sender's own events.
+            self.conn
+                .xtest_fake_input(kind, key, CURRENT_TIME, self.root, 0, 0, 0)
+                .map_err(|e| format!("X11 request failed: {e}"))?;
+        }
+        Ok(())
     }
 
     /// Re-read focus and visibility from the server and take or drop the grab
@@ -600,9 +644,15 @@ impl X11Grab {
     /// Drop the grab and send the remote a key-up for everything still held:
     /// the real releases will land in whatever window has the focus now.
     fn release(&mut self) {
+        self.drop_grab();
+        let _ = self.conn.flush();
+    }
+
+    /// [`release`](Self::release) without the flush, for a caller that sends
+    /// more requests in the same batch.
+    fn drop_grab(&mut self) {
         if std::mem::take(&mut self.grabbed) {
             let _ = self.conn.xinput_xi_ungrab_device(CURRENT_TIME, self.master);
-            let _ = self.conn.flush();
         }
         // Keys down since before the grab release into GTK again from here.
         self.down_at_grab.clear();
@@ -688,6 +738,23 @@ fn parent_of(conn: &RustConnection, window: Window) -> Result<Option<Window>, St
         Ok(t) => Ok(Some(t.parent)),
         Err(e) if is_bad_window(&e) => Ok(None),
         Err(e) => Err(format!("X11 window tree query failed: {e}")),
+    }
+}
+
+/// The XTEST events that replay a taken key press, given whether the key is
+/// still down right after the ungrab.
+fn replay_plan(still_down: bool) -> &'static [u8] {
+    if still_down {
+        // Still held (Synergy, VNC, a relayed modifier): a fresh press onto a
+        // held key would be dropped or become a repeat, so release it first
+        // (a stray release is harmless) and press it again; its real release
+        // then reaches the window ungrabbed.
+        &[KEY_RELEASE_EVENT, KEY_PRESS_EVENT]
+    } else {
+        // Already up: its release was taken by the grab too (it arrives later
+        // and is not replayed), or reached the window before the server grab
+        // (then the window gets one extra tap, never a stuck key).
+        &[KEY_PRESS_EVENT, KEY_RELEASE_EVENT]
     }
 }
 
@@ -834,6 +901,15 @@ mod tests {
             GrabResult::of(GrabStatus::FROZEN),
             GrabResult::Busy(why) if why.contains("Frozen")
         ));
+    }
+
+    #[test]
+    fn replay_leaves_the_key_as_the_sender_left_it() {
+        // Held: release first (a press onto a held key would be dropped or
+        // repeat), then press; the real release comes later.
+        assert_eq!(replay_plan(true), &[KEY_RELEASE_EVENT, KEY_PRESS_EVENT]);
+        // Up: a whole tap, ending up.
+        assert_eq!(replay_plan(false), &[KEY_PRESS_EVENT, KEY_RELEASE_EVENT]);
     }
 
     #[test]

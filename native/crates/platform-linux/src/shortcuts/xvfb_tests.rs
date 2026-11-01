@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 use platform_api::ShortcutHook;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    ConnectionExt as _, CreateWindowAux, GrabMode, GrabStatus, InputFocus, ModMask, Window,
-    WindowClass, KEY_PRESS_EVENT, KEY_RELEASE_EVENT,
+    ChangeWindowAttributesAux, ConnectionExt as _, CreateWindowAux, EventMask, GrabMode,
+    GrabStatus, InputFocus, ModMask, Window, WindowClass, KEY_PRESS_EVENT, KEY_RELEASE_EVENT,
 };
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::protocol::Event;
@@ -210,6 +210,20 @@ impl Desk {
         self.key(keycode, false);
     }
 
+    /// Keycodes the server has down right now.
+    fn keys_down(&self) -> Vec<usize> {
+        let keys = self
+            .conn
+            .query_keymap()
+            .unwrap_or_else(|e| panic!("keymap: {e}"))
+            .reply()
+            .unwrap_or_else(|e| panic!("keymap: {e}"))
+            .keys;
+        (0..256)
+            .filter(|&k| keys[k / 8] & (1 << (k % 8)) != 0)
+            .collect()
+    }
+
     /// Whether any client holds an active keyboard grab: try one ourselves.
     fn keyboard_grabbed(&self) -> bool {
         let status = self
@@ -272,6 +286,49 @@ impl WindowManager {
             }
         }
         keys
+    }
+}
+
+/// A client watching the key events the app window gets (GTK's view).
+struct Observer {
+    conn: RustConnection,
+}
+
+impl Observer {
+    fn new(display: &str, window: Window) -> Self {
+        let (conn, _) = match RustConnection::connect(Some(display)) {
+            Ok(c) => c,
+            Err(e) => panic!("connect: {e}"),
+        };
+        conn.change_window_attributes(
+            window,
+            &ChangeWindowAttributesAux::new()
+                .event_mask(EventMask::KEY_PRESS | EventMask::KEY_RELEASE),
+        )
+        .unwrap_or_else(|e| panic!("select: {e}"));
+        conn.get_input_focus()
+            .unwrap_or_else(|e| panic!("sync: {e}"))
+            .reply()
+            .unwrap_or_else(|e| panic!("sync: {e}"));
+        Self { conn }
+    }
+
+    /// `(keycode, is_press)` received since the last call.
+    fn events(&self) -> Vec<(u8, bool)> {
+        self.conn
+            .get_input_focus()
+            .unwrap_or_else(|e| panic!("sync: {e}"))
+            .reply()
+            .unwrap_or_else(|e| panic!("sync: {e}"));
+        let mut got = Vec::new();
+        while let Ok(Some(event)) = self.conn.poll_for_event() {
+            match event {
+                Event::KeyPress(e) => got.push((e.detail, true)),
+                Event::KeyRelease(e) => got.push((e.detail, false)),
+                _ => {}
+            }
+        }
+        got
     }
 }
 
@@ -497,6 +554,32 @@ fn virtual_keyboard_input_is_not_forwarded() {
     desk.focus(desk.elsewhere);
     desk.focus(desk.parent);
     wait_until("grab on focus-in", || desk.keyboard_grabbed());
+}
+
+#[test]
+fn a_held_virtual_key_is_replayed_without_sticking() {
+    let Some(x) = Xvfb::start() else { return };
+    let desk = Desk::new(&x.display);
+    let gtk = Observer::new(&x.display, desk.parent);
+    let hook = Running::start(&x.display, desk.video, desk.parent, false);
+    assert!(hook.installed);
+    assert!(desk.keyboard_grabbed());
+
+    // A Synergy/VNC-style hold: the press is taken by the grab, and the
+    // release is only sent once the grab has stepped aside.
+    desk.key(SUPER_L, true);
+    wait_until("grab steps aside", || !desk.keyboard_grabbed());
+    desk.key(SUPER_L, false);
+
+    // The window gets the press back, then the real release (possibly after
+    // the replay's stray release).
+    let mut seen = Vec::new();
+    wait_until("press, then release, at the window", || {
+        seen.extend(gtk.events());
+        seen.ends_with(&[(SUPER_L, true), (SUPER_L, false)])
+    });
+    assert!(desk.keys_down().is_empty(), "no key left down");
+    assert!(hook.take(0).is_empty(), "XTEST keys are not forwarded");
 }
 
 #[test]

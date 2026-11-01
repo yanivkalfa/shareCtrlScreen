@@ -388,8 +388,10 @@ to run (TCC). Use `objc2` 0.6-family crates throughout (`objc2-app-kit`,
   refusals, but XI2 events carry the source device. The trait requires the hook to ignore
   events produced by our own injector (L6 types through XTEST), and a core grab cannot tell
   XTEST keys from real ones. XTEST input is not forwarded; the grab steps aside until focus
-  leaves or the video is hidden (a grab cannot pass a key through), and the XTEST keys it
-  took are replayed through XTEST after the ungrab, so none is lost.
+  leaves or the video is hidden (a grab cannot pass a key through). A press the grab took
+  is replayed through XTEST after the ungrab, inside one server grab, according to the
+  key's state then (still held → release + press; already up → press + release). The
+  guarantee: no stuck key and no lost press; a racing tap may arrive twice.
 * X11 grab held only while the app window has the input focus **and** the video window is
   viewable (relies on L5 unmapping it on `hide`; L5's obligations are on its card), so
   modals can be typed into. Keys already down when the grab starts get their key-up

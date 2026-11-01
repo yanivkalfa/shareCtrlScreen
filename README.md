@@ -119,6 +119,7 @@ been tested on hardware.
 | File push, controller to controlled | Yes | Yes | Yes | Yes |
 | Drop a file on a remote window | Yes | Yes, with Accessibility permission | Yes | No. The file stays on the clipboard and a notice shows |
 | Shortcut passthrough (Alt+Tab, Cmd+Tab, Super) | Experimental, off by default. Ctrl+Alt+Del and Win+L cannot be captured | Cmd+Tab, Cmd+Space, Cmd+\` and Ctrl+arrows (Spaces, Mission Control) while the session window is focused; Force Quit (Cmd+Option+Esc) always stays local. Not while Secure Input is on (password fields) | Yes, the window grabs the keyboard | Depends on the compositor. If refused, the app says shortcuts are unsupported here |
+| Modifier translation for the remote OS (default on, Settings → Advanced) | From a Mac viewer: Cmd is sent as Ctrl, Cmd+Tab as Alt+Tab, Mac Control as Win. To a Mac host: Ctrl is sent as Cmd, Win as Control, Alt+Tab as Cmd+Tab | Same | Same | Same |
 | Lock screen (a user is logged in) | Yes, with the Windows service | In scope. Unverified | In scope. Unverified | In scope. Unverified |
 | Login window (nobody logged in) | Yes, with the Windows service | No | No | No |
 | Hardware video encode | Yes (Media Foundation, H.264 and HEVC) | Yes (VideoToolbox, H.264 and HEVC) | Intel and AMD via VA-API, when libva is 2.20 or newer. NVIDIA via NVENC (optional) | Same as X11 |
@@ -242,6 +243,11 @@ publishes nothing. To build this machine's assets locally the same way, run
   losing window focus releases it). Still **cannot** be captured, by Windows
   design: **Ctrl+Alt+Del** and **Win+L** (kernel/secure-desktop level). F11 is
   deliberately left alone so local fullscreen still works.
+- **Modifier translation** (default on, ⚙ Settings → Advanced → "Translate modifiers for
+  the remote OS"): Mac → Windows/Linux sends Cmd as Ctrl and Cmd+Tab as Alt+Tab, Mac
+  Control as Win/Super; Windows/Linux → Mac sends Ctrl as Cmd, Win/Super as Control,
+  Alt+Tab as Cmd+Tab. Ctrl+Tab stays Ctrl+Tab. Off = literal keys. Same-OS and
+  Windows ↔ Linux sessions are never translated.
 - **One session at a time** per machine. A second incoming request gets `busy`.
 - **Password uses challenge-response** — the viewer sends a proof derived from a
   host-issued nonce (`SHA256(SHA256(password) + ":" + nonce)`), never the plaintext,

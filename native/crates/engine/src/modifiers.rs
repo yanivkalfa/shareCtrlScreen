@@ -51,9 +51,9 @@
 //! * Apple, "Windows keys on a Mac keyboard"
 //!   (<https://support.apple.com/guide/mac-help/cpmh0152/mac>): Command plays
 //!   the role of the PC's Control in common shortcuts; Option is Alt.
-//! * AutoHotkey, `#MenuMaskKey`: Windows opens the Start menu when the Win key
-//!   is pressed and released with no other key in between, and a Ctrl event
-//!   inside the press suppresses it. Hence rewrites press the new code
+//! * AutoHotkey, `#MenuMaskKey` (v1) / `A_MenuMaskKey` (v2): Windows opens
+//!   the Start menu when the Win key is pressed and released with no other
+//!   key in between, and a Ctrl event inside the press suppresses it. Hence rewrites press the new code
 //!   **before** releasing the old one (see [`KeyTranslator::resend`]).
 
 use std::sync::atomic::{AtomicBool, Ordering};

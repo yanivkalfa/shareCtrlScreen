@@ -44,7 +44,7 @@ const TCP: bool = false;
 
 /// An `Xvfb` with one screen of `size` (`WxHxDepth`).
 fn xvfb(size: &str) -> Option<XServer> {
-    XServer::start("Xvfb", &["-screen", "0", size], None, TCP)
+    XServer::start("Xvfb", &["-noreset", "-screen", "0", size], None, TCP)
 }
 
 /// What these tests do with a test server.
@@ -334,7 +334,7 @@ fn randr_resize_is_lost_then_reinit_has_the_new_size() {
     };
     let Some(x) = XServer::start(
         "Xephyr",
-        &["-screen", "1280x1024x24"],
+        &["-noreset", "-screen", "1280x1024x24"],
         Some(&host.name),
         TCP,
     ) else {

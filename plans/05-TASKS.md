@@ -131,8 +131,13 @@ I1..I4 after all lanes (hardware validation)
   prints the same numbers on machine A.
 
 ### W2 — Software codec backend selection on Windows  (size S, Windows)
-* Depends on: D2. Wire the OpenH264 fallback into `CodecFactory` for the no-HW-decoder
-  case (machine B). Acceptance: machine B decodes H.264 from machine A at ≥ 30 fps 1080p.
+* Depends on: D2. **Code done** (selection policy): hardware Media Foundation, then
+  Microsoft's software MF codec, then Cisco OpenH264 only while `useOpenH264` is on;
+  `WindowsPlatform::h264_problem()` tells Settings → Advanced when none exists (an "N"
+  edition without the Media Feature Pack and OpenH264 off or unavailable). Matrix
+  unit-tested with mocks. Acceptance (machine B decodes H.264 from machine A at ≥ 30 fps
+  1080p) still needs the device: run the ignored test in `platform-windows`, then a real
+  session; the log line "hardware H.264 decoder unavailable" shows OpenH264 took over.
 
 ### W3 — Keymap switch on Windows  (size S, Windows)
 * Depends on: D3. Replace `input/src/scancode.rs` lookups with the generated table (Set-1

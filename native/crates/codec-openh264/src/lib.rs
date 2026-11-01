@@ -61,7 +61,7 @@ pub use binary::{
 };
 pub use decoder::SoftwareDecoder;
 pub use encoder::{SoftwareEncoder, MAX_QP};
-pub use fallback::{FrameReadback, ReadbackFactory, WithSoftwareH264};
+pub use fallback::{FrameReadback, NativeH264, NativeProbe, ReadbackFactory, WithSoftwareH264};
 
 /// The attribution Cisco requires wherever the user controls the codec
 /// (licence condition 3). Shown verbatim next to the Settings toggle.

@@ -8,6 +8,26 @@
 //! objects cross the trait boundary as the wrapper types in [`gpu`], which the
 //! adapters here downcast — capture → encoder and decoder → presenter stay
 //! zero-copy on one D3D11 device each.
+//!
+//! ## H.264 selection policy
+//!
+//! Hardware Media Foundation codec first; then Microsoft's software Media
+//! Foundation codec (what machines without a GPU video decoder use); then Cisco
+//! OpenH264, only if the user has it turned on. [`WindowsPlatform::h264_problem`]
+//! reports, in words a user can act on, the one case where none of the three
+//! exists (a Windows "N" edition without the Media Feature Pack and OpenH264
+//! off, unsupported or not downloadable).
+//!
+//! ## References
+//!
+//! * `MFTEnumEx`, `_MFT_ENUM_FLAG` (hardware and synchronous-MFT flags may be
+//!   combined): <https://learn.microsoft.com/windows/win32/api/mfapi/nf-mfapi-mftenumex>,
+//!   <https://learn.microsoft.com/windows/win32/api/mfapi/ne-mfapi-_mft_enum_flag>
+//! * H.264 video decoder / encoder MFTs, and their absence on "N" editions
+//!   without the Media Feature Pack:
+//!   <https://learn.microsoft.com/windows/win32/medfound/h-264-video-decoder>,
+//!   <https://learn.microsoft.com/windows/win32/medfound/h-264-video-encoder>,
+//!   <https://support.microsoft.com/windows/media-feature-pack-for-windows-n-editions>
 
 #![cfg(windows)]
 
@@ -23,7 +43,7 @@ pub mod gpu;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use codec_openh264::{OpenH264, WithSoftwareH264};
+use codec_openh264::{NativeH264, OpenH264, WithSoftwareH264};
 
 /// GPU→CPU readback of Desktop Duplication frames for the software encoder;
 /// public so tools that build their own OpenH264 factory (the smoketest's
@@ -51,7 +71,11 @@ impl WindowsPlatform {
         let openh264 = Arc::new(OpenH264::new(app_dir().join("codecs")));
         Self {
             codecs: WithSoftwareH264::new(adapters::MfCodecFactory, openh264)
-                .with_readback(Box::new(cpu::D3d11Readback)),
+                .with_readback(Box::new(cpu::D3d11Readback))
+                .with_native_probe(Box::new(|| NativeH264 {
+                    encode: codec::encode::can_encode_any(codec::Codec::H264),
+                    decode: codec::decode::can_decode_any(codec::Codec::H264),
+                })),
             secrets: Arc::new(adapters::DpapiSecretStore),
             autostart: Arc::new(adapters::RunKeyAutostart),
         }
@@ -60,6 +84,12 @@ impl WindowsPlatform {
     /// The Cisco OpenH264 handle behind the Settings → Advanced toggle.
     pub fn openh264(&self) -> Arc<OpenH264> {
         self.codecs.openh264().clone()
+    }
+
+    /// Why this computer cannot host and/or view for lack of any H.264 codec,
+    /// or `None`. See the module docs for the policy.
+    pub fn h264_problem(&self) -> Option<String> {
+        self.codecs.h264_problem()
     }
 }
 
@@ -168,5 +198,26 @@ impl Platform for WindowsPlatform {
 
     fn autostart(&self) -> Arc<dyn Autostart> {
         self.autostart.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Machine-B check (no GPU H.264 decoder): such a computer must advertise
+    /// H.264 and report no "no codec" problem, because Microsoft's software
+    /// decoder (or a downloaded OpenH264) covers it. Run on that machine with
+    /// the ignored tests of this crate enabled, then view a real 1080p session
+    /// from machine A and confirm at least 30 fps.
+    #[test]
+    #[ignore = "needs no-HW-decoder machine"]
+    fn h264_is_usable_without_a_hardware_decoder() {
+        let platform = WindowsPlatform::new();
+        assert_eq!(platform.h264_problem(), None);
+        assert!(platform
+            .codecs()
+            .viewer_decodable()
+            .contains(&platform_api::Codec::H264));
     }
 }

@@ -8,7 +8,7 @@ use platform_api::{
     Codec, CodecError, CodecFactory, EncoderConfig, Frame, VideoDecoder, VideoEncoder,
 };
 
-use crate::binary::OpenH264;
+use crate::binary::{Availability, OpenH264};
 use crate::decoder::SoftwareDecoder;
 use crate::encoder::SoftwareEncoder;
 
@@ -37,7 +37,20 @@ pub struct WithSoftwareH264<H> {
     hardware: H,
     openh264: Arc<OpenH264>,
     readback: Option<Box<dyn ReadbackFactory>>,
+    native_probe: Option<NativeProbe>,
 }
+
+/// What the operating system itself can do with H.264, without OpenH264.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeH264 {
+    pub encode: bool,
+    pub decode: bool,
+}
+
+/// Asks the platform whether its own H.264 encoder/decoder exist (hardware or
+/// the OS's software one). Cheap and side-effect free: it runs when the
+/// Settings page is drawn.
+pub type NativeProbe = Box<dyn Fn() -> NativeH264 + Send + Sync>;
 
 impl<H: CodecFactory> WithSoftwareH264<H> {
     pub fn new(hardware: H, openh264: Arc<OpenH264>) -> Self {
@@ -45,7 +58,52 @@ impl<H: CodecFactory> WithSoftwareH264<H> {
             hardware,
             openh264,
             readback: None,
+            native_probe: None,
         }
+    }
+
+    /// For platforms that can tell, ahead of any session, whether the OS has
+    /// its own H.264 — enables [`h264_problem`](Self::h264_problem).
+    pub fn with_native_probe(mut self, probe: NativeProbe) -> Self {
+        self.native_probe = Some(probe);
+        self
+    }
+
+    /// `Some(advice)` when this computer would fail to host and/or view for lack
+    /// of any H.264 codec: the OS has none for that direction **and** OpenH264
+    /// cannot step in (turned off, no Cisco binary for this system, or its last
+    /// download failed). `None` when everything works — or will work once the
+    /// first-use download runs — and always `None` without a probe, because
+    /// then the platform's own availability is unknown and a guess would
+    /// either cry wolf or hide a real problem.
+    pub fn h264_problem(&self) -> Option<String> {
+        let native = (self.native_probe.as_ref()?)();
+        let what = match (native.encode, native.decode) {
+            (true, true) => return None,
+            (false, true) => "share its screen",
+            (true, false) => "show another computer's screen",
+            (false, false) => "share its screen or show another computer's screen",
+        };
+        let fix = match self.openh264.availability() {
+            Availability::Ready | Availability::NotDownloaded => return None,
+            Availability::Disabled => {
+                "Turn on \"Use Cisco OpenH264\" in Settings → Advanced to fix this.".to_string()
+            }
+            Availability::Unsupported => {
+                "Cisco provides no software codec for this system; install the \
+                 operating system's media codecs (on Windows \"N\" editions, the \
+                 Media Feature Pack)."
+                    .to_string()
+            }
+            Availability::Failed(msg) => format!(
+                "The software codec could not be downloaded: {msg} You can also install \
+                 the operating system's media codecs (on Windows \"N\" editions, the \
+                 Media Feature Pack)."
+            ),
+        };
+        Some(format!(
+            "This computer has no H.264 video codec, so it cannot {what}. {fix}"
+        ))
     }
 
     /// For platforms whose capture produces only GPU frames.
@@ -242,6 +300,116 @@ mod tests {
         assert!(f.new_encoder(None, EncoderConfig::default()).is_ok());
         assert!(f.new_decoder(None, Codec::H264, 64, 64).is_ok());
         assert_eq!(f.hardware().calls.load(Ordering::SeqCst), 2);
+    }
+
+    fn probed(native: NativeH264, openh264: Arc<OpenH264>) -> WithSoftwareH264<FakeHardware> {
+        WithSoftwareH264::new(FakeHardware::new(vec![], vec![], false), openh264)
+            .with_native_probe(Box::new(move || native))
+    }
+
+    const NOTHING: NativeH264 = NativeH264 {
+        encode: false,
+        decode: false,
+    };
+    const EVERYTHING: NativeH264 = NativeH264 {
+        encode: true,
+        decode: true,
+    };
+
+    /// A handle in a fresh, empty directory: enabled, nothing downloaded.
+    fn not_downloaded(tag: &str) -> Arc<OpenH264> {
+        let dir = std::env::temp_dir().join(format!("sct-openh264-policy-{tag}"));
+        Arc::new(OpenH264::new(dir))
+    }
+
+    #[test]
+    fn no_problem_when_the_os_has_h264() {
+        // Even with OpenH264 off: the OS codec is enough, so say nothing.
+        assert_eq!(probed(EVERYTHING, disabled_openh264()).h264_problem(), None);
+    }
+
+    #[test]
+    fn no_problem_while_the_download_can_still_happen() {
+        let f = probed(NOTHING, not_downloaded("pending"));
+        if f.openh264().availability() == Availability::NotDownloaded {
+            assert_eq!(f.h264_problem(), None);
+        }
+    }
+
+    #[test]
+    fn problem_names_the_missing_direction_and_the_fix_when_openh264_is_off() {
+        let both = probed(NOTHING, disabled_openh264())
+            .h264_problem()
+            .unwrap_or_default();
+        assert!(
+            both.contains("share its screen or show another computer's screen")
+                && both.contains("Settings → Advanced"),
+            "{both}"
+        );
+        let host_only = probed(
+            NativeH264 {
+                encode: false,
+                decode: true,
+            },
+            disabled_openh264(),
+        )
+        .h264_problem()
+        .unwrap_or_default();
+        assert!(
+            host_only.contains("cannot share its screen.") && !host_only.contains("show another"),
+            "{host_only}"
+        );
+        let viewer_only = probed(
+            NativeH264 {
+                encode: true,
+                decode: false,
+            },
+            disabled_openh264(),
+        )
+        .h264_problem()
+        .unwrap_or_default();
+        assert!(
+            viewer_only.contains("cannot show another computer's screen.")
+                && !viewer_only.contains("share its screen"),
+            "{viewer_only}"
+        );
+    }
+
+    #[test]
+    fn turning_it_off_reports_instead_of_downloading() {
+        let handle = not_downloaded("off-no-download");
+        handle.set_enabled(false);
+        let f = probed(NOTHING, handle);
+        assert!(f.h264_problem().is_some());
+        // Neither the report nor a codec attempt may touch the network or disk.
+        assert!(f.new_decoder(None, Codec::H264, 64, 64).is_err());
+        assert!(f.new_encoder(None, EncoderConfig::default()).is_err());
+        assert!(f.openh264().library_path().is_none_or(|p| !p.exists()));
+    }
+
+    #[test]
+    fn no_probe_means_no_claim() {
+        let f = WithSoftwareH264::new(
+            FakeHardware::new(vec![], vec![], false),
+            disabled_openh264(),
+        );
+        assert_eq!(f.h264_problem(), None);
+    }
+
+    #[test]
+    fn downloaded_library_clears_the_problem() {
+        let handle = not_downloaded("ready");
+        let Some(path) = handle.library_path() else {
+            return; // Cisco ships nothing for this target: nothing to pin.
+        };
+        let Some(dir) = path.parent() else { return };
+        if std::fs::create_dir_all(dir).is_err() || std::fs::write(&path, b"x").is_err() {
+            return;
+        }
+        let f = probed(NOTHING, handle);
+        assert_eq!(f.openh264().availability(), Availability::Ready);
+        assert_eq!(f.h264_problem(), None);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

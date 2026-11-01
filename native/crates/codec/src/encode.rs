@@ -483,12 +483,27 @@ impl Encoder {
 /// Cheap probe: is there a hardware encoder for `codec` on this machine? Counts
 /// `MFTEnumEx` results without activating them (Plan 04 §3 negotiation).
 pub fn can_encode(codec: Codec) -> bool {
+    can_encode_with(codec, MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER)
+}
+
+/// Is there any Media Foundation encoder for `codec` — hardware or Microsoft's
+/// software one? `false` on Windows "N" editions without the Media Feature
+/// Pack, where the software H.264 encoder is not installed. `MFTEnumEx` accepts
+/// the hardware and synchronous-MFT flags together (`_MFT_ENUM_FLAG`) and
+/// nothing is activated.
+pub fn can_encode_any(codec: Codec) -> bool {
+    can_encode_with(
+        codec,
+        MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
+    )
+}
+
+fn can_encode_with(codec: Codec, flags: MFT_ENUM_FLAG) -> bool {
     ensure_mf_startup();
     let output_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: output_subtype(codec),
     };
-    let flags = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER;
     let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
     let mut count: u32 = 0;
     // SAFETY: out-array/count pair per MFTEnumEx; we free the array below.

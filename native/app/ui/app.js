@@ -437,7 +437,8 @@ async function refreshOpenH264() {
     const info = await invoke('openh264_info');
     $('openh264-notice').textContent = info.notice;
     $('openh264-license').textContent = info.license;
-    $('openh264-status').textContent = info.status;
+    // The "no H.264 at all" warning leads: it is the one line the user must act on.
+    $('openh264-status').textContent = info.problem ? `${info.problem} ${info.status}` : info.status;
     $('btn-openh264-download').disabled = !!info.ready;
   } catch (err) {
     $('openh264-status').textContent = String((err && err.message) || err);

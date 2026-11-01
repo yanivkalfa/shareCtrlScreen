@@ -67,7 +67,14 @@ struct AppState {
     decider: Arc<AppDecider>,
     /// The Cisco OpenH264 software codec (Settings → Advanced).
     openh264: Arc<OpenH264>,
+    /// `Some(advice)` when this computer has no H.264 codec at all; shown next
+    /// to the OpenH264 toggle.
+    h264_problem: H264Problem,
 }
+
+/// Asks the platform whether H.264 is missing altogether (it can change when
+/// the user toggles OpenH264, so it is asked each time, not cached).
+type H264Problem = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
 // ---- commands (one per old ipcMain.handle) ----------------------------------
 
@@ -360,6 +367,7 @@ fn openh264_info(state: tauri::State<'_, AppState>) -> serde_json::Value {
         "version": codec_openh264::VERSION,
         "ready": availability == Availability::Ready,
         "status": availability.describe(),
+        "problem": (state.h264_problem)(),
     })
 }
 
@@ -408,15 +416,25 @@ fn init_logging(log_dir: &Path) {
 /// The OS backend for this build, and its Cisco OpenH264 handle (the one
 /// setting that reaches into the codec layer, so it is kept before the
 /// platform is type-erased).
-fn make_platform() -> (Arc<dyn Platform>, Arc<OpenH264>) {
+fn make_platform() -> (Arc<dyn Platform>, Arc<OpenH264>, H264Problem) {
     #[cfg(windows)]
-    let platform = platform_windows::WindowsPlatform::new();
+    let platform = Arc::new(platform_windows::WindowsPlatform::new());
     #[cfg(target_os = "macos")]
-    let platform = platform_macos::MacPlatform::new();
+    let platform = Arc::new(platform_macos::MacPlatform::new());
     #[cfg(target_os = "linux")]
-    let platform = platform_linux::LinuxPlatform::new();
+    let platform = Arc::new(platform_linux::LinuxPlatform::new());
     let openh264 = platform.openh264();
-    (Arc::new(platform), openh264)
+    // Only the Windows backend can tell yet whether the OS has its own H.264;
+    // elsewhere no claim is made (`None`).
+    #[cfg(windows)]
+    let problem: H264Problem = {
+        let p = platform.clone();
+        Arc::new(move || p.h264_problem())
+    };
+    #[cfg(not(windows))]
+    let problem: H264Problem = Arc::new(|| None);
+    let platform: Arc<dyn Platform> = platform;
+    (platform, openh264, problem)
 }
 
 /// Create the native video surface under the main window and hand it to the
@@ -442,7 +460,7 @@ fn attach_video_surface(engine: &Engine, win: &tauri::WebviewWindow) {
 }
 
 fn main() {
-    let (platform, openh264) = make_platform();
+    let (platform, openh264, h264_problem) = make_platform();
     init_logging(&platform.paths().log_dir);
     tracing::info!("platform: {}", platform.info().name);
 
@@ -471,6 +489,7 @@ fn main() {
         engine: engine.clone(),
         decider,
         openh264,
+        h264_problem,
     };
 
     tauri::Builder::default()

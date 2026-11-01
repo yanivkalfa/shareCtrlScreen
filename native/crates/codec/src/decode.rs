@@ -525,6 +525,17 @@ pub fn can_decode_hw(codec: Codec) -> bool {
     can_decode_with(codec, MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER)
 }
 
+/// Is there any Media Foundation decoder for `codec` — hardware or Microsoft's
+/// software one? `false` on Windows "N" editions without the Media Feature
+/// Pack. `MFTEnumEx` accepts the hardware and synchronous-MFT flags together
+/// (`_MFT_ENUM_FLAG`) and nothing is activated.
+pub fn can_decode_any(codec: Codec) -> bool {
+    can_decode_with(
+        codec,
+        MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
+    )
+}
+
 fn can_decode_with(codec: Codec, flags: MFT_ENUM_FLAG) -> bool {
     super::encode::ensure_mf_startup();
     let input_info = MFT_REGISTER_TYPE_INFO {

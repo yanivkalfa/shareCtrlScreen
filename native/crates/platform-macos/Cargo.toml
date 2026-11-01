@@ -66,6 +66,8 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
     "std",
     "CFArray",
     "CFCGTypes",
+    # The AV1 `av1C` record in the decoder's format description (task M3).
+    "CFData",
     "CFDictionary",
     "CFNumber",
     "CFString",
@@ -108,18 +110,24 @@ objc2-core-media = { version = "0.3.2", default-features = false, features = [
     "CMSampleBuffer",
     "CMTime",
     "objc2-core-video",
-    # Encoded samples and their parameter sets (task M2).
+    # Encoded samples and their parameter sets: the encoder's output (task
+    # M2), and the decoder's format descriptions and compressed samples (task
+    # M3).
+    "CMBase",
     "CMBlockBuffer",
     "CMFormatDescription",
 ] }
-# VideoToolbox encode (task M2). Only the compression session, its
-# properties and errors; the defaults also pull in the frame processors,
-# RAW and multi-pass APIs.
+# VideoToolbox encode (task M2) and decode (task M3);
+# `plans/06-CRATES-AND-LICENSES.md`. Only the compression and decompression
+# sessions, their properties and errors; the defaults also pull in the frame
+# processors, RAW and multi-pass APIs.
 objc2-video-toolbox = { version = "0.3.2", default-features = false, features = [
     "std",
     "VTBase",
     "VTCompressionProperties",
     "VTCompressionSession",
+    "VTDecompressionProperties",
+    "VTDecompressionSession",
     "VTErrors",
     "VTPixelTransferProperties",
     "VTSession",

@@ -1,35 +1,35 @@
-//! The macOS hardware `CodecFactory`: VideoToolbox encode (task M2). The
-//! platform wraps it in `codec_openh264::WithSoftwareH264`, so H.264 is
-//! always available and a Mac without a usable hardware H.264 encoder falls
-//! back to Cisco OpenH264.
+//! The macOS hardware `CodecFactory`: VideoToolbox encode (task M2) and
+//! decode (task M3). The platform wraps it in
+//! `codec_openh264::WithSoftwareH264`, so H.264 is always available and a
+//! Mac where VideoToolbox refuses H.264 falls back to Cisco OpenH264.
 //!
-//! Capabilities (plans/01 §4): H.264 always (the protocol guarantee, the
-//! fallback covers it); HEVC when a hardware HEVC session can actually be
-//! made — probed once, in the background from platform creation
+//! Encode capabilities (plans/01 §4): H.264 always (the protocol guarantee,
+//! the fallback covers it); HEVC when a hardware HEVC session can actually
+//! be made — probed once, in the background from platform creation
 //! ([`VtCodecs::start_probe`]), and logged; AV1 never — no Mac encodes it.
-//! Decoding is task M3; until it lands the decoder side is the fail-safe
-//! [`NoCodecs`], which the wrapper backs with OpenH264.
+//!
+//! Decode capabilities: H.264 always (VideoToolbox has a software decoder
+//! behind the hardware one); HEVC and AV1 only where the hardware decodes
+//! them (`decode::decodable`).
 
 use std::any::Any;
 use std::sync::{Arc, OnceLock};
 
-use platform_api::unavailable::NoCodecs;
 use platform_api::{Codec, CodecError, CodecFactory, EncoderConfig, VideoDecoder, VideoEncoder};
 
+use crate::decode::{self, VtDecoder};
 use crate::vt_encoder::{self, VtEncoder};
 use crate::vt_params::{even_size, validate};
 
 pub(crate) struct VtCodecs {
     /// The HEVC probe's answer. Shared with the thread that computes it.
     hevc: Arc<OnceLock<bool>>,
-    decode: NoCodecs,
 }
 
 impl VtCodecs {
-    pub(crate) fn new(decode: NoCodecs) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             hevc: Arc::new(OnceLock::new()),
-            decode,
         }
     }
 
@@ -67,7 +67,7 @@ impl CodecFactory for VtCodecs {
     }
 
     fn viewer_decodable(&self) -> Vec<Codec> {
-        self.decode.viewer_decodable()
+        decode::decodable()
     }
 
     /// `device` is unused: ScreenCaptureKit frames are IOSurface-backed and
@@ -87,14 +87,24 @@ impl CodecFactory for VtCodecs {
         Ok(Box::new(VtEncoder::new(cfg)?))
     }
 
+    /// `device` is unused: VideoToolbox needs no GPU device, and its
+    /// IOSurface-backed output can be wrapped by any Metal device (the
+    /// presenter's `device()` is `None` for the same reason).
     fn new_decoder(
         &self,
-        device: Option<&dyn Any>,
+        _device: Option<&dyn Any>,
         codec: Codec,
         width: u32,
         height: u32,
     ) -> Result<Box<dyn VideoDecoder>, CodecError> {
-        self.decode.new_decoder(device, codec, width, height)
+        // HEVC/AV1 are only negotiated when advertised, i.e. when the
+        // hardware decodes them; refuse here rather than at the first
+        // keyframe so the session ends with a clear reason. H.264 always has
+        // VideoToolbox's software decoder behind the hardware one.
+        if codec != Codec::H264 && !decode::hardware_decodes(codec) {
+            return Err(CodecError::NoDecoder(codec));
+        }
+        Ok(Box::new(VtDecoder::new(codec, width, height)))
     }
 }
 
@@ -103,9 +113,7 @@ mod tests {
     use super::*;
 
     fn codecs() -> VtCodecs {
-        VtCodecs::new(NoCodecs {
-            reason: "no decoder in this test",
-        })
+        VtCodecs::new()
     }
 
     #[test]
@@ -130,10 +138,31 @@ mod tests {
     }
 
     #[test]
-    fn decoding_is_left_to_the_fallback_until_m3() {
+    fn advertises_h264_and_only_hardware_decoded_codecs() {
         let f = codecs();
-        assert_eq!(f.viewer_decodable(), vec![Codec::H264]);
-        assert!(f.new_decoder(None, Codec::H264, 64, 64).is_err());
+        let decodable = f.viewer_decodable();
+        assert_eq!(decodable.last(), Some(&Codec::H264));
+        for codec in [Codec::Hevc, Codec::Av1] {
+            assert_eq!(
+                decodable.contains(&codec),
+                decode::hardware_decodes(codec),
+                "{codec:?}"
+            );
+            let made = f.new_decoder(None, codec, 1280, 720);
+            if decode::hardware_decodes(codec) {
+                assert!(made.is_ok(), "{codec:?}");
+            } else {
+                assert!(
+                    matches!(made, Err(CodecError::NoDecoder(c)) if c == codec),
+                    "{codec:?}"
+                );
+            }
+        }
+        let h264 = f
+            .new_decoder(None, Codec::H264, 1280, 720)
+            .unwrap_or_else(|e| panic!("{e}"));
+        // The hint is what is reported before the first picture.
+        assert_eq!(h264.dimensions(), (1280, 720));
     }
 
     /// Runs the real HEVC probe; its answer depends on the Mac, the shape of

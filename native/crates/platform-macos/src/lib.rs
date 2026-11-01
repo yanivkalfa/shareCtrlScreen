@@ -3,8 +3,9 @@
 //! NSPasteboard, Keychain, LaunchAgent).
 //!
 //! Status: screen capture and display enumeration (M1), VideoToolbox encode
-//! (M2), the video surface and presenter (M4), input injection (M5),
-//! clipboard (M7), Keychain (M8), autostart (M9), permissions (M11) and paths are real; every other
+//! (M2) and decode (M3), the video surface and presenter (M4), input
+//! injection (M5), clipboard (M7), Keychain (M8), autostart (M9),
+//! permissions (M11) and paths are real; every other
 //! capability fails safely with a clear message until its task lands (see
 //! `plans/05-TASKS.md`, lane M).
 
@@ -16,6 +17,7 @@ mod capture;
 mod codecs;
 mod convert;
 mod cursor;
+mod decode;
 mod display_id;
 mod displays;
 mod focus;
@@ -38,7 +40,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use codec_openh264::{OpenH264, WithSoftwareH264};
-use platform_api::unavailable::{NoAutostart, NoCodecs};
+use codecs::VtCodecs;
+use platform_api::unavailable::NoAutostart;
 use platform_api::{
     Autostart, CaptureError, Clipboard, CodecFactory, DisplayInfo, InputError, InputInjector,
     OsPermission, Paths, PermissionReport, Platform, PlatformInfo, RawDisplayHandle,
@@ -48,18 +51,16 @@ use platform_api::{
 mod clipboard;
 mod secret;
 
-const NOT_YET: &str = "not available on macOS in this version";
-
 pub struct MacPlatform {
-    /// VideoToolbox encode (M2); decode lands with M3. Cisco OpenH264 covers
-    /// H.264 on any Mac whose hardware refuses it, and decoding until M3.
-    codecs: WithSoftwareH264<codecs::VtCodecs>,
+    /// VideoToolbox encode (M2) and decode (M3); Cisco OpenH264 for H.264
+    /// wherever VideoToolbox refuses it.
+    codecs: WithSoftwareH264<VtCodecs>,
 }
 
 impl MacPlatform {
     pub fn new() -> Self {
         let openh264 = Arc::new(OpenH264::new(config_dir().join("codecs")));
-        let hardware = codecs::VtCodecs::new(NoCodecs { reason: NOT_YET });
+        let hardware = VtCodecs::new();
         hardware.start_probe();
         Self {
             codecs: WithSoftwareH264::new(hardware, openh264),

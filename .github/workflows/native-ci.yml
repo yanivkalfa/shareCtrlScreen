@@ -125,6 +125,9 @@ jobs:
     env:
       # Any skip in the X11 tests becomes a panic (support/xserver.rs skip()).
       SCT_X11_TESTS_REQUIRED: "1"
+      # Uinput read-back (L6) and the input peers it needs: a missing /dev/uinput,
+      # evdev node or sway becomes a panic (src/input/tests.rs skip_input()).
+      SCT_LINUX_INPUT_TESTS_REQUIRED: "1"
       # Software GL for the wgpu presenter in x11_surface: Mesa llvmpipe through
       # LIBGL_ALWAYS_SOFTWARE, because GitHub's Linux runners have no GPU.
       # x11_surface also sets it itself.
@@ -144,7 +147,7 @@ jobs:
             libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev \
             libpipewire-0.3-dev libspa-0.2-dev libclang-dev \
             mesa-vulkan-drivers \
-            xvfb xserver-xephyr x11-xserver-utils xterm xclip xdotool
+            xvfb xserver-xephyr x11-xserver-utils xterm xclip xdotool acl
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -159,6 +162,37 @@ jobs:
         run: cargo test -p platform-linux --lib clipboard::tests -- --nocapture
       - name: Shortcut hook (L7: private Xvfb, XI2 grab, XTEST keys)
         run: cargo test -p platform-linux --lib shortcuts::xvfb_tests -- --nocapture
+      # L6 (plan 05): the XTest injector against a private Xvfb, then the uinput
+      # read-back. Two filters, not `input::tests`: that module also holds the
+      # libei test (T4's EIS peer) and the wlroots test (needs sway, which this
+      # job does not install); with SCT_LINUX_INPUT_TESTS_REQUIRED=1 the wlroots
+      # test would fail here by design. The pure front-end tests run in
+      # build-test's workspace leg.
+      #
+      # uinput needs /dev/uinput writable and the /dev/input/event* nodes the test
+      # creates readable by the runner user. Group membership is not used: a
+      # `usermod -aG input` run inside the job does not reach the job's already
+      # started steps without a new login, so it would not be in effect. Instead:
+      # - modprobe uinput loads the module, which creates /dev/uinput (the L6
+      #   note says the runner kernel has evdev and uinput);
+      # - setfacl grants the runner user rw on /dev/uinput (acl package above);
+      # - a udev rule (udev(7): KERNEL and MODE keys) gives the event nodes
+      #   mode 0666 when the test creates them. The test waits up to 5 s for
+      #   each node (eventually() in input/tests.rs), which covers udev's
+      #   asynchronous processing.
+      # The runner is a throwaway VM (GitHub-hosted runner reference: passwordless
+      # sudo, a new VM per runner), so the permissive mode does not outlive the job.
+      - name: uinput access for the runner user (L6 read-back)
+        run: |
+          sudo modprobe uinput
+          sudo setfacl -m "u:$(id -un):rw" /dev/uinput
+          echo 'KERNEL=="event*", SUBSYSTEM=="input", MODE="0666"' | sudo tee /etc/udev/rules.d/90-sharectrl-ci-input.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --subsystem-match=input
+      - name: XTest injector (L6: private Xvfb)
+        run: cargo test -p platform-linux --lib input::tests::xtest -- --nocapture
+      - name: uinput read-back through evdev (L6)
+        run: cargo test -p platform-linux --lib input::tests::uinput -- --nocapture
 
   release-build:
     # The optimized Windows build the dev/test pipelines ship.

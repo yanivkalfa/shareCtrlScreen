@@ -3,9 +3,10 @@
 //! NSPasteboard, Keychain, LaunchAgent).
 //!
 //! Status: screen capture and display enumeration (M1), the video surface and
-//! presenter (M4), clipboard (M7), Keychain (M8), autostart (M9), permissions
-//! (M11) and paths are real; every other capability fails safely with a clear
-//! message until its task lands (see `plans/05-TASKS.md`, lane M).
+//! presenter (M4), input injection (M5), clipboard (M7), Keychain (M8),
+//! autostart (M9), permissions (M11) and paths are real; every other
+//! capability fails safely with a clear message until its task lands (see
+//! `plans/05-TASKS.md`, lane M).
 
 #![cfg(target_os = "macos")]
 
@@ -15,8 +16,11 @@ mod convert;
 mod cursor;
 mod display_id;
 mod displays;
+mod focus;
 pub mod gpu;
 mod import;
+mod inject_state;
+mod injector;
 pub mod keymap;
 mod permissions;
 mod presenter;
@@ -133,7 +137,7 @@ impl Platform for MacPlatform {
     }
 
     fn create_injector(&self) -> Result<Box<dyn InputInjector>, InputError> {
-        Err(InputError::Unavailable(format!("remote control {NOT_YET}")))
+        Ok(Box::new(injector::CgInjector::new()?))
     }
 
     fn create_shortcut_hook(&self) -> Option<Box<dyn ShortcutHook>> {

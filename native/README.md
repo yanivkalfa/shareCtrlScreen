@@ -16,7 +16,7 @@ The Cloudflare signaling server (`../server/`) and the JSON WebSocket protocol
 | `crates/protocol` | Shared types: config schema + challenge-response, signaling / input / control message enums. Pure, cross-platform, unit-tested. |
 | `crates/platform-api` | **The OS boundary**: traits for capture, codecs, video surface + presenter, input injection, shortcut hook, clipboard, secrets, autostart, paths, permissions. No OS dependencies. Feature `mock` = in-memory backends for tests. |
 | `crates/platform-windows` | Windows implementation of `platform-api`, wrapping `capture`/`codec`/`render`/`input`/`elevation` + DPAPI, Run key, Win32 clipboard. |
-| `crates/platform-macos`, `crates/platform-linux` | macOS / Linux implementations (scaffolds: real paths, every other capability fails safely until its task lands — see `../plans/05-TASKS.md`). |
+| `crates/platform-macos`, `crates/platform-linux` | macOS / Linux implementations, filled in task by task (on macOS capture, the video surface, input injection, clipboard, Keychain, autostart and permissions are real); a capability whose task has not landed fails safely — see `../plans/05-TASKS.md`. |
 | `crates/capture` | DXGI Desktop Duplication (§5a): shared `ID3D11Texture2D` + dirty/move rects + out-of-band cursor; `ACCESS_LOST` re-init. |
 | `crates/codec` | Media Foundation HW H.264/HEVC encode (§5b, zero-copy, LTR, the low-latency `ICodecAPI` recipe) + D3D11-backed decode (§5c). |
 | `crates/transport` | str0m WebRTC (§6): video on an RTP media track with congestion control (BWE), ctl (reliable) / cursor (unreliable) / bulk (reliable) data channels. Unit-tested. |

@@ -12,6 +12,8 @@ workspace = true
 # macOS implementation of `platform-api` (plan lane M). Empty on other targets.
 [target.'cfg(target_os = "macos")'.dependencies]
 platform-api = { path = "../platform-api" }
+# `InputMsg` / `Button`, the wire types the injector (task M5) consumes.
+protocol = { path = "../protocol" }
 codec-openh264 = { path = "../codec-openh264" }
 tracing.workspace = true
 dirs = "6"
@@ -42,6 +44,9 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSImage",
     "NSImageRep",
     "NSPasteboard",
+    # Input injection (task M5): app activation for `focus_window_at`.
+    "NSRunningApplication",
+    "libc",
     "NSWorkspace",
     "objc2-core-foundation",
     "objc2-core-graphics",
@@ -75,12 +80,23 @@ objc2-core-graphics = { version = "0.3.2", default-features = false, features = 
     "CGDisplayStream",
     "CGError",
     "CGEvent",
+    # Input injection (task M5): event creation, its source and key codes.
+    "CGEventSource",
+    "CGEventTypes",
+    "CGRemoteOperation",
     "CGGeometry",
     "CGImage",
     "CGWindow",
     "libc",
 ] }
-objc2-application-services = { version = "0.3.2", default-features = false, features = ["std", "HIServices", "AXUIElement"] }
+# `focus_window_at` (task M5) adds the AX error codes and pid-taking calls.
+objc2-application-services = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "HIServices",
+    "AXError",
+    "AXUIElement",
+    "libc",
+] }
 # Keychain (generic passwords). keyring 4.2 has no `macos` feature: the Keychain
 # store is selected by its default `v1` feature on macOS.
 keyring = "4.2"

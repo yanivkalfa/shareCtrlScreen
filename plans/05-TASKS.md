@@ -29,6 +29,7 @@
 | L5-spike | **done** `de9f354` (Opus) | Wayland subsurface works on sway/Weston; GNOME/KDE device pass pending; L5 builds option 1 (see plans/spikes) |
 | D2 OpenH264 | **done** `0dd75a1` (Opus) | Cisco binary downloaded at runtime (SHA-256 pinned), licence toggle + notice in Settings → Advanced, `WithSoftwareH264` adapter on all three platforms, D3D11 readback + CPU-NV12 upload on Windows. 1080p encode budget to be measured on an idle machine |
 | M4 NSView surface | **done** `76eccb2` (Opus) | `surface-wgpu` shared crate (WGSL NV12→RGB, letterbox, cursor, reveal, held-input release) + NSView/CAMetalLayer view, bounded main-thread hop, zero-copy CVPixelBuffer import. Uses `gpu::CvPixelBufferFrame` and the generated keymap. **Device-pending** (checklists/M4.md) |
+| M5 CGEvent injector | **done** (Opus) | `CgInjector` posts to `kCGHIDEventTap` from its own event source (local suppression 0, sentinel in `kCGEventSourceUserData`); refuses with `PermissionDenied` without Accessibility. Explicit modifier + device-bit flags on every event, modifiers and Caps Lock as `flagsChanged`, Caps Lock toggles per press, drags + click counts; wheel → 40 px/notch pixel events (pixels-per-line 40/3 = 3 lines/notch); `focus_window_at` = window list → AX raise → `AXFrontmost` + `NSRunningApplication.activate`; `paste_chord` Cmd+V. **Device-pending** (checklists/M5.md) |
 | L9 Secret Service store | **done** `bc7f6d0` (Haiku, Opus-reviewed) | keyring-core + zbus store, fresh connection per call (no poisoned cache), `forget` implemented; daemon round-trip test. The dev-dep feature-unification build defect was caught by the gate and fixed |
 | M8b Keychain `forget` | **done** `63e5466` (Haiku) | follow-up to M8 |
 | L3 NVENC + VA-API encode | **done** `8baf62c` (Opus, independent FFI review: layouts verified with gcc; 9 findings fixed) | dlopen bindings, CBR/max-QP-32/one-frame VBV recipe, levels from size+fps, driver-header capture. NVENC verified on the GTX 1080 Ti; **VA-API device-pending** (checklists/L3.md) |
@@ -37,7 +38,7 @@
 | M2, M3, L1, L2, L4, M6, L7 | queued (Opus cap) | start in wave 2, warm caches |
 | W3 keymap switch | **done** `e2d6b1c` (Sonnet, Opus-reviewed) | `input::scancode` is an adapter over the generated keymap; NumLock is E0 45 (plain 45 is Pause). Device check: NumLock LED toggles, Pause does nothing |
 | W2 software codec selection | **done** (Sonnet, Opus-reviewed) | H.264 policy on Windows: hardware → MF software decoder → OpenH264 (only while `useOpenH264` is on); `h264_problem()` gives an actionable report when Media Foundation has no H.264 MFTs (N editions without the Media Feature Pack fail at launch — documented). Machine-B check: ignored test + log line "no hardware H264 decoder — using software decode" |
-| M5, L6, L5, D7, T2, T3, T4 | in wave 2 | see rows above/below as they land |
+| L6, L5, D7, T2, T3, T4 | in wave 2 | see rows above/below as they land |
 | everything else | open | as below. |
 
 Interfaces the remaining tasks must use: `Platform::create_capture / create_surface / create_injector / create_shortcut_hook / create_clipboard` (call on the thread that uses the object), `Engine::start(platform, decider)`, `Engine::attach_surface`, `IcePolicy::LoopbackOnly` for tests, mocks in `platform_api::mock`.

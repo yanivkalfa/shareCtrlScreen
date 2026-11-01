@@ -134,7 +134,7 @@ fn settings_url(p: OsPermission) -> &'static str {
 }
 
 /// Side-effect-free probe: never shows a prompt.
-fn is_granted(p: OsPermission) -> bool {
+pub(crate) fn is_granted(p: OsPermission) -> bool {
     match p {
         OsPermission::ScreenCapture => CGPreflightScreenCaptureAccess(),
         OsPermission::InputInjection => accessibility_trusted(false),

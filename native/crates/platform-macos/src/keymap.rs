@@ -1,14 +1,16 @@
-//! macOS key events → DOM `KeyboardEvent.code`.
+//! macOS key events ↔ DOM `KeyboardEvent.code`.
 //!
 //! The key-code table itself is the shared generated one
 //! ([`platform_api::keymap`], from Chromium's `dom_code_data.inc`); this module
-//! adds only what is macOS-specific about reading key events: modifier keys
-//! arrive as `flagsChanged`, whose press/release must be read from the
-//! side-specific modifier bits, and Caps Lock reports the lock toggling.
+//! adds only what is macOS-specific about key events, read by the surface and
+//! written by the injector: modifier keys arrive as `flagsChanged`, whose
+//! press/release lives in the side-specific modifier bits, and Caps Lock
+//! reports the lock toggling.
 //!
 //! ## References
 //! * `NSEvent.keyCode`, `NSEvent.modifierFlags`:
 //!   <https://developer.apple.com/documentation/appkit/nsevent>
+//! * `CGEventFlags`: <https://developer.apple.com/documentation/coregraphics/cgeventflags>
 //! * `HIToolbox/Events.h` (Carbon), "Virtual keycodes" — the `kVK_*` values.
 //! * `IOKit/hidsystem/IOLLEvent.h` — the `NX_DEVICE*KEYMASK` bits.
 
@@ -20,39 +22,95 @@ pub fn dom_code(key_code: u16) -> Option<&'static str> {
     KeyId::from_mac(key_code).map(dom_for)
 }
 
+/// One modifier key, as macOS describes it in an event's modifier flags.
+///
+/// `flag` is the device-independent bit set while either side is held; it is
+/// the same bit in `NSEvent.modifierFlags` and in `CGEventFlags`
+/// (`kCGEventFlagMask*`). `device_bit` is the side-specific bit in the low
+/// word (IOKit `NX_DEVICE*KEYMASK`, `IOLLEvent.h`), the only way to tell left
+/// from right: with both Shift keys held, releasing one still leaves the
+/// shared Shift flag set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Modifier {
+    /// `kVK_*` code of the key (`HIToolbox/Events.h`).
+    pub key_code: u16,
+    pub flag: u64,
+    pub device_bit: u64,
+}
+
+// CGEventTypes.h `kCGEventFlagMask*` (= NSEvent.h `NSEventModifierFlag*`).
+const FLAG_SHIFT: u64 = 0x0002_0000;
+const FLAG_CONTROL: u64 = 0x0004_0000;
+const FLAG_OPTION: u64 = 0x0008_0000;
+const FLAG_COMMAND: u64 = 0x0010_0000;
+
+/// `kCGEventFlagMaskAlphaShift` (= `NSEventModifierFlagCapsLock`): the Caps
+/// Lock is on.
+pub(crate) const FLAG_CAPS_LOCK: u64 = 0x0001_0000;
+
+/// The eight modifier keys. Their `kVK_*` codes are pinned to the generated
+/// table by `keys_the_surface_relies_on_map_through_the_generated_table`;
+/// the device bits are `NX_DEVICE{L,R}{CTL,SHIFT,CMD,ALT}KEYMASK`.
+pub(crate) const MODIFIERS: [Modifier; 8] = [
+    Modifier {
+        key_code: 0x3B,
+        flag: FLAG_CONTROL,
+        device_bit: 0x0000_0001,
+    },
+    Modifier {
+        key_code: 0x3E,
+        flag: FLAG_CONTROL,
+        device_bit: 0x0000_2000,
+    },
+    Modifier {
+        key_code: 0x38,
+        flag: FLAG_SHIFT,
+        device_bit: 0x0000_0002,
+    },
+    Modifier {
+        key_code: 0x3C,
+        flag: FLAG_SHIFT,
+        device_bit: 0x0000_0004,
+    },
+    Modifier {
+        key_code: 0x37,
+        flag: FLAG_COMMAND,
+        device_bit: 0x0000_0008,
+    },
+    Modifier {
+        key_code: 0x36,
+        flag: FLAG_COMMAND,
+        device_bit: 0x0000_0010,
+    },
+    Modifier {
+        key_code: 0x3A,
+        flag: FLAG_OPTION,
+        device_bit: 0x0000_0020,
+    },
+    Modifier {
+        key_code: 0x3D,
+        flag: FLAG_OPTION,
+        device_bit: 0x0000_0040,
+    },
+];
+
+/// The modifier `key_code` names, if it is one.
+pub(crate) fn modifier(key_code: u16) -> Option<Modifier> {
+    MODIFIERS.into_iter().find(|m| m.key_code == key_code)
+}
+
 /// How a `flagsChanged` event for `key_code` maps to a press or release.
 ///
 /// AppKit reports modifier keys only through `flagsChanged`, with the new
-/// modifier state in `modifierFlags`. The device-independent bits (Shift,
-/// Control…) cannot tell left from right, so this uses the device-dependent
-/// bits in the low word (IOKit `NX_DEVICE*KEYMASK`, `IOLLEvent.h`): with both
-/// Shift keys held, releasing one still leaves the shared Shift flag set.
+/// modifier state in `modifierFlags`; the side-specific
+/// [`Modifier::device_bit`] says whether this key is now down.
 pub fn modifier_is_down(key_code: u16, modifier_flags: usize) -> Option<bool> {
-    // IOKit/hidsystem/IOLLEvent.h
-    const NX_DEVICELCTLKEYMASK: usize = 0x0000_0001;
-    const NX_DEVICELSHIFTKEYMASK: usize = 0x0000_0002;
-    const NX_DEVICERSHIFTKEYMASK: usize = 0x0000_0004;
-    const NX_DEVICELCMDKEYMASK: usize = 0x0000_0008;
-    const NX_DEVICERCMDKEYMASK: usize = 0x0000_0010;
-    const NX_DEVICELALTKEYMASK: usize = 0x0000_0020;
-    const NX_DEVICERALTKEYMASK: usize = 0x0000_0040;
-    const NX_DEVICERCTLKEYMASK: usize = 0x0000_2000;
-    let mask = match key_code {
-        0x3B => NX_DEVICELCTLKEYMASK,
-        0x3E => NX_DEVICERCTLKEYMASK,
-        0x38 => NX_DEVICELSHIFTKEYMASK,
-        0x3C => NX_DEVICERSHIFTKEYMASK,
-        0x37 => NX_DEVICELCMDKEYMASK,
-        0x36 => NX_DEVICERCMDKEYMASK,
-        0x3A => NX_DEVICELALTKEYMASK,
-        0x3D => NX_DEVICERALTKEYMASK,
-        _ => return None,
-    };
-    Some(modifier_flags & mask != 0)
+    modifier(key_code).map(|m| modifier_flags as u64 & m.device_bit != 0)
 }
 
 /// `kVK_CapsLock`. A `flagsChanged` for it reports the **lock** toggling, not
-/// the key going down and up, so the surface forwards each one as a tap.
+/// the key going down and up, so the surface forwards each one as a tap and
+/// the injector turns each press back into one toggle.
 pub const CAPS_LOCK: u16 = 0x39;
 
 #[cfg(test)]

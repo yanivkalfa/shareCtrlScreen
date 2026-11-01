@@ -230,6 +230,14 @@ impl Capabilities {
     }
 }
 
+/// Whether a viewer advertises AV1 when NVDEC reports it can decode it.
+/// Off until the device check has run: AV1 through NVDEC is implemented
+/// but has never decoded a real host stream (no Ampere-or-newer GPU on the
+/// test machines). Flip to `true` once plans/checklists/L4.md step 2b
+/// passes. While off, a Windows host that encodes AV1 negotiates HEVC or
+/// H.264 with this viewer instead.
+const ADVERTISE_AV1_DECODE: bool = false;
+
 /// A hardware decoder the probe found.
 #[derive(Debug, Clone)]
 enum DecodeBackend {
@@ -334,6 +342,10 @@ impl DecodeCapabilities {
     fn decodable(&self) -> Vec<Codec> {
         let mut out: Vec<Codec> = [Codec::Av1, Codec::Hevc]
             .into_iter()
+            .filter(|&c| match c {
+                Codec::Av1 => ADVERTISE_AV1_DECODE,
+                Codec::Hevc | Codec::H264 => true,
+            })
             .filter(|&c| self.found.iter().any(|b| b.decodes(c)))
             .collect();
         // Always: the protocol's guaranteed fallback (see the module docs).
@@ -634,7 +646,16 @@ mod tests {
             })],
             missing: vec![],
         };
-        assert_eq!(caps.decodable(), vec![Codec::Av1, Codec::Hevc, Codec::H264]);
+        // AV1 only once the device check has switched the advertisement on.
+        let want = if ADVERTISE_AV1_DECODE {
+            vec![Codec::Av1, Codec::Hevc, Codec::H264]
+        } else {
+            vec![Codec::Hevc, Codec::H264]
+        };
+        assert_eq!(caps.decodable(), want);
+        // The decoder itself still builds when asked (negotiation never asks
+        // while the advertisement is off).
+        assert!(caps.found[0].decodes(Codec::Av1));
     }
 
     /// The real decode probe on whatever machine runs the tests (CI: nothing;
@@ -655,7 +676,7 @@ mod tests {
 
     /// A smooth moving BGRA picture (gradients plus a moving block), so the
     /// decoded luma can be compared with the source within coding error.
-    #[cfg(all(feature = "nvenc", feature = "nvdec"))]
+    #[cfg(any(feature = "vaapi", all(feature = "nvenc", feature = "nvdec")))]
     fn gradient(w: usize, h: usize, t: usize) -> Vec<u8> {
         let mut px = vec![0u8; w * h * 4];
         for y in 0..h {
@@ -677,7 +698,7 @@ mod tests {
 
     /// Mean absolute difference between a decoded frame's luma and the
     /// BT.709 limited-range luma of the BGRA source.
-    #[cfg(all(feature = "nvenc", feature = "nvdec"))]
+    #[cfg(any(feature = "vaapi", all(feature = "nvenc", feature = "nvdec")))]
     fn luma_error(frame: &platform_api::Frame<'_>, bgra: &[u8]) -> f64 {
         let platform_api::FrameData::Cpu { plane0, .. } = frame.data else {
             panic!("CPU frame expected");
@@ -717,66 +738,156 @@ mod tests {
             codecs.push(Codec::Hevc);
         }
         for codec in codecs {
-            let cfg = EncoderConfig {
-                width: 640,
-                height: 360,
-                fps_num: 30,
-                fps_den: 1,
-                bitrate_bps: 4_000_000,
+            round_trip(
                 codec,
-            };
-            let mut enc = nvenc::NvencEncoder::new(cfg).expect("encoder");
-            let mut dec = nvdec::NvdecDecoder::new(&dec_probe, codec, 640, 360).expect("decoder");
-            let mut first_delta = None;
-            for t in 0..12 {
-                if t == 6 {
-                    enc.force_keyframe();
-                }
-                let src = gradient(640, 360, t);
-                let units = enc
-                    .encode(&platform_api::Frame::bgra(640, 360, &src, 640 * 4))
-                    .expect("encode");
-                assert_eq!(units.len(), 1);
-                let u = &units[0];
-                assert_eq!(u.keyframe, t == 0 || t == 6, "{codec:?} frame {t}");
-                if t == 1 {
-                    first_delta = Some(u.data.clone());
-                }
-                let frame = dec
-                    .decode(&u.data, u.keyframe, t as i64 * 333_333)
-                    .expect("decode")
-                    .unwrap_or_else(|| panic!("{codec:?} AU {t} gave no picture"));
-                assert_eq!((frame.width, frame.height), (640, 360));
-                let err = luma_error(&frame, &src);
-                assert!(err < 4.0, "{codec:?} frame {t}: mean luma error {err:.2}");
-                assert_eq!(dec.dimensions(), (640, 360));
-            }
-            // A fresh decoder fed a delta first has nothing to show.
-            let mut fresh = nvdec::NvdecDecoder::new(&dec_probe, codec, 640, 360).expect("decoder");
-            let delta = first_delta.expect("a delta frame");
-            assert!(fresh.decode(&delta, false, 0).expect("decode").is_none());
+                |cfg| Box::new(nvenc::NvencEncoder::new(cfg).expect("NVENC encoder")),
+                |codec, w, h| {
+                    Box::new(nvdec::NvdecDecoder::new(&dec_probe, codec, w, h).expect("decoder"))
+                },
+            );
+        }
+    }
 
-            // Resolution change on the same decoder.
-            let mut small = nvenc::NvencEncoder::new(EncoderConfig {
-                width: 320,
-                height: 240,
-                ..cfg
-            })
-            .expect("encoder");
-            for t in 0..3 {
-                let src = gradient(320, 240, t);
-                let units = small
-                    .encode(&platform_api::Frame::bgra(320, 240, &src, 320 * 4))
-                    .expect("encode");
-                let frame = dec
-                    .decode(&units[0].data, units[0].keyframe, 0)
-                    .expect("decode after the size change")
-                    .expect("picture after the size change");
-                assert_eq!((frame.width, frame.height), (320, 240));
-                assert!(luma_error(&frame, &src) < 4.0);
-                assert_eq!(dec.dimensions(), (320, 240));
+    /// The encoder → decoder round trip both hardware pairs run: every access
+    /// unit yields its picture immediately and within coding error of the
+    /// source, a forced IDR is a keyframe, a fresh decoder fed a delta first
+    /// yields `Ok(None)`, and a new resolution on the same decoder reports the
+    /// new size.
+    #[cfg(any(feature = "vaapi", all(feature = "nvenc", feature = "nvdec")))]
+    fn round_trip(
+        codec: Codec,
+        make_enc: impl Fn(EncoderConfig) -> Box<dyn VideoEncoder>,
+        make_dec: impl Fn(Codec, u32, u32) -> Box<dyn VideoDecoder>,
+    ) {
+        let cfg = EncoderConfig {
+            width: 640,
+            height: 360,
+            fps_num: 30,
+            fps_den: 1,
+            bitrate_bps: 4_000_000,
+            codec,
+        };
+        let mut enc = make_enc(cfg);
+        let mut dec = make_dec(codec, 640, 360);
+        let mut first_delta = None;
+        for t in 0..12 {
+            if t == 6 {
+                enc.force_keyframe();
+            }
+            let src = gradient(640, 360, t);
+            let units = enc
+                .encode(&platform_api::Frame::bgra(640, 360, &src, 640 * 4))
+                .expect("encode");
+            assert_eq!(units.len(), 1);
+            let u = &units[0];
+            assert_eq!(u.keyframe, t == 0 || t == 6, "{codec:?} frame {t}");
+            if t == 1 {
+                first_delta = Some(u.data.clone());
+            }
+            let frame = dec
+                .decode(&u.data, u.keyframe, t as i64 * 333_333)
+                .expect("decode")
+                .unwrap_or_else(|| panic!("{codec:?} AU {t} gave no picture"));
+            assert_eq!((frame.width, frame.height), (640, 360));
+            let err = luma_error(&frame, &src);
+            assert!(err < 4.0, "{codec:?} frame {t}: mean luma error {err:.2}");
+            assert_eq!(dec.dimensions(), (640, 360));
+        }
+        // A fresh decoder fed a delta first has nothing to show.
+        let mut fresh = make_dec(codec, 640, 360);
+        let delta = first_delta.expect("a delta frame");
+        assert!(fresh.decode(&delta, false, 0).expect("decode").is_none());
+
+        // Resolution change on the same decoder.
+        let mut small = make_enc(EncoderConfig {
+            width: 320,
+            height: 240,
+            ..cfg
+        });
+        for t in 0..3 {
+            let src = gradient(320, 240, t);
+            let units = small
+                .encode(&platform_api::Frame::bgra(320, 240, &src, 320 * 4))
+                .expect("encode");
+            let frame = dec
+                .decode(&units[0].data, units[0].keyframe, 0)
+                .expect("decode after the size change")
+                .expect("picture after the size change");
+            assert_eq!((frame.width, frame.height), (320, 240));
+            assert!(luma_error(&frame, &src) < 4.0);
+            assert_eq!(dec.dimensions(), (320, 240));
+        }
+    }
+
+    /// VA-API encoder (task L3) → VA-API decoder on an Intel/AMD GPU: the
+    /// round trip above. Run on the Linux test machine (checklists/L4.md).
+    #[cfg(feature = "vaapi")]
+    #[test]
+    #[ignore = "needs VA-API device"]
+    fn vaapi_encode_to_vaapi_decode_round_trip() {
+        let enc_probe = vaapi::probe().expect("VA-API encode probe");
+        let dec_probe = vaapi::decode_probe().expect("VA-API decode probe");
+        eprintln!("{} / {}", enc_probe.describe(), dec_probe.describe());
+        round_trip(
+            Codec::H264,
+            |cfg| Box::new(vaapi::VaapiEncoder::new(&enc_probe, cfg).expect("VA-API encoder")),
+            |codec, w, h| {
+                Box::new(vaapi::VaapiDecoder::new(&dec_probe, codec, w, h).expect("decoder"))
+            },
+        );
+    }
+
+    /// The L4 acceptance budget: decoding 1080p (decode + read-back into CPU
+    /// NV12, i.e. one `decode` call) takes at most 4 ms per frame on average
+    /// on an Intel iGPU. 120 frames from the L3 VA-API encoder at 8 Mbit/s;
+    /// the first picture (session and surface creation) is not counted.
+    #[cfg(feature = "vaapi")]
+    #[test]
+    #[ignore = "needs VA-API device"]
+    fn vaapi_decode_1080p_within_4ms() {
+        let enc_probe = vaapi::probe().expect("VA-API encode probe");
+        let dec_probe = vaapi::decode_probe().expect("VA-API decode probe");
+        let cfg = EncoderConfig {
+            width: 1920,
+            height: 1080,
+            fps_num: 60,
+            fps_den: 1,
+            bitrate_bps: 8_000_000,
+            codec: Codec::H264,
+        };
+        let mut enc = vaapi::VaapiEncoder::new(&enc_probe, cfg).expect("VA-API encoder");
+        let mut units = Vec::new();
+        for t in 0..120 {
+            let src = gradient(1920, 1080, t);
+            units.extend(
+                enc.encode(&platform_api::Frame::bgra(1920, 1080, &src, 1920 * 4))
+                    .expect("encode"),
+            );
+        }
+        let mut dec =
+            vaapi::VaapiDecoder::new(&dec_probe, Codec::H264, 1920, 1080).expect("decoder");
+        let mut ms = Vec::with_capacity(units.len());
+        for (i, u) in units.iter().enumerate() {
+            let start = std::time::Instant::now();
+            let frame = dec.decode(&u.data, u.keyframe, 0).expect("decode");
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            assert!(frame.is_some(), "AU {i} gave no picture");
+            if i > 0 {
+                ms.push(elapsed);
             }
         }
+        ms.sort_by(f64::total_cmp);
+        let mean = ms.iter().sum::<f64>() / ms.len() as f64;
+        let p95 = ms[ms.len() * 95 / 100];
+        eprintln!(
+            "VA-API 1080p decode+read-back over {} frames: mean {mean:.2} ms, p95 {p95:.2} ms, max {:.2} ms",
+            ms.len(),
+            ms[ms.len() - 1]
+        );
+        assert!(
+            mean <= 4.0,
+            "mean {mean:.2} ms/frame exceeds the 4 ms budget"
+        );
     }
 
     /// Writes the golden streams of the encoders on this machine into

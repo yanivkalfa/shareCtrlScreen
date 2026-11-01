@@ -99,12 +99,19 @@ impl<S: Copy> Stream<S> {
     }
 
     /// Parse an access unit and plan its picture. `Ok(None)`: nothing to
-    /// decode — parameter sets only, or a non-IDR picture before the first
-    /// IDR (its references were never received).
+    /// decode — parameter sets only, or a non-IDR picture while no coded
+    /// video sequence is running (before the first IDR, or after the stream
+    /// broke one): its references were never received, and the caller's
+    /// keyframe watchdog counts exactly these `Ok(None)`s.
     pub(crate) fn begin<'a>(&mut self, au: &'a [u8]) -> Result<Option<Picture<'a>>, Bad> {
         let mut slices: Vec<Parsed<'a>> = Vec::new();
         for nal in annexb::nal_units(au) {
             match nal[0] & 0x1f {
+                // WHY before any lookup: without a running sequence a delta
+                // cannot be decoded whatever it names — its PPS/SPS may well
+                // be unknown too (they came with the lost IDR), and that must
+                // not turn into an error the watchdog does not count.
+                1 if self.active.is_none() => {}
                 7 => {
                     let sps = Sps::parse(&unescape(&nal[1..]))?;
                     let id = sps.id;
@@ -182,11 +189,16 @@ impl<S: Copy> Stream<S> {
             match &self.active {
                 None => return Ok(None),
                 // An SPS may only change at an IDR (§7.4.1.2.1); an equal
-                // re-send is fine.
+                // re-send is fine. A different one breaks the sequence: drop
+                // it and wait for the next IDR (Ok(None) until then, so the
+                // viewer asks for one) rather than fail every frame.
                 Some(active) if **active != *sps => {
-                    return Err(Bad::Malformed(
-                        "the SPS changed without an IDR picture".into(),
-                    ))
+                    tracing::warn!(
+                        "H.264: the SPS changed without an IDR picture — waiting for the next IDR"
+                    );
+                    self.active = None;
+                    self.dpb.flush();
+                    return Ok(None);
                 }
                 Some(_) => {}
             }
@@ -390,14 +402,38 @@ pub(crate) mod tests {
     #[test]
     fn nothing_before_the_first_idr() {
         let mut s: Stream<u32> = Stream::default();
-        // Parameter sets arrive with the IDR only; a P frame first has none.
-        assert!(s.begin(&p(3, 2)).is_err());
-        // With parameter sets known but no IDR yet: Ok(None).
+        // Parameter sets arrive with the IDR only: a delta first names a PPS
+        // that was never received, and still yields Ok(None) — the first IDR
+        // was lost and the viewer's watchdog must see "no picture yet".
+        for n in 1..8 {
+            assert!(s.begin(&p(n, 2)).expect("delta first").is_none());
+        }
+        // The IDR then starts the sequence normally.
+        assert_eq!(step(&mut s, &idr(0), 0), Some((true, vec![])));
+        assert_eq!(step(&mut s, &p(1, 2), 1), Some((true, vec![Some(0)])));
+        // With parameter sets known but no IDR yet: Ok(None) as well.
         let mut s: Stream<u32> = Stream::default();
         let h = SeqHeader::new(Profile::Main, 320, 240, 30, 1);
         let sets = [h.sps_nal(), h.pps_nal()].concat();
         assert!(s.begin(&sets).expect("sets").is_none());
         assert!(s.begin(&p(3, 2)).expect("plan").is_none());
+    }
+
+    #[test]
+    fn an_sps_change_without_an_idr_waits_for_the_next_idr() {
+        let mut s: Stream<u32> = Stream::default();
+        step(&mut s, &idr(0), 0);
+        step(&mut s, &p(1, 2), 1);
+        // A different SPS (another size) re-sent in front of a delta.
+        let other = SeqHeader::new(Profile::Main, 640, 480, 30, 1);
+        let mut broken = [other.sps_nal(), other.pps_nal()].concat();
+        broken.extend(p(2, 2));
+        assert!(s.begin(&broken).expect("SPS change").is_none());
+        // Every delta after it: no picture, never an error.
+        assert!(s.begin(&p(3, 2)).expect("delta").is_none());
+        // The next IDR (with the original sets) recovers.
+        assert_eq!(step(&mut s, &idr(1), 5), Some((true, vec![])));
+        assert_eq!(step(&mut s, &p(1, 2), 6), Some((true, vec![Some(5)])));
     }
 
     #[test]

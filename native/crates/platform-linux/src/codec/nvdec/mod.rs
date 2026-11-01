@@ -23,6 +23,13 @@
 //! copied into host memory with `cuMemcpy2D` (v1; the zero-copy seam is the
 //! presenter importing the CUDA allocation instead).
 //!
+//! Loss behaves differently from the VA-API decoder, by design of the
+//! driver's parser: after a lost reference NVDEC keeps decoding and conceals
+//! (the picture shows smeared blocks until the next IDR), where VA-API stops
+//! submitting, returns `Ok(None)` and so makes the viewer's watchdog ask for
+//! a keyframe sooner. Both recover at the next IDR; the parser offers no
+//! hook to tell which pictures predict from a lost one.
+//!
 //! ## References
 //! * NVIDIA Video Codec SDK 12.0 — *NVDEC Video Decoder API Programming
 //!   Guide* (§"Video decoder capabilities", §"Creating a decoder", §"Decoding

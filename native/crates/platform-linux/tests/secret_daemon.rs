@@ -63,7 +63,24 @@ fn password_round_trips_through_the_keyring() {
         item.get_secret().expect("secret readable"),
         PASSWORD.as_bytes()
     );
-    item.delete().expect("remove the item this test created");
+
+    // Forget deletes the item from the daemon, and the id then reads as nothing.
+    store.forget(&sealed);
+    let remaining = collection
+        .search_items(HashMap::from([
+            ("service", SERVICE),
+            ("username", sealed.as_str()),
+        ]))
+        .expect("search by attributes");
+    assert!(
+        remaining.is_empty(),
+        "forget removed the item from the daemon"
+    );
+    assert_eq!(store.open(&sealed), None, "a forgotten id reads as nothing");
+
+    // Forgetting again, or an id the keyring never had, is not an error.
+    store.forget(&sealed);
+    store.forget("ffffffffffffffffffffffffffffffff");
 
     // An id the keyring does not know is a plain miss.
     assert_eq!(store.open("ffffffffffffffffffffffffffffffff"), None);

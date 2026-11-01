@@ -21,6 +21,14 @@
 //! The item attributes are fixed by the store to `service` and `username`, so the
 //! opaque id is stored as `username`.
 //!
+//! ## Deleting items
+//! `forget` deletes the keyring item behind an id, and the engine calls it once
+//! the config entry is gone. An id that is malformed or whose item is already
+//! gone is not an error. A failure is logged and never returned, so the engine
+//! cannot be left unsure whether the entry was removed. Keyring items are not
+//! otherwise cleaned up: without `forget` a removed saved login would stay in the
+//! user's keyring with its password.
+//!
 //! ## References
 //! * freedesktop Secret Service API draft: <https://specifications.freedesktop.org/secret-service/latest/>
 //!   (item attributes, collections, locking and prompts, error names).
@@ -76,6 +84,20 @@ impl SecretStore for SecretServiceStore {
                 report(&e, "read");
                 None
             }
+        }
+    }
+
+    fn forget(&self, sealed: &str) {
+        // Same shape check as `open`: a malformed value is not one of our items.
+        if !is_id(sealed) {
+            return;
+        }
+        let Some(entry) = entry(sealed) else {
+            return;
+        };
+        match entry.delete_credential() {
+            Ok(()) | Err(Error::NoEntry) => {}
+            Err(e) => report(&e, "delete"),
         }
     }
 }
@@ -155,5 +177,14 @@ mod tests {
             "32 bytes of multi-byte UTF-8"
         );
         assert!(!is_id("00000000-0000-4000-8000-000000000000"), "hyphenated");
+    }
+
+    #[test]
+    fn forget_ignores_garbage_without_touching_the_keyring() {
+        // Returns without a keyring call: the same shape check as `open` guards it.
+        let store = SecretServiceStore;
+        store.forget("");
+        store.forget("not-an-id");
+        store.forget(&"A".repeat(ID_LEN));
     }
 }

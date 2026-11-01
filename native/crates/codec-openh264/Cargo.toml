@@ -41,3 +41,5 @@ ureq = { version = "3.5", default-features = false, features = ["native-tls-no-d
 
 [dev-dependencies]
 platform-api = { path = "../platform-api", features = ["mock"] }
+# The golden streams, decoder matrix and encoder shape check (task I5).
+codec-goldens = { path = "../codec-goldens" }

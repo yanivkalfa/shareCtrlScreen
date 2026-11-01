@@ -35,10 +35,17 @@ impl SoftwareDecoder {
         let api = openh264
             .load()
             .map_err(|e| CodecError::Backend(e.to_string()))?;
-        // NoFlush: the encoder never reorders, so every access unit yields its
-        // picture from `DecodeFrameNoDelay` directly; flushing would only add a
-        // call per frame (and the wrapper documents flush errors).
-        let config = DecoderConfig::new().flush_after_decode(Flush::NoFlush);
+        // Flush after every access unit that returned no picture. OpenH264
+        // keeps Main/High-profile pictures in its reorder buffer even from
+        // `DecodeFrameNoDelay` (only Constrained Baseline, which cannot
+        // reorder, comes out directly), so without the flush a Main stream —
+        // what NVENC, Media Foundation and VideoToolbox hosts send — gave no
+        // picture at all (found by the I5 golden matrix). The flush is
+        // exact here because no encoder in the project reorders (the
+        // `platform_api::VideoDecoder` contract): the one buffered picture
+        // is the access unit just decoded. The wrapper flushes only when a
+        // picture is buffered (`GetOption(DECODER_OPTION_NUM_OF_FRAMES_REMAINING_IN_BUFFER)`).
+        let config = DecoderConfig::new().flush_after_decode(Flush::Flush);
         let inner = Decoder::with_api_config(api, config)
             .map_err(|e| CodecError::Backend(format!("OpenH264 decoder: {e}")))?;
         tracing::info!("openh264: decoder ready");

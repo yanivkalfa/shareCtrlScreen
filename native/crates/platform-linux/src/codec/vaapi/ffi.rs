@@ -516,11 +516,6 @@ pub(crate) struct Va {
     ) -> VAStatus,
 }
 
-// SAFETY: immutable function pointers + library handles. libva itself is
-// thread-safe per display; each encoder uses its display from one thread.
-unsafe impl Send for Va {}
-unsafe impl Sync for Va {}
-
 impl Va {
     /// The process-wide binding, loaded on first use.
     pub(crate) fn shared() -> Result<Arc<Self>, String> {

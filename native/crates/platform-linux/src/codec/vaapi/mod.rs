@@ -67,7 +67,7 @@ use platform_api::{
 use self::ffi::*;
 use super::h264::{Profile, SeqHeader, LOG2_MAX_FRAME_NUM};
 use super::zeroed::Zeroed;
-use super::{annexb, vbv_bits, MAX_QP};
+use super::{annexb, validate, vbv_bits, MAX_QP};
 
 /// Decision #7: libva older than 2.20 (VA-API 1.20) keeps hardware encode off
 /// — Ubuntu 22.04's 2.14 included — and the software codec is used instead.
@@ -611,7 +611,16 @@ fn write_image(d: &Display, image: &VAImage, planes: &[PlaneCopy<'_>]) -> Result
     let mut result = Ok(());
     for (i, p) in planes.iter().enumerate() {
         let (offset, pitch) = (image.offsets[i] as usize, image.pitches[i] as usize);
-        let row = p.row_bytes.min(pitch);
+        let row = p.row_bytes;
+        // A row wider than the image pitch (or than the source stride) is a
+        // geometry mismatch: refuse it rather than copy a cut-down picture.
+        if row > pitch || row > p.stride {
+            result = Err(format!(
+                "plane {i}: {row}-byte rows do not fit (image pitch {pitch}, source stride {})",
+                p.stride
+            ));
+            break;
+        }
         let fits_dst =
             p.rows == 0 || offset + pitch * (p.rows - 1) + row <= image.data_size as usize;
         let fits_src = p.rows == 0 || p.stride * (p.rows - 1) + row <= p.data.len();
@@ -764,8 +773,13 @@ pub(crate) struct VaapiEncoder {
     _enc_config: Config,
     display: Rc<Display>,
     header: SeqHeader,
-    /// SPS + PPS, Annex-B: sent as packed headers and used to repair keyframes.
+    /// Annex-B parameter sets used to repair a keyframe that lacks them.
+    /// Ours (SPS + PPS) when the driver takes both as packed headers; else
+    /// the driver writes some or all itself, and ours could duplicate or
+    /// contradict them, so the ones from its first complete IDR replace ours
+    /// (`capture_headers`) — ours stay only as the fallback until then.
     headers: Vec<u8>,
+    capture_headers: bool,
     sps: Vec<u8>,
     pps: Vec<u8>,
     packed_headers: u32,
@@ -786,6 +800,7 @@ impl VaapiEncoder {
         if cfg.codec != Codec::H264 {
             return Err(CodecError::NoEncoder(cfg.codec));
         }
+        validate(&cfg)?;
         Self::create(probe, cfg).map_err(|e| CodecError::Backend(format!("VA-API: {e}")))
     }
 
@@ -798,7 +813,6 @@ impl VaapiEncoder {
             cfg.height,
             cfg.fps_num,
             cfg.fps_den,
-            cfg.bitrate_bps,
         );
         let mut attrs = vec![
             VAConfigAttrib {
@@ -876,6 +890,8 @@ impl VaapiEncoder {
             display,
             header,
             headers: [sps.as_slice(), pps.as_slice()].concat(),
+            capture_headers: probe.packed_headers
+                != (VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_PICTURE),
             sps,
             pps,
             packed_headers: probe.packed_headers,
@@ -956,6 +972,19 @@ impl VaapiEncoder {
                 ]
             }
         };
+        // `Frame` only debug-asserts its plane sizes; refuse a short plane
+        // here as the caller's error, before it can look like a driver one.
+        for (i, p) in planes.iter().enumerate() {
+            let fits = p.stride >= p.row_bytes
+                && (p.rows == 0 || p.stride * (p.rows - 1) + p.row_bytes <= p.data.len());
+            if !fits {
+                return Err(CodecError::Unsupported(format!(
+                    "VA-API: plane {i} of a {w}x{h} frame is {} bytes at stride {} — too small",
+                    p.data.len(),
+                    p.stride
+                )));
+            }
+        }
         if format == PixelFormat::Nv12 && (w, h) == (self.cfg.width, self.cfg.height) {
             let target = self.input.ids[0];
             return upload(
@@ -1273,6 +1302,18 @@ impl VaapiEncoder {
         if keyframe != idr && !data.is_empty() {
             tracing::warn!("VA-API: asked for idr={idr}, the driver produced idr={keyframe}");
         }
+        if keyframe && self.capture_headers {
+            let found = annexb::parameter_sets(Codec::H264, &data);
+            if annexb::has_parameter_sets(Codec::H264, &found) {
+                tracing::debug!("VA-API: using the driver's own SPS/PPS for keyframe repair");
+                self.headers = found;
+                self.capture_headers = false;
+            } else {
+                tracing::warn!(
+                    "VA-API: the driver's IDR carries no complete SPS/PPS — adding ours"
+                );
+            }
+        }
         let data = if keyframe {
             annexb::with_parameter_sets(Codec::H264, data, &self.headers)
         } else {
@@ -1299,7 +1340,7 @@ impl VideoEncoder for VaapiEncoder {
     /// new target and the driver re-plans from there (no IDR, no reset).
     fn set_bitrate(&mut self, bps: u32) -> Result<(), CodecError> {
         if bps == 0 {
-            return Err(CodecError::Backend("VA-API: bitrate 0".into()));
+            return Err(CodecError::Unsupported("VA-API: bitrate 0".into()));
         }
         self.cfg.bitrate_bps = bps;
         Ok(())

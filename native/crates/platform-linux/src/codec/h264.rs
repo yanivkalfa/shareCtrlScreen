@@ -14,8 +14,10 @@
 //! presenter's NV12 shader.
 //!
 //! ## References
-//! * ITU-T H.264 (08/2021) §7.3.2.1.1 (SPS), §7.3.2.2 (PPS), Annex A Table A-1
-//!   (level limits), Annex E.1.1 (VUI), §7.4.1 (emulation prevention).
+//! * ITU-T H.264 (08/2021) §7.3.2.1.1 (SPS), §7.3.2.2 (PPS), Annex E.1.1
+//!   (VUI), §7.4.1 (emulation prevention). Levels: `super::level`.
+
+use super::level::h264_level;
 
 /// H.264 profile this encoder can produce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,27 +68,25 @@ pub(crate) struct SeqHeader {
 }
 
 impl SeqHeader {
-    /// `level_idc` is chosen from the size, rate and initial bitrate.
+    /// `level_idc` comes from the size and rate alone (see `level`: the live
+    /// bitrate moves without a new SPS).
     pub(crate) fn new(
         profile: Profile,
         width: u32,
         height: u32,
         fps_num: u32,
         fps_den: u32,
-        bitrate_bps: u32,
     ) -> Self {
         let fps_num = fps_num.max(1);
         let fps_den = fps_den.max(1);
-        let mut h = Self {
+        Self {
             profile,
-            level_idc: 0,
+            level_idc: h264_level(width, height, fps_num, fps_den),
             width,
             height,
             fps_num,
             fps_den,
-        };
-        h.level_idc = level_for(h.width_mbs(), h.height_mbs(), fps_num, fps_den, bitrate_bps);
-        h
+        }
     }
 
     pub(crate) fn width_mbs(&self) -> u32 {
@@ -206,56 +206,6 @@ impl SeqHeader {
         w.flag(false); // redundant_pic_cnt_present_flag
         nal(3, 8, &w.finish())
     }
-}
-
-/// One row of H.264 Table A-1: `(level_idc, MaxMBPS, MaxFS, MaxBR kbit/s)`.
-/// MaxBR is the VCL figure for Baseline/Main (cpbBrVclFactor 1000).
-const LEVELS: &[(u8, u64, u64, u64)] = &[
-    (10, 1_485, 99, 64),
-    (11, 3_000, 396, 192),
-    (12, 6_000, 396, 384),
-    (13, 11_880, 396, 768),
-    (20, 11_880, 396, 2_000),
-    (21, 19_800, 792, 4_000),
-    (22, 20_250, 1_620, 4_000),
-    (30, 40_500, 1_620, 10_000),
-    (31, 108_000, 3_600, 14_000),
-    (32, 216_000, 5_120, 20_000),
-    (40, 245_760, 8_192, 20_000),
-    (41, 245_760, 8_192, 50_000),
-    (42, 522_240, 8_704, 50_000),
-    (50, 589_824, 22_080, 135_000),
-    (51, 983_040, 36_864, 240_000),
-    (52, 2_073_600, 36_864, 240_000),
-    (60, 4_177_920, 139_264, 240_000),
-    (61, 8_355_840, 139_264, 480_000),
-    (62, 16_711_680, 139_264, 800_000),
-];
-
-/// The lowest level whose limits hold this stream: frame size (MaxFS, and each
-/// dimension ≤ √(8·MaxFS), A.3.1 f/g), macroblock rate (MaxMBPS) and bitrate.
-/// Beyond every limit → the highest level (decoders that check at all refuse
-/// such sizes anyway; the encoder's own size cap catches it first).
-pub(crate) fn level_for(
-    width_mbs: u32,
-    height_mbs: u32,
-    fps_num: u32,
-    fps_den: u32,
-    bitrate_bps: u32,
-) -> u8 {
-    let fs = width_mbs as u64 * height_mbs as u64;
-    let mbps = (fs * fps_num as u64).div_ceil(fps_den.max(1) as u64);
-    let longest = width_mbs.max(height_mbs) as u64;
-    LEVELS
-        .iter()
-        .find(|&&(_, max_mbps, max_fs, max_br)| {
-            fs <= max_fs
-                && longest * longest <= 8 * max_fs
-                && mbps <= max_mbps
-                && bitrate_bps as u64 <= max_br * 1000
-        })
-        .or(LEVELS.last())
-        .map_or(62, |l| l.0)
 }
 
 /// Big-endian RBSP bit writer.
@@ -432,26 +382,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn level_selection() {
-        // 1920x1080 = 120x68 MBs.
-        assert_eq!(level_for(120, 68, 30, 1, 8_000_000), 40);
-        assert_eq!(level_for(120, 68, 60, 1, 8_000_000), 42);
-        // Bitrate above level 4's 20 Mbit/s pushes to 4.1.
-        assert_eq!(level_for(120, 68, 30, 1, 30_000_000), 41);
-        // 3840x2160 = 240x135 MBs.
-        assert_eq!(level_for(240, 135, 30, 1, 20_000_000), 51);
-        assert_eq!(level_for(240, 135, 60, 1, 20_000_000), 52);
-        // 1280x720 @ 30.
-        assert_eq!(level_for(80, 45, 30, 1, 4_000_000), 31);
-        // 7680x4320 @ 60: needs level 6.1.
-        assert_eq!(level_for(480, 270, 60, 1, 40_000_000), 61);
-        // A 32768-wide strip fits no level's √(8·MaxFS) → highest.
-        assert_eq!(level_for(2048, 1, 1, 1, 1), 62);
-    }
-
-    #[test]
     fn sps_round_trips_for_1080p() {
-        let h = SeqHeader::new(Profile::Main, 1920, 1080, 60, 1, 8_000_000);
+        let h = SeqHeader::new(Profile::Main, 1920, 1080, 60, 1);
         assert_eq!(h.level_idc, 42);
         assert_eq!((h.width_mbs(), h.height_mbs()), (120, 68));
         assert_eq!((h.crop_right(), h.crop_bottom()), (0, 4));
@@ -499,7 +431,7 @@ pub(crate) mod tests {
     /// `sps_round_trips_for_1080p` asserts (and no errors).
     #[test]
     fn main_1080p60_headers_are_byte_exact() {
-        let h = SeqHeader::new(Profile::Main, 1920, 1080, 60, 1, 8_000_000);
+        let h = SeqHeader::new(Profile::Main, 1920, 1080, 60, 1);
         assert_eq!(
             h.sps_nal(),
             [
@@ -516,10 +448,11 @@ pub(crate) mod tests {
 
     #[test]
     fn uncropped_baseline_sps_and_pps() {
-        let h = SeqHeader::new(Profile::ConstrainedBaseline, 1280, 720, 30, 1, 4_000_000);
+        let h = SeqHeader::new(Profile::ConstrainedBaseline, 1280, 720, 30, 1);
         assert!(!h.cropped());
         let (_, rbsp) = rbsp_of(&h.sps_nal());
-        assert_eq!(&rbsp[..3], &[66, 0b1100_0000, 31]);
+        // Level 4.1: the lowest whose MaxBR holds the 50 Mbit/s ceiling.
+        assert_eq!(&rbsp[..3], &[66, 0b1100_0000, 41]);
 
         let (header, rbsp) = rbsp_of(&h.pps_nal());
         assert_eq!(header, 0x68);
@@ -534,7 +467,7 @@ pub(crate) mod tests {
         assert_eq!([r.bit(), r.bit(), r.bit()], [1, 0, 0]);
         assert_eq!(r.bit(), 1); // stop bit
 
-        let main = SeqHeader::new(Profile::Main, 1280, 720, 30, 1, 4_000_000);
+        let main = SeqHeader::new(Profile::Main, 1280, 720, 30, 1);
         let (_, rbsp) = rbsp_of(&main.pps_nal());
         // ue(0)=1, ue(0)=1, then entropy_coding_mode_flag=1.
         assert_eq!(rbsp[0] >> 5, 0b111);

@@ -75,6 +75,20 @@ pub(crate) fn has_parameter_sets(codec: Codec, au: &[u8]) -> bool {
     parameter_set_types(codec).iter().all(|t| types.contains(t))
 }
 
+/// The parameter-set NALs of `au`, in stream order, re-framed with 4-byte
+/// start codes — what a later keyframe needs if it arrives without them.
+/// (VA-API only: NVENC hands its headers over through an API call.)
+#[cfg(feature = "vaapi")]
+pub(crate) fn parameter_sets(codec: Codec, au: &[u8]) -> Vec<u8> {
+    let types = parameter_set_types(codec);
+    let mut out = Vec::new();
+    for nal in nal_units(au).filter(|n| nal_type(codec, n).is_some_and(|t| types.contains(&t))) {
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(nal);
+    }
+    out
+}
+
 /// True when `au` holds an instantaneous-decoding-refresh picture.
 pub(crate) fn is_idr(codec: Codec, au: &[u8]) -> bool {
     nal_units(au).any(|n| match (codec, nal_type(codec, n)) {
@@ -163,6 +177,15 @@ mod tests {
             with_parameter_sets(Codec::H264, IDR.to_vec(), &[]),
             IDR.to_vec()
         );
+    }
+
+    #[cfg(feature = "vaapi")]
+    #[test]
+    fn extracts_parameter_sets_with_four_byte_start_codes() {
+        let three_byte_sps = &[0, 0, 1, 0x67, 0x4d, 0x40, 0x28][..];
+        let au = cat(&[three_byte_sps, PPS, IDR]);
+        assert_eq!(parameter_sets(Codec::H264, &au), cat(&[SPS, PPS]));
+        assert!(parameter_sets(Codec::H264, P).is_empty());
     }
 
     #[test]

@@ -51,9 +51,10 @@ use platform_api::{
 
 use self::cuda::{Context, Cuda, DeviceFrame};
 use self::ffi::*;
+use super::level::{h264_level, hevc_level};
 use super::scale::{self, Plane};
 use super::zeroed::Zeroed;
-use super::{annexb, vbv_bits, MAX_QP};
+use super::{annexb, validate, vbv_bits, MAX_QP};
 
 /// Oldest NVENC API the binding is written against (`ffi` struct versions).
 const MIN_API: (u32, u32) = (API_MAJOR, API_MINOR);
@@ -128,11 +129,6 @@ struct Api {
     fns: Fns,
     max_version: (u32, u32),
 }
-
-// SAFETY: immutable function pointers + the library handle; NVENC sessions
-// are independent objects, each used from one thread at a time.
-unsafe impl Send for Api {}
-unsafe impl Sync for Api {}
 
 impl Api {
     fn shared() -> Result<Arc<Self>, String> {
@@ -397,6 +393,10 @@ fn apply_recipe(config: &mut NvEncConfig, cfg: &EncoderConfig) {
             // SAFETY: the preset was fetched for the HEVC GUID, so `hevc` is the
             // initialised member of the union.
             let hevc = unsafe { &mut config.encode_codec_config.hevc };
+            // Explicit, not autoselect: NVENC would pick it from the starting
+            // bitrate, which BWE then raises without a new VPS/SPS.
+            hevc.level = hevc_level(cfg.width, cfg.height, cfg.fps_num, cfg.fps_den);
+            hevc.tier = NV_ENC_TIER_HEVC_MAIN;
             hevc.idr_period = NVENC_INFINITE_GOPLENGTH;
             hevc.flags |= HEVC_REPEAT_SPSPPS;
             hevc.flags &= !(HEVC_OUTPUT_AUD
@@ -411,6 +411,8 @@ fn apply_recipe(config: &mut NvEncConfig, cfg: &EncoderConfig) {
             config.profile_guid = NV_ENC_H264_PROFILE_MAIN_GUID;
             // SAFETY: as above, for the H.264 GUID.
             let h264 = unsafe { &mut config.encode_codec_config.h264 };
+            // Explicit for the same reason as HEVC above.
+            h264.level = h264_level(cfg.width, cfg.height, cfg.fps_num, cfg.fps_den) as u32;
             h264.idr_period = NVENC_INFINITE_GOPLENGTH;
             h264.flags |= H264_REPEAT_SPSPPS;
             h264.flags &= !(H264_OUTPUT_AUD
@@ -452,6 +454,7 @@ pub(crate) struct NvencEncoder {
 
 impl NvencEncoder {
     pub(crate) fn new(cfg: EncoderConfig) -> Result<Self, CodecError> {
+        validate(&cfg)?;
         let backend = |e: String| CodecError::Backend(format!("NVENC: {e}"));
         let (codec_guid, _) = codec_guids(cfg.codec)?;
         let api = Api::shared().map_err(backend)?;
@@ -642,6 +645,8 @@ impl NvencEncoder {
             ));
         };
         let backend = |e: String| CodecError::Backend(format!("NVENC: {e}"));
+        // A frame whose planes are smaller than it claims.
+        let malformed = |e: String| CodecError::Unsupported(format!("NVENC: {e}"));
         let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
         let (fw, fh) = (frame.width as usize, frame.height as usize);
         let same = (fw, fh) == (w, h);
@@ -674,7 +679,8 @@ impl NvencEncoder {
                         w,
                         h,
                         w * 4,
-                    );
+                    )
+                    .map_err(malformed)?;
                     (&scaled[..], w * 4)
                 };
                 input
@@ -704,7 +710,8 @@ impl NvencEncoder {
                         w,
                         h,
                         w,
-                    );
+                    )
+                    .map_err(malformed)?;
                     scale::bilinear(
                         Plane {
                             data: uv.data,
@@ -717,7 +724,8 @@ impl NvencEncoder {
                         cw,
                         ch,
                         cw * 2,
-                    );
+                    )
+                    .map_err(malformed)?;
                     (&*y, w, &*c, cw * 2)
                 };
                 input
@@ -762,7 +770,18 @@ impl NvencEncoder {
             return Ok(None);
         }
         self.session.check(status, "nvEncEncodePicture")?;
+        let read = self.read_bitstream();
+        if read.is_err() {
+            // The encoder already holds this picture as its reference, but the
+            // viewer will never get it: every following P frame would predict
+            // from a picture the decoder does not have.
+            self.force_idr = true;
+        }
+        read.map(Some)
+    }
 
+    /// Lock, copy out and unlock the bitstream of the picture just encoded.
+    fn read_bitstream(&mut self) -> Result<(Vec<u8>, u32), String> {
         let mut lock = NvEncLockBitstream::zeroed();
         lock.version = NV_ENC_LOCK_BITSTREAM_VER;
         lock.output_bitstream = self.bitstream;
@@ -789,7 +808,7 @@ impl NvencEncoder {
         let unlocked =
             unsafe { (self.session.fns().unlock_bitstream)(self.session.enc, self.bitstream) };
         self.session.check(unlocked, "nvEncUnlockBitstream")?;
-        Ok(Some((data, picture_type)))
+        Ok((data, picture_type))
     }
 }
 
@@ -828,6 +847,8 @@ impl VideoEncoder for NvencEncoder {
         };
         self.frame_idx = self.frame_idx.wrapping_add(1);
         if data.is_empty() {
+            // Encoded but nothing to send: same reference hazard as above.
+            self.force_idr = true;
             return Ok(Vec::new());
         }
         let keyframe = picture_type == NV_ENC_PIC_TYPE_IDR || annexb::is_idr(self.cfg.codec, &data);
@@ -843,7 +864,10 @@ impl VideoEncoder for NvencEncoder {
     }
 
     fn set_bitrate(&mut self, bps: u32) -> Result<(), CodecError> {
-        if bps == 0 || bps == self.cfg.bitrate_bps {
+        if bps == 0 {
+            return Err(CodecError::Unsupported("NVENC: bitrate 0".into()));
+        }
+        if bps == self.cfg.bitrate_bps {
             return Ok(());
         }
         let mut next = self.cfg;
@@ -939,6 +963,8 @@ mod tests {
         // SAFETY: H.264 member was the one written.
         let h = unsafe { c.encode_codec_config.h264 };
         assert_eq!(h.idr_period, NVENC_INFINITE_GOPLENGTH);
+        // 1080p30 → 4.1, whatever the 6 Mbit/s starting rate would allow.
+        assert_eq!(h.level, 41);
         assert_eq!(h.flags, H264_REPEAT_SPSPPS);
         assert_eq!((h.slice_mode, h.slice_mode_data), (3, 1));
         assert_eq!(h.entropy_coding_mode, NV_ENC_H264_ENTROPY_CODING_MODE_CABAC);
@@ -959,6 +985,7 @@ mod tests {
         // SAFETY: HEVC member was the one written.
         let h = unsafe { c.encode_codec_config.hevc };
         assert_eq!(h.idr_period, NVENC_INFINITE_GOPLENGTH);
+        assert_eq!((h.level, h.tier), (156, NV_ENC_TIER_HEVC_MAIN));
         assert_eq!(h.flags, HEVC_REPEAT_SPSPPS);
         assert_eq!((h.slice_mode, h.slice_mode_data), (3, 1));
         assert_eq!(h.vui.colour_primaries, VUI_BT709);
@@ -1104,6 +1131,31 @@ mod tests {
             (77, 640, 360),
             "Main profile, cropped to 640x360"
         );
+        // Level from size + rate at the 50 Mbit/s ceiling, not from 2 Mbit/s.
+        assert_eq!(sps[7], 41, "level_idc");
+
+        // Malformed input is the caller's error, never an out-of-bounds read.
+        assert!(matches!(
+            enc.set_bitrate(0),
+            Err(CodecError::Unsupported(_))
+        ));
+        let short = vec![0u8; 1280 * 4 * 719];
+        let short_frame = Frame {
+            width: 1280,
+            height: 720,
+            data: FrameData::Cpu {
+                format: PixelFormat::Bgra8,
+                plane0: platform_api::CpuPlane {
+                    data: &short,
+                    stride: 1280 * 4,
+                },
+                plane1: None,
+            },
+        };
+        assert!(matches!(
+            enc.encode(&short_frame),
+            Err(CodecError::Unsupported(_))
+        ));
 
         // A frame larger than the encode size is resampled, not rejected.
         let big = pattern(1280, 720, 3);
@@ -1141,14 +1193,20 @@ mod tests {
                 ..cfg
             })
             .expect("HEVC encoder");
-            for t in 0..4 {
+            for t in 0..6 {
+                if t == 3 {
+                    enc.force_keyframe();
+                }
+                if t == 4 {
+                    enc.set_bitrate(1_000_000).expect("HEVC live bitrate");
+                }
                 let px = pattern(640, 360, t);
                 let got = enc
                     .encode(&Frame::bgra(640, 360, &px, 640 * 4))
                     .expect("encode");
                 assert_eq!(got.len(), 1);
-                assert_eq!(got[0].keyframe, t == 0);
-                if t == 0 {
+                assert_eq!(got[0].keyframe, t == 0 || t == 3, "HEVC frame {t}");
+                if got[0].keyframe {
                     assert!(annexb::has_parameter_sets(Codec::Hevc, &got[0].data));
                     assert!(annexb::is_idr(Codec::Hevc, &got[0].data));
                 }

@@ -109,6 +109,9 @@ pub(crate) const NV_ENC_INPUT_IMAGE: u32 = 0x0;
 pub(crate) const NV_ENC_DEVICE_TYPE_CUDA: u32 = 0x1;
 // NV_ENC_H264_ENTROPY_CODING_MODE
 pub(crate) const NV_ENC_H264_ENTROPY_CODING_MODE_CABAC: u32 = 0x1;
+// NV_ENC_LEVEL (tier member). H.264/HEVC level values equal the bitstream's
+// level_idc / general_level_idc, so `codec::level` feeds them directly.
+pub(crate) const NV_ENC_TIER_HEVC_MAIN: u32 = 0;
 // NV_ENC_CAPS
 pub(crate) const NV_ENC_CAPS_WIDTH_MAX: u32 = 16;
 pub(crate) const NV_ENC_CAPS_HEIGHT_MAX: u32 = 17;

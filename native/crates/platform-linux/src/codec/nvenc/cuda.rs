@@ -71,11 +71,6 @@ pub(crate) struct Cuda {
     get_error_name: unsafe extern "C" fn(CuResult, *mut *const c_char) -> CuResult,
 }
 
-// SAFETY: the CUDA driver API is thread-safe; the table holds only immutable
-// function pointers and the library handle.
-unsafe impl Send for Cuda {}
-unsafe impl Sync for Cuda {}
-
 impl Cuda {
     /// `dlopen("libcuda.so.1")` + `cuInit`. Fails with a readable reason when the
     /// NVIDIA driver (or a usable GPU) is absent.

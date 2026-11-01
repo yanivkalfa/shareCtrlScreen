@@ -25,6 +25,8 @@ mod annexb;
 #[cfg(any(feature = "vaapi", all(test, feature = "nvenc")))]
 #[cfg_attr(not(feature = "vaapi"), allow(dead_code))]
 mod h264;
+#[cfg(any(feature = "vaapi", feature = "nvenc"))]
+mod level;
 #[cfg(feature = "nvenc")]
 mod nvenc;
 #[cfg(feature = "nvenc")]
@@ -46,6 +48,40 @@ use platform_api::{Codec, CodecError, CodecFactory, EncoderConfig, VideoDecoder,
 /// engine's source pacing drops frames rather than detail.
 #[cfg(any(feature = "vaapi", feature = "nvenc"))]
 pub(crate) const MAX_QP: u32 = 32;
+
+/// Refuse configurations no backend can honour, before any GPU object is made
+/// (a zero rate would divide by zero in the VBV maths; zero sizes make
+/// drivers fail in ways that do not name the cause).
+#[cfg(any(feature = "vaapi", feature = "nvenc"))]
+pub(crate) fn validate(cfg: &EncoderConfig) -> Result<(), CodecError> {
+    let problem = if cfg.width < 2 || cfg.height < 2 {
+        "a width or height below 2"
+    } else if cfg.fps_num == 0 || cfg.fps_den == 0 {
+        "a zero frame rate numerator or denominator"
+    } else if cfg.bitrate_bps == 0 {
+        "a zero bitrate"
+    } else {
+        return Ok(());
+    };
+    Err(CodecError::Unsupported(format!(
+        "encoder config has {problem}: {}x{} @{}/{} fps, {} bps",
+        cfg.width, cfg.height, cfg.fps_num, cfg.fps_den, cfg.bitrate_bps
+    )))
+}
+
+/// 4:2:0 chroma is subsampled 2×2, so the hardware encoders (and the SPS
+/// cropping maths) want even sizes. The engine already asks for even sizes;
+/// anything odd is rounded down by one pixel here rather than refused.
+/// Sizes below 2 are left for [`validate`] to refuse.
+fn even_size(mut cfg: EncoderConfig) -> EncoderConfig {
+    if cfg.width >= 2 {
+        cfg.width &= !1;
+    }
+    if cfg.height >= 2 {
+        cfg.height &= !1;
+    }
+    cfg
+}
 
 /// One frame's worth of the CBR budget: the single-frame VBV/HRD buffer the
 /// NVENC low-latency guidance recommends, used by both backends so a keyframe
@@ -216,11 +252,14 @@ impl CodecFactory for LinuxCodecs {
 
     /// `device` is unused: v1 takes CPU frames on every backend. A capture
     /// backend that hands out DMA-BUFs (task L3b) passes its DRM device here.
+    /// Odd sizes are rounded down to even (see `even_size`); the encoder then
+    /// scales the frame to that size like any other.
     fn new_encoder(
         &self,
         _device: Option<&dyn Any>,
         cfg: EncoderConfig,
     ) -> Result<Box<dyn VideoEncoder>, CodecError> {
+        let cfg = even_size(cfg);
         let caps = self.caps();
         let mut last_err = None;
         for backend in caps.found.iter().filter(|b| b.encodes(cfg.codec)) {
@@ -264,6 +303,45 @@ mod tests {
         assert_eq!(vbv_bits(6_000_000, 30_000, 1001), 200_200);
         assert_eq!(vbv_bits(10, 60, 1), 1);
         assert_eq!(vbv_bits(1_000_000, 0, 0), 1_000_000);
+    }
+
+    #[cfg(any(feature = "vaapi", feature = "nvenc"))]
+    #[test]
+    fn invalid_configs_are_refused() {
+        let ok = EncoderConfig::default();
+        assert!(validate(&ok).is_ok());
+        for bad in [
+            EncoderConfig { width: 0, ..ok },
+            EncoderConfig { height: 1, ..ok },
+            EncoderConfig { fps_num: 0, ..ok },
+            EncoderConfig { fps_den: 0, ..ok },
+            EncoderConfig {
+                bitrate_bps: 0,
+                ..ok
+            },
+        ] {
+            assert!(
+                matches!(validate(&bad), Err(CodecError::Unsupported(_))),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn odd_sizes_round_down_to_even() {
+        let cfg = even_size(EncoderConfig {
+            width: 1921,
+            height: 1081,
+            ..EncoderConfig::default()
+        });
+        assert_eq!((cfg.width, cfg.height), (1920, 1080));
+        // Too small to round: left for `validate` to refuse.
+        let cfg = even_size(EncoderConfig {
+            width: 1,
+            height: 0,
+            ..EncoderConfig::default()
+        });
+        assert_eq!((cfg.width, cfg.height), (1, 0));
     }
 
     #[test]

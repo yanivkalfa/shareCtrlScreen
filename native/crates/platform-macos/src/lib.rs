@@ -2,13 +2,24 @@
 //! VideoToolbox, an NSView + Metal surface, CGEvent injection and event taps,
 //! NSPasteboard, Keychain, LaunchAgent).
 //!
-//! Status: scaffold. Paths are real; every other capability fails safely with a
-//! clear message until its task lands (see `plans/05-TASKS.md`, lane M).
+//! Status: screen capture and display enumeration (M1), clipboard (M7),
+//! Keychain (M8), autostart (M9), permissions (M11) and paths are real; every other
+//! capability fails safely with a clear message until its task lands (see
+//! `plans/05-TASKS.md`, lane M).
 
 #![cfg(target_os = "macos")]
 
 mod autostart;
+mod capture;
+mod convert;
+mod cursor;
+mod display_id;
+mod displays;
+pub mod gpu;
 mod permissions;
+mod slot;
+
+pub use capture::SckCapture;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -73,7 +84,7 @@ impl Platform for MacPlatform {
     }
 
     fn displays(&self) -> Vec<DisplayInfo> {
-        Vec::new()
+        displays::enumerate()
     }
 
     fn permissions(&self) -> PermissionReport {
@@ -86,9 +97,9 @@ impl Platform for MacPlatform {
 
     fn create_capture(
         &self,
-        _display: Option<&str>,
+        display: Option<&str>,
     ) -> Result<Box<dyn ScreenCapture>, CaptureError> {
-        Err(CaptureError::Backend(format!("screen capture {NOT_YET}")))
+        Ok(Box::new(SckCapture::new(display)?))
     }
 
     fn codecs(&self) -> &dyn CodecFactory {

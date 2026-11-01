@@ -483,6 +483,13 @@ fn virtual_keyboard_input_is_not_forwarded() {
     desk.tap(SUPER_L);
     assert!(hook.take(0).is_empty(), "XTEST keys are not forwarded");
     wait_until("grab steps aside", || !desk.keyboard_grabbed());
+    // The tap the grab took is replayed after the ungrab: not lost.
+    let mut seen = Vec::new();
+    wait_until("the first tap reaches the WM", || {
+        seen.extend(wm.pressed());
+        seen.contains(&SUPER_L)
+    });
+    assert_eq!(seen, vec![SUPER_L]);
     desk.tap(SUPER_L);
     assert_eq!(wm.pressed(), vec![SUPER_L]);
 
@@ -490,4 +497,22 @@ fn virtual_keyboard_input_is_not_forwarded() {
     desk.focus(desk.elsewhere);
     desk.focus(desk.parent);
     wait_until("grab on focus-in", || desk.keyboard_grabbed());
+}
+
+#[test]
+fn a_key_held_when_the_grab_starts_is_released_on_the_remote() {
+    let Some(x) = Xvfb::start() else { return };
+    let desk = Desk::new(&x.display);
+    desk.focus(desk.elsewhere);
+    let hook = Running::start(&x.display, desk.video, desk.parent, true);
+    assert!(hook.installed, "not focused: installed, waiting");
+    assert!(!desk.keyboard_grabbed());
+
+    // Alt goes down before the grab (in the app it would reach the remote
+    // through GTK and the surface); its release lands in the grab.
+    desk.key(ALT_L, true);
+    desk.focus(desk.parent);
+    wait_until("grab on focus-in", || desk.keyboard_grabbed());
+    desk.key(ALT_L, false);
+    assert_eq!(hook.take(1), vec![k("AltLeft", false)], "no stuck Alt");
 }

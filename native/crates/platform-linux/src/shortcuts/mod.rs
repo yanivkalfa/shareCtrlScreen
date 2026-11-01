@@ -2,8 +2,10 @@
 //! the session window is focused, so they act on the remote machine (task L7).
 //!
 //! The backend follows the window handles the video surface exposes
-//! ([`VideoSurface::native_handles`]), not the session type: an app forced onto
-//! XWayland (`GDK_BACKEND=x11`) has X11 handles even in a Wayland session.
+//! ([`VideoSurface::native_handles`]), not the session type. An app forced onto
+//! XWayland (`GDK_BACKEND=x11`) has X11 handles in a Wayland session; an X11
+//! grab cannot take the compositor's shortcuts there, so the X11 backend
+//! detects XWayland and refuses with the remedy.
 //!
 //! * **X11** ([`x11`]): an XInput2 keyboard grab on the video window while the
 //!   session window has the input focus and the video is shown. While the grab
@@ -16,7 +18,7 @@
 //!   shortcut twice).
 //!
 //! `install` returns `false`, with the reason in the log, whenever capture
-//! cannot work here: no native handles, no XInput2, the keyboard grabbed by
+//! cannot work here: no native handles, no XInput2, XWayland, the keyboard grabbed by
 //! someone else (`AlreadyGrabbed` / `Frozen`), no inhibit manager, or the
 //! compositor refusing the inhibitor. The UI then shows the "unsupported here"
 //! hint.

@@ -361,6 +361,15 @@ to run (TCC). Use `objc2` 0.6-family crates throughout (`objc2-app-kit`,
 * Acceptance: CI X11 (Xvfb + software GL via `LIBGL_ALWAYS_SOFTWARE=1`): presents 100
   `Cpu(Nv12)` frames, `client_size` stable under clip, scripted X events arrive as
   `VideoInput`; Wayland: manual on the three compositors.
+* **Owed to L7 (the shortcut hook reads the surface only through `native_handles()`):**
+  1. Implement `VideoSurface::native_handles()` — returning `None` turns shortcut capture
+     off on Linux.
+  2. X11: `video` = the video child window's XID; `parent` = the toplevel XID GTK gave
+     `create_surface`; the video window is a **direct child** of that toplevel.
+  3. Wayland: `parent` = the toplevel `wl_surface` (`create_surface`'s handle, not the
+     video subsurface); `display` = GDK's `wl_display`.
+  4. X11: `hide()` **unmaps** the video window and `show()` maps it (the hook's grab ends
+     on unmap, which is what lets a modal be typed into).
 
 ### L6 — Input injection: XTest / portal+libei / wlroots virtual input / uinput  (size L)
 * `impl InputInjector` with runtime backend selection and `PermissionReport` for each
@@ -376,16 +385,23 @@ to run (TCC). Use `objc2` 0.6-family crates throughout (`objc2-app-kit`,
 * Built (`platform-linux/src/shortcuts/`), on the `SurfaceHandles` / `native_handles()` seam
   added to platform-api for it (backend chosen from the handles, not the session type).
 * **Deviation (approved): `XIGrabDevice`, not the core `XGrabKeyboard`.** Same semantics and
-  refusals, but XI2 events carry the source device, so keys from XTEST devices (our own
-  injector, L6) are not forwarded — a core grab cannot tell them apart and two machines
-  viewing each other would loop keys forever. Such input makes the grab step aside until
-  focus leaves or the video is hidden (a grab cannot pass a key through).
+  refusals, but XI2 events carry the source device. The trait requires the hook to ignore
+  events produced by our own injector (L6 types through XTEST), and a core grab cannot tell
+  XTEST keys from real ones. XTEST input is not forwarded; the grab steps aside until focus
+  leaves or the video is hidden (a grab cannot pass a key through), and the XTEST keys it
+  took are replayed through XTEST after the ungrab, so none is lost.
 * X11 grab held only while the app window has the input focus **and** the video window is
-  viewable (relies on L5 unmapping it on `hide`), so modals can be typed into. Wayland:
-  inhibitor on the **toplevel** over GDK's `wl_display`; it never calls `forward` (the keys
-  arrive through GTK like any other).
+  viewable (relies on L5 unmapping it on `hide`; L5's obligations are on its card), so
+  modals can be typed into. Keys already down when the grab starts get their key-up
+  forwarded. Under **XWayland** (`GDK_BACKEND=x11` in a Wayland session) `install` refuses:
+  an X grab cannot take the compositor's shortcuts. Wayland: inhibitor on the **toplevel**
+  over GDK's `wl_display`; it never calls `forward` (the keys arrive through GTK like any
+  other); it stays on while a modal hides the video (Super then goes to the web view — a
+  behaviour follow-up, documented in the checklist).
+* Keys the shared keymap lacks (media, brightness, vendor keys) are dropped while grabbed
+  (neither remote nor local).
 * Tests: Xvfb acceptance (WM passive grabs see nothing while grabbed; focus-out, unmap,
-  AlreadyGrabbed, XTEST); they start private Xvfbs and use loopback TCP where
+  key held across the grab start, AlreadyGrabbed, XTEST + replay); they start private Xvfbs and use loopback TCP where
   `/tmp/.X11-unix` is read-only (WSLg), local sockets elsewhere. Wayland test is `#[ignore]`d.
   CI needs `xvfb` installed (T3). Device pass: [checklists/L7.md](checklists/L7.md).
 ### L8 — Clipboard: arboard + file-list MIME targets + content-hash change counter  (size M) — Acceptance: echo-guard loop test (two mock peers) never ping-pongs; `set_files` is readable by `wl-paste --list-types` / `xclip -t TARGETS`.

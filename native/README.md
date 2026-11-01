@@ -183,7 +183,10 @@ every compositor keeps an escape combination of its own. Desktops without the
 keyboard-shortcuts-inhibit protocol keep their shortcuts; the log says why
 (`shortcut capture is off: …`). Keys typed through a virtual (XTEST) keyboard, such as
 Synergy or a VNC server driving this machine, pause the X11 capture until the window is
-focused again.
+focused again (the keys themselves still arrive). Under XWayland (`GDK_BACKEND=x11` in a
+Wayland session) capture is off: start the app without that variable. While the X11
+capture holds the keyboard, keys the app does not know (media, volume, brightness and
+vendor keys) do nothing.
 
 **Logs.** `~/.local/state/sharectrl/app.log` (`$XDG_STATE_HOME/sharectrl/app.log`).
 Config lives in `~/.config/sharectrl/`.

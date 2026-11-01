@@ -46,6 +46,7 @@ every crate below.
 | `cros-codecs` | 0.0.6 (2025-06-18) | BSD-3-Clause | VA-API H.264/VP9/AV1 encoders, H.264/HEVC/VP8/VP9/AV1 decoders — evaluate in L3/L4; low release cadence, consider vendoring if API churn bites |
 | `nvidia-video-codec-sdk` | 0.4.0 | MIT | NVENC/NVDEC bindings (needs SDK headers at build, `cudarc`); alternative: in-tree `dlopen` binding over MIT `nv-codec-headers` |
 | `wayland-client`, `wayland-protocols`, `wayland-protocols-wlr` | 0.31+ | MIT | subsurface, shortcuts-inhibit, fractional-scale, wlr virtual input |
+| `wayland-backend` | 0.3 (already transitive via wayland-client) | MIT | `client_system` feature: libwayland-client backend, needed to join GDK's `wl_display` (`from_foreign_display`; L5, L7) |
 | `input-linux` / `mouse-keyboard-input` | 0.7 / 0.9 | MIT | uinput fallback |
 | `wl-clipboard-rs` (via arboard) | — | MIT | Wayland clipboard |
 | `xcap` (reference only) | 0.9.8 (2026-08-01) | Apache-2.0 | X11 screenshot code to crib from; Wayland unimplemented |

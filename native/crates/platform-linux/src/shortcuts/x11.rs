@@ -6,17 +6,25 @@
 //! Both grabs behave the same (async mode, the same `AlreadyGrabbed` / `Frozen`
 //! / `NotViewable` refusals, ended by the server when the grab window becomes
 //! unviewable). But a core grab delivers core `KeyPress` events, which cannot
-//! tell a real keyboard from XTEST, and our own injector (the host side, task
-//! L6) types through XTEST: two machines viewing each other with capture on
-//! would bounce every key back and forth forever. XI2 device events carry the
-//! `sourceid` of the slave device that produced them, so input from an XTEST
-//! device can be recognised (the trait's "ignore our own injector" invariant).
+//! tell a real keyboard from XTEST, and the trait requires the hook to ignore
+//! events produced by our own injector, which (host side, task L6) types
+//! through XTEST. XI2 device events carry the `sourceid` of the slave device
+//! that produced them, so input from an XTEST device can be recognised.
 //!
 //! Recognised XTEST input is not forwarded, and the grab steps aside until the
 //! session window loses focus or the video is hidden: a grab cannot pass a key
-//! through, so dropping the grab is the only way to let XTEST-driven typing
-//! (our injector, or a user driving this machine through Synergy / VNC) reach
-//! the app instead of vanishing.
+//! through, so dropping it is the only way to let XTEST-driven typing (our
+//! injector, or a user driving this machine through Synergy / VNC) reach the
+//! app. The XTEST keys that arrived under the grab are replayed through XTEST
+//! after the ungrab, so none is lost; from then on they reach GTK like any key.
+//!
+//! ## Not under XWayland
+//!
+//! An X client's grab under XWayland binds only other X clients: the Wayland
+//! compositor keeps its shortcuts (mutter honours XWayland grabs only for
+//! allow-listed apps). `install` therefore refuses when the server is
+//! XWayland, with the remedy (start without `GDK_BACKEND=x11`, so the Wayland
+//! inhibitor is used).
 //!
 //! ## Design
 //!
@@ -31,6 +39,13 @@
 //!   happen.
 //! * **"Focused"** = the input focus is the app window or one of its
 //!   descendants. A focus of `PointerRoot` or `None` is never ours.
+//! * **The video is a direct child of the app window** (the L5 contract), so
+//!   structure events on those two windows are all it takes to see the video
+//!   become viewable or not; `install` refuses any other layout.
+//! * **Keys already down when the grab starts** went to GTK (and so to the
+//!   remote through the surface); their releases land in our grab. The grab
+//!   reads the key state when it starts and forwards those releases too (a
+//!   stray key-up is harmless; a missing one is a stuck key).
 //! * **Async grab mode.** The server never freezes the keyboard waiting for us,
 //!   so a slow hook thread cannot stall input (the trait's "never block the OS
 //!   input path").
@@ -62,7 +77,15 @@
 //! * The X server marks its XTEST slave devices with the boolean device property
 //!   `XTEST Device` (`XI_PROP_XTEST_DEVICE`, `include/xserver-properties.h`,
 //!   set in `Xi/xtest.c`): <https://gitlab.freedesktop.org/xorg/xserver>
-//! * x11rb `xinput` bindings: <https://docs.rs/x11rb/0.14/x11rb/protocol/xinput/index.html>
+//! * XTEST extension (`FakeInput`):
+//!   <https://www.x.org/releases/X11R7.7/doc/xextproto/xtest.html>
+//! * `QueryKeymap` (32-byte bit vector, keycode `8N + M` = bit `M` of byte
+//!   `N`): X protocol, as above.
+//! * Xwayland 23.1 and newer announce themselves with the `XWAYLAND` extension
+//!   (`hw/xwayland/` in <https://gitlab.freedesktop.org/xorg/xserver>); older
+//!   ones (Ubuntu 22.04 ships 22.1) are recognised by the session's
+//!   `WAYLAND_DISPLAY`.
+//! * x11rb `xinput` / `xtest` bindings: <https://docs.rs/x11rb/0.14/x11rb/protocol/index.html>
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -78,8 +101,9 @@ use x11rb::protocol::xinput::{
 use x11rb::protocol::xproto::{
     AtomEnum, ChangeWindowAttributesAux, ClientMessageEvent, ConnectionExt as _, CreateWindowAux,
     EventMask, GrabMode, GrabStatus, InputFocus, MapState, NotifyDetail, NotifyMode, Window,
-    WindowClass,
+    WindowClass, KEY_PRESS_EVENT, KEY_RELEASE_EVENT,
 };
+use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::protocol::{ErrorKind, Event};
 use x11rb::rust_connection::RustConnection;
 use x11rb::{COPY_DEPTH_FROM_PARENT, CURRENT_TIME, NONE};
@@ -168,6 +192,9 @@ pub(super) struct X11Grab {
     accept_virtual_keyboards: bool,
     forward: KeyForwarder,
     held: HeldKeys,
+    /// Keycodes that were already down when the grab started (see the module
+    /// docs); their releases are forwarded, their repeats ignored.
+    down_at_grab: Vec<u32>,
     grabbed: bool,
     stand_down: Option<StandDown>,
     /// Retrying a refused grab until this instant.
@@ -218,10 +245,17 @@ impl X11Grab {
             ));
         }
 
-        if !is_self_or_descendant(&conn, video, parent)? {
+        if is_xwayland(&conn, options.display.is_none())? {
             return Err(
-                "the video window is not inside the app window on this X server \
-                        (is DISPLAY the display the app runs on?)"
+                "the app runs under XWayland, where the desktop keeps its shortcuts; start it \
+                 without GDK_BACKEND=x11 to capture them"
+                    .into(),
+            );
+        }
+        if parent_of(&conn, video)? != Some(parent) {
+            return Err(
+                "the video window is not a child of the app window on this X server \
+                 (is DISPLAY the display the app runs on?)"
                     .into(),
             );
         }
@@ -295,6 +329,7 @@ impl X11Grab {
             accept_virtual_keyboards: options.accept_virtual_keyboards,
             forward,
             held: HeldKeys::default(),
+            down_at_grab: Vec::new(),
             grabbed: false,
             stand_down: None,
             retry_until: None,
@@ -409,40 +444,92 @@ impl X11Grab {
                 }
                 self.refresh()
             }
-            Event::FocusIn(_) | Event::MapNotify(_) | Event::ReparentNotify(_) => self.refresh(),
+            Event::FocusIn(e) => {
+                // The competing grab that made us give up has ended: the
+                // server reports its end as a focus-in with mode Ungrab. A
+                // virtual-keyboard stand-down is not lifted by that.
+                if e.mode == NotifyMode::UNGRAB && self.stand_down == Some(StandDown::Refused) {
+                    self.stand_down = None;
+                }
+                self.refresh()
+            }
+            Event::MapNotify(_) | Event::ReparentNotify(_) => self.refresh(),
             _ => Ok(()),
         }
     }
 
     fn on_key(&mut self, device: u16, source: u16, keycode: u32, down: bool, repeat: bool) {
-        // Events queued before an ungrab can still arrive; they are no longer
-        // ours to take.
-        if !self.grabbed || device != self.master {
+        if device != self.master {
             return;
         }
-        if !self.accept_virtual_keyboards && self.xtest.contains(&source) {
+        let virtual_keyboard = !self.accept_virtual_keyboards && self.xtest.contains(&source);
+        if !self.grabbed {
+            // We only receive key events through the grab, so this one was
+            // delivered (and taken from everyone else) before our ungrab
+            // landed. An XTEST key of the stand-down is replayed like the one
+            // that triggered it; others are not ours to forward any more.
+            if virtual_keyboard && self.stand_down == Some(StandDown::VirtualKeyboard) {
+                self.replay(keycode, down);
+            }
+            return;
+        }
+        if virtual_keyboard {
             tracing::info!(
                 "keys from a virtual (XTEST) keyboard: shortcut capture paused until the \
                  session window is focused again"
             );
             self.stand_down = Some(StandDown::VirtualKeyboard);
             self.release();
+            self.replay(keycode, down);
             return;
+        }
+        let pressed_before_grab = self.down_at_grab.contains(&keycode);
+        if pressed_before_grab {
+            if down && repeat {
+                // Its press went to the remote through GTK; repeats did too.
+                return;
+            }
+            self.down_at_grab.retain(|&k| k != keycode);
         }
         let Some(code) = dom_code(keycode) else {
             return;
         };
         if down {
-            // A repeat of a key whose press we never saw (it went down before
-            // the grab) is not a new press: the remote would get a key-down
-            // with no history.
+            // A repeat of a key whose press we never saw is not a new press:
+            // the remote would get a key-down with no history.
             if repeat && !self.held.contains(code) {
                 return;
             }
             self.held.press(code);
             (self.forward)(code, true);
-        } else if self.held.release(code) {
+        } else if self.held.release(code) || pressed_before_grab {
             (self.forward)(code, false);
+        }
+    }
+
+    /// Send a key we took under the grab back through XTEST, now that the
+    /// keyboard is no longer grabbed, so it reaches the focused window as if we
+    /// had never been there.
+    fn replay(&self, keycode: u32, down: bool) {
+        let Ok(keycode) = u8::try_from(keycode) else {
+            return;
+        };
+        let kind = if down {
+            KEY_PRESS_EVENT
+        } else {
+            KEY_RELEASE_EVENT
+        };
+        // XTEST is present: the key came from one of its devices. Device 0 =
+        // the core keyboard, like the injector's own events.
+        // Sent after the ungrab on the same connection, so the server handles
+        // it ungrabbed.
+        let sent = self
+            .conn
+            .xtest_fake_input(kind, keycode, CURRENT_TIME, self.root, 0, 0, 0)
+            .map(|_| ())
+            .and_then(|()| self.conn.flush());
+        if let Err(e) = sent {
+            tracing::debug!("shortcut capture: could not replay a virtual key: {e}");
         }
     }
 
@@ -481,6 +568,16 @@ impl X11Grab {
             GrabResult::Grabbed => {
                 self.grabbed = true;
                 self.retry_until = None;
+                // Read after the grab is ours: a key that goes down later is
+                // delivered to us, so nothing falls between the two.
+                let keys = self
+                    .conn
+                    .query_keymap()
+                    .map_err(|e| format!("X11 request failed: {e}"))?
+                    .reply()
+                    .map_err(x11_err("key state query"))?
+                    .keys;
+                self.down_at_grab = keycodes_down(&keys);
             }
             GrabResult::NotViewable => self.retry_until = None,
             GrabResult::Busy(why) => {
@@ -507,6 +604,8 @@ impl X11Grab {
             let _ = self.conn.xinput_xi_ungrab_device(CURRENT_TIME, self.master);
             let _ = self.conn.flush();
         }
+        // Keys down since before the grab release into GTK again from here.
+        self.down_at_grab.clear();
         for code in self.held.drain() {
             (self.forward)(code, false);
         }
@@ -563,6 +662,46 @@ fn pump(conn: &RustConnection, tx: &Sender<Result<Event, String>>, shutdown: &At
 
 fn is_bad_window(e: &ReplyError) -> bool {
     matches!(e, ReplyError::X11Error(x) if x.error_kind == ErrorKind::Window)
+}
+
+/// Whether this X server is XWayland (see the module docs). `session_server`
+/// = we dialled the session's `$DISPLAY`, so the session's `WAYLAND_DISPLAY`
+/// speaks for it (Xwayland older than 23.1 has no `XWAYLAND` extension).
+fn is_xwayland(conn: &RustConnection, session_server: bool) -> Result<bool, String> {
+    let announced = conn
+        .query_extension(b"XWAYLAND")
+        .map_err(|e| format!("X11 request failed: {e}"))?
+        .reply()
+        .map_err(x11_err("extension query"))?
+        .present;
+    Ok(announced || (session_server && std::env::var_os("WAYLAND_DISPLAY").is_some()))
+}
+
+/// The parent of `window`; `None` when it has none or no longer exists.
+fn parent_of(conn: &RustConnection, window: Window) -> Result<Option<Window>, String> {
+    let tree = conn
+        .query_tree(window)
+        .map_err(|e| format!("X11 request failed: {e}"))?
+        .reply();
+    match tree {
+        Ok(t) if t.parent == NONE => Ok(None),
+        Ok(t) => Ok(Some(t.parent)),
+        Err(e) if is_bad_window(&e) => Ok(None),
+        Err(e) => Err(format!("X11 window tree query failed: {e}")),
+    }
+}
+
+/// Keycodes set in a `QueryKeymap` bit vector: keycode `8 * byte + bit`.
+fn keycodes_down(keys: &[u8; 32]) -> Vec<u32> {
+    let mut down = Vec::new();
+    for (byte, &bits) in (0u32..).zip(keys.iter()) {
+        for bit in 0..8 {
+            if bits & (1 << bit) != 0 {
+                down.push(byte * 8 + bit);
+            }
+        }
+    }
+    down
 }
 
 /// Whether `window` is `ancestor` or lies inside it. A window that vanishes
@@ -695,6 +834,16 @@ mod tests {
             GrabResult::of(GrabStatus::FROZEN),
             GrabResult::Busy(why) if why.contains("Frozen")
         ));
+    }
+
+    #[test]
+    fn keymap_bits_name_keycodes() {
+        let mut keys = [0u8; 32];
+        keys[8] = 0b0000_0001; // keycode 64, Alt_L
+        keys[16] = 0b0010_0000; // keycode 133, Super_L
+        keys[31] = 0b1000_0000; // keycode 255
+        assert_eq!(keycodes_down(&keys), vec![64, 133, 255]);
+        assert!(keycodes_down(&[0; 32]).is_empty());
     }
 
     #[test]

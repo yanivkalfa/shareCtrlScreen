@@ -52,6 +52,13 @@ while ($true) {
                     $alive = ($null -ne (Get-Process -Id $wp -ErrorAction SilentlyContinue))
                 }
             } elseif ($age -lt 90) { $alive = $true }   # worker still starting up
+            if (-not $alive -and (Test-Path -LiteralPath (Join-Path $Done "$name.result"))) {
+                # The worker finished and wrote its result but could not move the request (a lock);
+                # just file the request, never overwrite the result.
+                Move-Item -LiteralPath $r.FullName -Destination (Join-Path $Done "$name.request") -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
+                continue
+            }
             if (-not $alive) {
                 Log "reaping $name - worker died without a result"
                 Move-Item -LiteralPath $r.FullName -Destination (Join-Path $Done "$name.request") -Force

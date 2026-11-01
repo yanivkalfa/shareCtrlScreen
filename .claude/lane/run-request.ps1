@@ -157,10 +157,12 @@ if ($failTail) {
     $out += "--- last 150 lines of step $failedStep (full log in the path above) ---"
     $out += $failTail
 }
-Move-Item -LiteralPath $Request -Destination (Join-Path $Done "$Name.request") -Force
-Remove-Item -LiteralPath (Join-Path $Running "$Name.pid") -Force -ErrorAction SilentlyContinue
-# The .result is written last and atomically (temp + rename) so a watcher on done/ sees a complete file.
+# The .result is written first and atomically (temp + rename) so a watcher on done/ sees a complete
+# file; only then do the pid file and the request go, so the drain's reaper can never mistake a
+# finished worker for a dead one (it also refuses to reap when a .result already exists).
 $tmp = Join-Path $Logs "$Name.result.tmp"
 [IO.File]::WriteAllText($tmp, (($out -join "`r`n") + "`r`n"), (New-Object Text.UTF8Encoding($false)))
 Move-Item -LiteralPath $tmp -Destination (Join-Path $Done "$Name.result") -Force
+Remove-Item -LiteralPath (Join-Path $Running "$Name.pid") -Force -ErrorAction SilentlyContinue
+Move-Item -LiteralPath $Request -Destination (Join-Path $Done "$Name.request") -Force
 Log "done: $status in $total"

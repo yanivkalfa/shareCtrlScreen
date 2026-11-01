@@ -142,7 +142,7 @@ I1..I4 after all lanes (hardware validation)
   (`Injector`, the viewer window's `code_for`) are unchanged in shape. `MapVirtualKeyW` is not
   used (layout-dependent). Decision, **NumLock parity override removed**: the old table sent
   NumLock as plain `0x45`, but Windows reads plain `45` as Pause (`E1 1D 45`, make code `45`
-  not extended) and NumLock as `E0 45` (Chromium `0xe045`, AutoHotkey `SC145`). So the old
+  not extended) and NumLock as `E0 45` (Chromium `0xe045`, Microsoft "About Keyboard Input"). So the old
   injector pressed Pause and the viewer forwarded a real Pause as NumLock. The generated
   `0xe045` is used as is; `SET1_OVERRIDES` is deleted from `tools/gen-keymap`. This is the one
   intentional difference from the 104 old entries (asserted in `scancode.rs`). Device smoke

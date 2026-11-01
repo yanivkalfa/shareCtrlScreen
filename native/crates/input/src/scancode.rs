@@ -22,7 +22,7 @@
 //! NumLock is the extended scan code `E0 45`; plain `45` is Pause (whose full
 //! sequence is `E1 1D 45`, and Windows reports its make code as `45` without
 //! the extended bit). Chromium records NumLock as `0xE045` for exactly this
-//! reason, and AutoHotkey's key list names them `SC145` and `SC045`. The
+//! reason, and Microsoft documents the same split (see the references). The
 //! table this module replaced sent NumLock as plain `45`, which Windows reads
 //! as Pause; the generated table sends it extended. On the viewer side the
 //! same rule means a real Pause (`45`, not extended) is dropped, as Pause is
@@ -37,14 +37,18 @@
 //! * Microsoft, Keyboard Input / `WM_KEYDOWN` (bits 16-23 scan code, bit 24
 //!   extended-key flag):
 //!   <https://learn.microsoft.com/windows/win32/inputdev/wm-keydown>
-//! * Microsoft, "Keyboard scan codes" (Set 1 make codes, `E0` / `E1` prefixes):
-//!   <https://learn.microsoft.com/previous-versions/windows/hardware/design/dn613904(v=vs.85)>
+//! * Microsoft, "About Keyboard Input", Scan Codes table and Extended-Key Flag
+//!   (NumLock `0xE045` and Pause `0x0045` in legacy messages; "the Num Lock key
+//!   has a separate scan code from the Pause key (which uses the same scan code
+//!   without the extended-key flag)"):
+//!   <https://learn.microsoft.com/windows/win32/inputdev/about-keyboard-input#scan-codes>
+//! * Microsoft, `keybd_event` (its NumLock sample sends scan `0x45` with
+//!   `KEYEVENTF_EXTENDEDKEY`):
+//!   <https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-keybd_event>
 //! * Microsoft, `MapVirtualKeyW` (`MAPVK_VSC_TO_VK_EX`, layout dependence):
 //!   <https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-mapvirtualkeyw>
 //! * Chromium `ui/events/keycodes/dom/dom_code_data.inc` (the generated
 //!   table's source; NumLock `0xe045`, Pause `0x0045`).
-//! * AutoHotkey, "List of Keys" (SC045 Pause, SC145 NumLock):
-//!   <https://www.autohotkey.com/docs/v1/KeyList.htm>
 
 use platform_api::keymap::{dom_for, from_dom, KeyId};
 

@@ -96,7 +96,7 @@ pub(crate) fn pointer_shape_to_bgra(
             }
             let mut out = Vec::with_capacity(w * h * 4);
             for y in 0..h {
-                for px in data[y * pitch..y * pitch + w * 4].chunks_exact(4) {
+                for px in data[y * pitch..y * pitch + w * 4].as_chunks::<4>().0 {
                     let (b, g, r, a) = (px[0], px[1], px[2], px[3]);
                     let alpha = if kind == SHAPE_COLOR {
                         a

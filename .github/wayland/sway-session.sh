@@ -21,10 +21,12 @@
 #   then `portals.conf`; values are `;`-separated backend lists:
 #   https://flatpak.github.io/xdg-desktop-portal/docs/portals.conf.html
 # * xdg-desktop-portal-wlr reads `$XDG_CONFIG_HOME/xdg-desktop-portal-wlr/config`
-#   with a `[screencast]` section (output_name, chooser_type, max_fps). The
-#   chooser_type=none reading is from the wlr project's man page, `man 5
-#   xdg-desktop-portal-wlr`; it was not fetched while writing this script, so
-#   the first CI run is the check.
+#   with a `[screencast]` section (output_name, chooser_type, max_fps), `man 5
+#   xdg-desktop-portal-wlr`. Its persist_mode is capped by the XDPW_PERSIST_MODE
+#   environment variable (src/screencast/screencast.c, setup_target: anything
+#   but "transient"/"permanent" means none). Its method handlers return -1 on
+#   several paths (unsupported cursor mode, window source, no instance at Start),
+#   which the frontend reports as "A backend call failed: Operation not permitted".
 # * Activation environment: `dbus-update-activation-environment` pushes variables
 #   into the session bus so bus-activated portal services inherit them.
 #
@@ -91,13 +93,14 @@ chooser_type=none
 max_fps=30
 EOF
 
-# One 1920x1080 headless output, no XWayland, and an animated client so the
-# screencast has frames to deliver (portal_capture needs motion).
+# One 1920x1080 headless output and no XWayland. The animated client is started
+# by this script (below), not by `exec` here, so its stderr lands in a log file
+# and it is restarted if it exits (the first CI run saw "simple-shm exiting" in
+# sway.log with no reason attached).
 cat > "$RUNTIME/sway.conf" <<'EOF'
 output HEADLESS-1 resolution 1920x1080 scale 1
 xwayland disable
 default_border none
-exec weston-simple-shm
 EOF
 
 # --- compositor ----------------------------------------------------------------
@@ -116,12 +119,24 @@ done
 export WAYLAND_DISPLAY="$SOCKET"
 echo "sway is up on $WAYLAND_DISPLAY"
 
-# pgrep -f: the process name (comm) is cut to 15 bytes, so -x never matches.
+echo "outputs: $(swaymsg -t get_outputs -r 2>/dev/null | tr -d '\n' | head -c 400)"
+
+# The moving client (the screencast's "test pattern"; portal_capture needs
+# motion). Kept alive by a restart loop whose PID we own, with its own log, so
+# an early exit is visible and does not leave a static screen.
+(
+  while true; do
+    weston-simple-shm >>"$LOG_DIR/simple-shm.log" 2>&1 || true
+    echo "simple-shm exited with $? at $(date +%T), restarting" >>"$LOG_DIR/simple-shm.log"
+    sleep 0.5
+  done
+) &
+PIDS+=("$!")
 for _ in $(seq 1 50); do
-  pgrep -f weston-simple-shm >/dev/null && break
+  pgrep -x weston-simple-s >/dev/null && break   # comm is cut to 15 bytes
   sleep 0.1
 done
-pgrep -f weston-simple-shm >/dev/null || die "the animated client (weston-simple-shm) did not start, see sway.log"
+pgrep -x weston-simple-s >/dev/null || die "the animated client (weston-simple-shm) did not start, see simple-shm.log"
 
 # --- PipeWire, then the session manager ----------------------------------------
 pipewire >"$LOG_DIR/pipewire.log" 2>&1 &
@@ -157,25 +172,50 @@ echo "pipewire and wireplumber are up"
 
 # Export what the portals and the bus-activated services need.
 dbus-update-activation-environment XDG_CURRENT_DESKTOP XDG_SESSION_TYPE \
-  XDG_RUNTIME_DIR WAYLAND_DISPLAY
+  XDG_RUNTIME_DIR WAYLAND_DISPLAY XDPW_PERSIST_MODE
 
-/usr/libexec/xdg-desktop-portal-wlr >"$LOG_DIR/portal-wlr.log" 2>&1 &
-PIDS+=("$!")
-/usr/libexec/xdg-desktop-portal >"$LOG_DIR/portal.log" 2>&1 &
-PIDS+=("$!")
+# Backend first, then the frontend, each started by us with --replace and at
+# full log level, and each awaited through `busctl list` (name ownership only).
+# The first CI run probed with `busctl introspect`, which D-Bus-ACTIVATED a
+# second frontend from its .service file before ours owned the name; the copy
+# that won logged to the bus daemon, not to our files, and the ScreenCast call
+# failed with "Operation not permitted" (a backend handler returning -1) with
+# nothing in portal-wlr.log to say why. Owning both processes and logging at
+# TRACE/--verbose makes the next failure, if any, explain itself.
+# XDPW_PERSIST_MODE=permanent: xdg-desktop-portal-wlr forces persist_mode to
+# "none" unless this variable allows more (screencast.c, setup_target); the
+# portal_capture test checks the restore-token round trip, which needs it.
+export XDPW_PERSIST_MODE=permanent
+/usr/libexec/xdg-desktop-portal-wlr -r -l TRACE >"$LOG_DIR/portal-wlr.log" 2>&1 &
+WLR_PID=$!
+PIDS+=("$WLR_PID")
+WLR_OK=0
+for _ in $(seq 1 150); do
+  if has "$(busctl --user list 2>/dev/null)" org.freedesktop.impl.portal.desktop.wlr; then
+    WLR_OK=1
+    break
+  fi
+  kill -0 "$WLR_PID" 2>/dev/null || die "xdg-desktop-portal-wlr exited, see portal-wlr.log"
+  sleep 0.1
+done
+[ "$WLR_OK" = 1 ] || die "the wlr backend did not own its bus name in 15 s, see portal-wlr.log"
 
-# Wait until the frontend exposes ScreenCast and the wlr backend owns its name.
+/usr/libexec/xdg-desktop-portal --replace --verbose >"$LOG_DIR/portal.log" 2>&1 &
+XDP_PID=$!
+PIDS+=("$XDP_PID")
 PORTAL_OK=0
 for _ in $(seq 1 300); do
-  if has "$(busctl --user introspect org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop 2>/dev/null)" org.freedesktop.portal.ScreenCast \
-    && has "$(busctl --user list 2>/dev/null)" org.freedesktop.impl.portal.desktop.wlr; then
+  if has "$(busctl --user list 2>/dev/null)" org.freedesktop.portal.Desktop \
+    && has "$(busctl --user introspect org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop 2>/dev/null)" org.freedesktop.portal.ScreenCast; then
     PORTAL_OK=1
     break
   fi
+  kill -0 "$XDP_PID" 2>/dev/null || die "xdg-desktop-portal exited, see portal.log"
   sleep 0.1
 done
-[ "$PORTAL_OK" = 1 ] || die "ScreenCast portal or the wlr backend is not on the bus, see portal*.log"
-echo "portal stack is up: ScreenCast on the bus, wlr backend registered"
+[ "$PORTAL_OK" = 1 ] || die "ScreenCast portal is not on the bus, see portal*.log"
+echo "portal stack is up: ScreenCast on the bus, wlr backend registered (ours: pids $WLR_PID / $XDP_PID)"
+echo "pipewire nodes: $(pw-cli ls Node 2>/dev/null | grep -c 'id ' || true)"
 
 # --- tests ---------------------------------------------------------------------
 cd "$NATIVE"

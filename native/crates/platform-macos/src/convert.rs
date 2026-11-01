@@ -150,7 +150,7 @@ pub(crate) fn hotspot_pixels(hot: (f64, f64), scale: f64, size: (u32, u32)) -> P
 /// `CursorShape` carries). Without this, every anti-aliased cursor edge would
 /// be drawn too dark by a viewer that blends with straight alpha.
 pub(crate) fn unpremultiply_bgra(px: &mut [u8]) {
-    for p in px.chunks_exact_mut(4) {
+    for p in px.as_chunks_mut::<4>().0 {
         let a = p[3] as u32;
         match a {
             0 => p[..3].fill(0),

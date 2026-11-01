@@ -75,11 +75,12 @@ const SHAPE_MASKED_COLOR: u32 = 4;
 /// * Color: 32-bpp BGRA as-is.
 /// * Masked color: the alpha byte is a mask — 0 replaces the screen pixel
 ///   (opaque), 0xFF XORs it. XOR pixels can't be reproduced on another screen, so
-///   non-black XOR pixels are drawn opaque (they are the outline) and black ones
+///   non-black XOR pixels are drawn opaque in their colour with a 1-px
+///   contrasting rim (see [`outline_xor`]) and black ones (XOR no-ops)
 ///   transparent.
 /// * Monochrome: two stacked 1-bpp masks (AND above XOR), so the real height is
 ///   half. AND=1,XOR=0 is transparent; AND=0 is black/white by XOR; AND=1,XOR=1
-///   (invert) is drawn black with a 1-px white outline (see [`outline_inverting`]).
+///   (invert) is drawn black with a 1-px white rim (see [`outline_xor`]).
 ///
 /// ## References
 /// * `DXGI_OUTDUPL_POINTER_SHAPE_TYPE`:
@@ -101,8 +102,14 @@ pub(crate) fn pointer_shape_to_bgra(
                 return None;
             }
             let mut out = Vec::with_capacity(w * h * 4);
+            let mut xor = vec![false; w * h];
             for y in 0..h {
-                for px in data[y * pitch..y * pitch + w * 4].as_chunks::<4>().0 {
+                for (x, px) in data[y * pitch..y * pitch + w * 4]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .enumerate()
+                {
                     let (b, g, r, a) = (px[0], px[1], px[2], px[3]);
                     let alpha = if kind == SHAPE_COLOR {
                         a
@@ -111,8 +118,12 @@ pub(crate) fn pointer_shape_to_bgra(
                     } else {
                         0
                     };
+                    xor[y * w + x] = kind == SHAPE_MASKED_COLOR && a == 0xff && (b | g | r) != 0;
                     out.extend_from_slice(&[b, g, r, alpha]);
                 }
+            }
+            if kind == SHAPE_MASKED_COLOR {
+                outline_xor(&mut out, &xor, w, h);
             }
             Some((width, height, out))
         }
@@ -137,31 +148,47 @@ pub(crate) fn pointer_shape_to_bgra(
                     });
                 }
             }
-            outline_inverting(&mut out, &inverting, w, h);
+            outline_xor(&mut out, &inverting, w, h);
             Some((width, h as u32, out))
         }
         _ => None,
     }
 }
 
-/// Inverting pixels (screen XOR) cannot be reproduced on the viewer, which
-/// only blends. Drawn plain black, the standard Windows I-beam (an inverting
-/// monochrome cursor) disappears on a dark terminal, so every transparent pixel
-/// touching an inverting one (8-neighbourhood) becomes opaque white: a black
-/// line with a white rim reads on any background. `out` is straight BGRA,
-/// `inverting` one flag per pixel, both `w * h` row-major.
-fn outline_inverting(out: &mut [u8], inverting: &[bool], w: usize, h: usize) {
+/// XOR pixels (monochrome "invert", masked-colour XOR) cannot be reproduced on
+/// the viewer, which only blends, so they are drawn in one fixed colour — and
+/// one fixed colour vanishes on a background of that colour (the standard
+/// Windows I-beam, an inverting monochrome cursor drawn black, on a dark
+/// terminal; a masked-colour I-beam with white XOR pixels on a white page).
+/// Every transparent pixel touching an XOR pixel (8-neighbourhood) therefore
+/// becomes an opaque rim in the contrasting colour: white beside a dark XOR
+/// pixel, black beside a light one. A line with a contrasting rim reads on any
+/// background. `out` is straight BGRA, `xor` one flag per pixel, both `w * h`
+/// row-major; XOR pixels are opaque, so the rim never overwrites one.
+fn outline_xor(out: &mut [u8], xor: &[bool], w: usize, h: usize) {
     for y in 0..h {
         for x in 0..w {
             let i = y * w + x;
             if out[i * 4 + 3] != 0 {
-                continue; // only transparent pixels become outline
+                continue; // only transparent pixels become rim
             }
-            let near = (y.saturating_sub(1)..(y + 2).min(h))
-                .any(|ny| (x.saturating_sub(1)..(x + 2).min(w)).any(|nx| inverting[ny * w + nx]));
-            if near {
-                out[i * 4..i * 4 + 4].copy_from_slice(&[255, 255, 255, 255]);
-            }
+            let neighbour = (y.saturating_sub(1)..(y + 2).min(h))
+                .flat_map(|ny| (x.saturating_sub(1)..(x + 2).min(w)).map(move |nx| ny * w + nx))
+                .find(|&n| xor[n]);
+            let Some(n) = neighbour else { continue };
+            // BT.601 luma of the XOR pixel decides the rim's colour.
+            let (b, g, r) = (
+                u32::from(out[n * 4]),
+                u32::from(out[n * 4 + 1]),
+                u32::from(out[n * 4 + 2]),
+            );
+            let luma = (299 * r + 587 * g + 114 * b) / 1000;
+            let rim = if luma < 128 {
+                [255, 255, 255, 255]
+            } else {
+                [0, 0, 0, 255]
+            };
+            out[i * 4..i * 4 + 4].copy_from_slice(&rim);
         }
     }
 }
@@ -690,12 +717,28 @@ mod tests {
 
     #[test]
     fn masked_color_makes_xor_black_transparent_and_outline_opaque() {
-        // replace pixel (mask 0), xor-black (transparent), xor-white (outline).
-        let data = [10, 20, 30, 0, 0, 0, 0, 0xff, 255, 255, 255, 0xff];
-        let (_, _, px) = pointer_shape_to_bgra(SHAPE_MASKED_COLOR, 3, 1, 12, &data).unwrap();
+        // replace pixel (mask 0), xor-black (transparent), xor-black (transparent,
+        // touching the next one), xor-white (outline).
+        let data = [
+            10, 20, 30, 0, 0, 0, 0, 0xff, 0, 0, 0, 0xff, 255, 255, 255, 0xff,
+        ];
+        let (_, _, px) = pointer_shape_to_bgra(SHAPE_MASKED_COLOR, 4, 1, 16, &data).unwrap();
         assert_eq!(&px[0..4], &[10, 20, 30, 255]);
-        assert_eq!(px[7], 0);
-        assert_eq!(px[11], 255);
+        assert_eq!(px[7], 0, "XOR black is a no-op: transparent");
+        assert_eq!(&px[12..16], &[255, 255, 255, 255]);
+        // The transparent pixel beside the light XOR pixel is its dark rim, so
+        // a white XOR I-beam still shows on a white page.
+        assert_eq!(&px[8..12], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn dark_xor_pixels_in_masked_cursors_get_a_light_rim() {
+        // transparent, XOR dark blue, transparent.
+        let data = [0, 0, 0, 0xff, 40, 0, 0, 0xff, 0, 0, 0, 0xff];
+        let (_, _, px) = pointer_shape_to_bgra(SHAPE_MASKED_COLOR, 3, 1, 12, &data).unwrap();
+        assert_eq!(&px[0..4], &[255, 255, 255, 255]);
+        assert_eq!(&px[4..8], &[40, 0, 0, 255]);
+        assert_eq!(&px[8..12], &[255, 255, 255, 255]);
     }
 
     #[test]

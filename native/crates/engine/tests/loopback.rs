@@ -121,6 +121,8 @@ struct Peer {
     toasts: Arc<std::sync::Mutex<Vec<String>>>,
     /// Every role the engine reported, in order.
     roles: Arc<std::sync::Mutex<Vec<Role>>>,
+    /// How many "link trouble" countdown ticks the engine reported.
+    link_trouble: Arc<std::sync::atomic::AtomicU32>,
 }
 
 fn temp_root(name: &str) -> PathBuf {
@@ -174,12 +176,16 @@ fn start_peer_with(name: &str, relay: &str, configure: impl FnOnce(&mut MockPlat
     });
     let toasts: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
     let roles: Arc<std::sync::Mutex<Vec<Role>>> = Arc::default();
-    let (t, r) = (toasts.clone(), roles.clone());
+    let link_trouble: Arc<std::sync::atomic::AtomicU32> = Arc::default();
+    let (t, r, lt) = (toasts.clone(), roles.clone(), link_trouble.clone());
     tokio::spawn(async move {
         while let Some(ev) = ui_rx.recv().await {
             match ev {
                 UiEvent::Toast(msg) => t.lock().unwrap().push(msg),
                 UiEvent::RoleChanged(role) => r.lock().unwrap().push(role),
+                UiEvent::LinkTrouble { .. } => {
+                    lt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 _ => {}
             }
         }
@@ -190,6 +196,7 @@ fn start_peer_with(name: &str, relay: &str, configure: impl FnOnce(&mut MockPlat
         uuid,
         toasts,
         roles,
+        link_trouble,
     }
 }
 
@@ -441,8 +448,9 @@ async fn host_cursor_image_reaches_the_viewer_and_lands_on_the_hotspot() {
     .await;
 }
 
-/// A 256×256 pointer image (the wire maximum: 8 parts of ~33 KiB, more than
-/// SCTP's whole 128 KiB send buffer), distinct per `seed`.
+/// A 256×256 pointer image (the wire maximum: 256 KiB of pixels in 16 parts of
+/// ~33 KiB of JSON, ≈ 526 KB, four times SCTP's whole 128 KiB send buffer),
+/// distinct per `seed`.
 fn big_cursor(seed: u8) -> platform_api::CursorShape {
     let side = 256u32;
     let mut bgra = Vec::with_capacity((side * side * 4) as usize);
@@ -466,10 +474,14 @@ fn big_cursor(seed: u8) -> platform_api::CursorShape {
 async fn maximum_size_cursor_images_in_a_burst_all_arrive_intact() {
     // Before ctl had a send queue, str0m refused every part past its 128 KiB
     // send buffer and the driver dropped them: any image of 128 px or more
-    // lost its tail, was counted as sent, and never showed. Five maximum-size
-    // images back to back (≈ 1.3 MB on ctl, queued before the channel opens
-    // and flushed at open) must all get through, in order, the last one
-    // complete and current.
+    // lost its tail, was counted as sent, and never showed. Six maximum-size
+    // images back to back (the first shape plus a burst of five: 96 parts,
+    // ≈ 3.2 MB on ctl, queued before the channel opens and flushed at open)
+    // must all get through, in order, the last one complete and current —
+    // without the viewer ever reporting link trouble while it drains (pongs
+    // wait behind the parts; every ctl message counts as proof of life). On
+    // localhost the drain takes milliseconds, so this guards the plumbing;
+    // the slow-uplink case rests on that rule in the driver.
     let relay = start_relay().await;
     let burst: Vec<_> = (2..=6).map(big_cursor).collect();
     let last = burst[burst.len() - 1].clone();
@@ -507,11 +519,19 @@ async fn maximum_size_cursor_images_in_a_burst_all_arrive_intact() {
         assert_eq!(sprite.frame, (640, 360));
         assert!(
             sprite.bgra == last.bgra,
-            "every byte of all 8 parts arrived"
+            "every byte of all 16 parts arrived"
         );
     }
-    // The session survived the 1.3 MB on ctl (pings queued behind it).
+    // The session survived the 3.2 MB on ctl (pings queued behind it), and
+    // neither side ever reported link trouble.
     assert!(matches!(viewer.engine.role(), Role::Viewer { .. }));
+    for (who, p) in [("viewer", &viewer), ("host", &host)] {
+        assert_eq!(
+            p.link_trouble.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{who} reported link trouble"
+        );
+    }
 
     viewer.engine.end_session();
     eventually("both idle", t, || {

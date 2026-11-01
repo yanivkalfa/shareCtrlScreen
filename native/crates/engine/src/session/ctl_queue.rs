@@ -45,6 +45,12 @@ impl CtlQueue {
         self.open = true;
     }
 
+    /// Forget everything not yet accepted (session teardown: only the Bye
+    /// queued after this still matters).
+    pub(super) fn clear(&mut self) {
+        self.pending.clear();
+    }
+
     /// Messages waiting (not yet accepted by the transport).
     #[cfg(test)]
     fn pending(&self) -> usize {
@@ -158,6 +164,22 @@ mod tests {
         assert_eq!(q.pending(), 0);
         let firsts: Vec<u8> = t.sent.iter().map(|m| m[0]).collect();
         assert_eq!(firsts, vec![1, 2, 3, 4, 9]);
+    }
+
+    #[test]
+    fn a_bye_after_clear_goes_first() {
+        let mut q = CtlQueue::default();
+        q.open();
+        let mut t = Fake {
+            room: 0,
+            sent: Vec::new(),
+        };
+        q.send(vec![1; 10], |b| t.write(b)); // backlog, refused
+        q.clear();
+        t.room = 16;
+        q.send(vec![2], |b| t.write(b));
+        assert_eq!(t.sent, vec![vec![2]]);
+        assert_eq!(q.pending(), 0);
     }
 
     #[test]

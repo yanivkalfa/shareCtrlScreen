@@ -209,6 +209,8 @@ pub(super) fn transport_driver(d: Driver) {
     /// that a frozen picture is explained rather than left a mystery.
     const TROUBLE_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
     let mut last_ping_sent = std::time::Instant::now();
+    // When the peer's ctl channel last delivered anything (a pong or any other
+    // message: see `Inbound::Ctl`). The silence timers run from here.
     let mut last_pong = std::time::Instant::now();
     let mut ping_seq: u32 = 0;
     let mut link_trouble = false;
@@ -588,23 +590,26 @@ pub(super) fn transport_driver(d: Driver) {
                             }
                         }
                         Inbound::Ctl(bytes) => {
+                            // Liveness: ANY ctl message proves the peer's session
+                            // is alive, not only a pong. The peer's ctl is one
+                            // ordered queue, so its pong can wait behind a cursor
+                            // image backlog (D9: up to MBs on a slow uplink) while
+                            // the parts ahead of it keep arriving; counting only
+                            // pongs would show "link trouble", even end the
+                            // session, while everything flows.
+                            last_pong = std::time::Instant::now();
                             // Control messages both sides understand, handled once
                             // up front. Anything that isn't one falls through to
                             // the host's input-injection path below.
                             match serde_json::from_slice::<protocol::ControlMsg>(&bytes) {
-                                // Liveness: answer probes, and count any reply as
-                                // proof the peer is alive.
+                                // Answer probes (the reply proves us alive to them).
                                 Ok(protocol::ControlMsg::Ping { seq }) => {
-                                    last_pong = std::time::Instant::now();
                                     ctl.send(serialize(&protocol::ControlMsg::Pong { seq }), |b| {
                                         tp.send_ctl(b)
                                     });
                                     continue;
                                 }
-                                Ok(protocol::ControlMsg::Pong { .. }) => {
-                                    last_pong = std::time::Instant::now();
-                                    continue;
-                                }
+                                Ok(protocol::ControlMsg::Pong { .. }) => continue,
                                 // A viewer keyframe request restarts the stream
                                 // (decoder never started / lost the keyframe). NOT
                                 // gated on control — view-only viewers need it too.
@@ -821,6 +826,9 @@ pub(super) fn transport_driver(d: Driver) {
     // when the signaling socket is itself the thing that broke — the peer would
     // then sit out the full grace period instead of dropping immediately.
     if stop.load(Ordering::SeqCst) && ctl.is_open() && connected {
+        // Nothing still waiting matters once we leave (a cursor image backlog
+        // would otherwise keep the Bye out of the 250 ms window below).
+        ctl.clear();
         ctl.send(serialize(&protocol::ControlMsg::Bye), |b| tp.send_ctl(b));
         // The loop is over, so nothing else will flush str0m's queue — pump it
         // briefly by hand, bounded so teardown can't hang on a dead socket.

@@ -825,17 +825,40 @@ to run (TCC). Use `objc2` 0.6-family crates throughout (`objc2-app-kit`,
       each driver pass, before newer ones; it also replaces the pre-open backlog. A message
       larger than the whole buffer is dropped with a warning (it could never be accepted).
       Loopback `maximum_size_cursor_images_in_a_burst_all_arrive_intact`: six 256×256 images
-      (≈ 1.6 MB on ctl) all arrive, the last byte-exact and drawn.
+      (16 parts each, 96 parts, ≈ 3.2 MB on ctl) all arrive, the last byte-exact and drawn.
     * Windows monochrome cursors: inverting pixels (the standard I-beam) are black with a 1-px
-      white rim (`outline_inverting`, as WebRTC's `AddCursorOutline`), so they show on a dark
+      white rim (`outline_xor` since round 2, as WebRTC's `AddCursorOutline`), so they show on a dark
       terminal.
     * A 1:1 image is snapped to whole target pixels in both presenters (a centred letterbox
       can start at x.5 and the bilinear sampler would blur it); the mock compositor's doc says
       it samples nearest and does not snap.
-  * Seen while fixing, not changed (outside D9): the viewer's file push sends `bulk` frames
-    while `bulk_buffered() < 256 KiB`, but `send_bulk` ignores the same `Ok(false)`, and str0m
-    refuses anything past 128 KiB buffered across all channels, so a large file transfer can
-    lose chunks silently. Needs the same treatment as ctl (follow-up).
+  * Review round 2 fixes:
+    * Liveness: every inbound ctl message now refreshes the peer-silence timer, not only
+      Ping/Pong. The peer's pong waits behind its cursor-image backlog in the ordered ctl
+      queue (MBs on a slow uplink: an animated large cursor can mean many 132–527 KB images),
+      and counting only pongs showed "link trouble" — or ended the session past the 15 s
+      grace — while video and parts kept arriving. The burst loopback asserts neither side
+      reports link trouble; on localhost the drain is milliseconds, so the slow-uplink case
+      rests on the rule itself (no link shaper in the harness).
+    * Teardown: the queue is cleared before the final Bye, so a cursor backlog cannot keep the
+      Bye out of the 250 ms pump.
+    * Windows masked-colour cursors: non-black XOR pixels get the same 1-px rim as monochrome
+      inverting pixels, in the contrasting colour (white beside dark, black beside light), so a
+      white-XOR I-beam shows on a white page (`outline_xor`).
+  * Not done (accepted): the host does not drop a queued image when a newer shape supersedes
+    it, so on a slow uplink a burst of new large images delays later ctl messages (perm,
+    clipboard) until it drains; liveness is no longer affected.
+  * Seen while fixing, not changed (outside D9), follow-ups:
+    * The viewer's file push sends `bulk` frames while `bulk_buffered() < 256 KiB`, but
+      `send_bulk` ignores the same `Ok(false)`, and str0m refuses anything past 128 KiB
+      buffered across all channels, so a large file transfer can lose chunks silently. Needs
+      the same treatment as ctl.
+    * Clipboard text is capped at `MAX_TEXT_BYTES` (256 KiB, `platform-api/src/os.rs`), but a
+      ctl message over str0m's 128 KiB send buffer can never be accepted. Between two copies
+      of this app that buffer is the real limit (str0m peers advertise a 256 KiB
+      `max-message-size`, `LOCAL_MAX_MESSAGE_SIZE`); only a peer advertising none would cap
+      messages at the 64 KiB default. Such text was silently lost before D9 and is now dropped
+      with a warning. Cap the clipboard at what fits, or chunk it.
   * Not verified: real sessions (I1–I3): arrow/I-beam/hand/resize on each host, DXGI top-left
     semantics on hardware, portal cursor scale under fractional scaling, Retina scale.
 

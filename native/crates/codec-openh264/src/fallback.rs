@@ -441,7 +441,10 @@ mod tests {
         // Neither the report nor a codec attempt may touch the network or disk.
         assert!(f.new_decoder(None, Codec::H264, 64, 64).is_err());
         assert!(f.new_encoder(None, EncoderConfig::default()).is_err());
-        assert!(!scratch.0.exists(), "a disabled codec must not create files");
+        assert!(
+            !scratch.0.exists(),
+            "a disabled codec must not create files"
+        );
     }
 
     #[test]

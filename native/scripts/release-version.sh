@@ -50,6 +50,8 @@ json_query() {
   else
     local py
     py="$(command -v python3 || command -v python || true)"
+    # On Windows `python3` may be the Microsoft Store stub, which exists but cannot run.
+    if [[ -n "$py" ]] && ! "$py" -c 'import sys' >/dev/null 2>&1; then py=""; fi
     if [[ -z "$py" ]]; then
       echo "error: need jq or python3 to read JSON" >&2
       return 1

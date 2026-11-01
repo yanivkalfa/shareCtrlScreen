@@ -133,6 +133,9 @@ jobs:
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-about@${{ env.CARGO_ABOUT_VERSION }}
+          # A source-build fallback would lack the `cli` feature, i.e. the `about`
+          # command itself; fail clearly if the prebuilt is missing instead.
+          fallback: none
 
       # tauri-cli has no prebuilt binary that install-action verifies, so it is built
       # from crates.io with its own lockfile at an exact version.

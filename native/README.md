@@ -165,9 +165,12 @@ Config lives in `~/.config/sharectrl/`.
 **Building the packages.** On Ubuntu 22.04: install the packages listed in
 `.github/workflows/build-assets.yml` (Linux step), the Tauri CLI and cargo-about at the
 versions pinned there, then run `scripts/release-dry-run.sh linux`. The release assets
-land in `native/dist/`. The AppImage step needs FUSE or `APPIMAGE_EXTRACT_AND_RUN=1` (the
-script sets it); under WSL it is not expected to work, and the script then stops before
-packaging, so build only `deb,rpm` there. The icon PNGs in `app/icons/` are
+land in `native/dist/`. The full Linux recipe needs a real Ubuntu (or another machine
+where the AppImage tooling runs; the script sets `APPIMAGE_EXTRACT_AND_RUN=1`). Under WSL
+the AppImage step fails (no FUSE), so the recipe and its `package` phase cannot complete
+there. To check the deb and rpm there, run by hand from `app/` the first command
+`scripts/release-dry-run.sh --print-build-steps linux` prints (the notices page the
+bundle includes), then `cargo tauri build --config tauri.release.conf.json --bundles deb,rpm`. The icon PNGs in `app/icons/` are
 regenerated with `python3 app/icons/generate-linux-icons.py`.
 
 ## Licensing (§11 — CI-enforced)
@@ -177,6 +180,8 @@ regenerated with `python3 app/icons/generate-linux-icons.py`.
 - `about.toml` / `about.hbs` — `cargo about generate`, run per OS by
   `scripts/release-assets.sh` → `THIRD-PARTY-LICENSES.html` inside each installer and
   `THIRD-PARTY-LICENSES-<os>.html` on each release. Generated, never committed.
+- Clean-room: **zero lines** of RustDesk (AGPL). Every module implemented from
+  Microsoft/vendor primary docs.
 
 ## Releasing
 
@@ -184,8 +189,6 @@ Push the tag `v<version>` matching `[workspace.package] version` (see the root R
 *Packaging*). The pipeline: `.github/workflows/release.yml` → `build-assets.yml` (one
 reusable workflow per OS) → `scripts/release-assets.sh` (the recipe). Local equivalent:
 `scripts/release-dry-run.sh [--print-build-steps | --skip-build] [windows|macos|linux]`.
-- Clean-room: **zero lines** of RustDesk (AGPL). Every module implemented from
-  Microsoft/vendor primary docs.
 
 ## Status / what needs on-hardware validation
 

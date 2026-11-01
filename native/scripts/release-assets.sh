@@ -137,16 +137,18 @@ if command -v cygpath >/dev/null 2>&1; then
   target_dir="$(cygpath -u "$target_dir")" # Git Bash on Windows: C:\x -> /c/x
 fi
 
-# one_file <glob>: print the single file matching <glob>; fail on none or several (a
-# second match means a stale bundle from another version is lying in the target dir).
+# one_file <dir> <pattern>: print the single file in <dir> matching the glob <pattern>;
+# fail on none or several (a second match means a stale bundle from another version is
+# lying in the target dir). The directory is quoted and only the pattern is a glob, so a
+# path with spaces (C:\Users\John Smith\...) is not split.
 one_file() {
   local -a m
   shopt -s nullglob
-  # shellcheck disable=SC2206 # the glob must expand here
-  m=($1)
+  # shellcheck disable=SC2206 # the pattern must expand here; the directory is quoted
+  m=("$1"/$2)
   shopt -u nullglob
   if [[ ${#m[@]} -ne 1 ]]; then
-    echo "error: expected exactly one file matching $1, found ${#m[@]}: ${m[*]:-}" >&2
+    echo "error: expected exactly one file matching $1/$2, found ${#m[@]}: ${m[*]:-}" >&2
     return 1
   fi
   printf '%s\n' "${m[0]}"
@@ -159,7 +161,7 @@ summary() {
 
 package_windows() {
   local bundle="$target_dir/release/bundle/nsis" setup
-  setup="$(one_file "$bundle/ShareCtrlScreen_${version}_*-setup.exe")"
+  setup="$(one_file "$bundle" "ShareCtrlScreen_${version}_*-setup.exe")"
   # tauri-build copies bundle resources next to the binary; a missing copy means the
   # release overlay was not applied and the installer lacks the notices.
   [[ -f "$target_dir/release/THIRD-PARTY-LICENSES.html" ]] || {
@@ -214,7 +216,11 @@ package_macos() {
   hdiutil attach -readonly -nobrowse -mountpoint "$mnt" "$dmg" >/dev/null
   local ok=0 requirement
   if codesign --verify --strict --verbose=2 "$mnt/ShareCtrlScreen.app"; then
-    requirement="$(codesign -dr - "$mnt/ShareCtrlScreen.app" 2>&1)"
+    # `|| …` instead of letting set -e exit: the image must still be detached below.
+    requirement="$(codesign -dr - "$mnt/ShareCtrlScreen.app" 2>&1)" || {
+      echo "error: codesign -dr failed on the app in the DMG: $requirement" >&2
+      ok=1
+    }
     if [[ "$kind" == certificate && ("$requirement" != *"certificate leaf ="* || "$requirement" == *cdhash*) ]]; then
       echo "error: the app in the DMG is not certificate-signed; refusing to ship it" >&2
       ok=1
@@ -232,11 +238,11 @@ package_macos() {
 
 package_linux() {
   local bundle="$target_dir/release/bundle" appimage deb rpm
-  appimage="$(one_file "$bundle/appimage/ShareCtrlScreen_${version}_*.AppImage")"
-  deb="$(one_file "$bundle/deb/ShareCtrlScreen_${version}_*.deb")"
+  appimage="$(one_file "$bundle/appimage" "ShareCtrlScreen_${version}_*.AppImage")"
+  deb="$(one_file "$bundle/deb" "ShareCtrlScreen_${version}_*.deb")"
   # RPM's Version field cannot hold '-', so a pre-release version is spelled differently
   # in the file name; match on the core x.y.z only.
-  rpm="$(one_file "$bundle/rpm/ShareCtrlScreen-${version%%[-+]*}*.rpm")"
+  rpm="$(one_file "$bundle/rpm" "ShareCtrlScreen-${version%%[-+]*}*.rpm")"
 
   if command -v dpkg-deb >/dev/null 2>&1; then
     dpkg-deb --info "$deb"

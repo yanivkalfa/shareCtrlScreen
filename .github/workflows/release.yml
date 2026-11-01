@@ -134,6 +134,8 @@ jobs:
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-deny@${{ env.CARGO_DENY_VERSION }}
+          # Only the checksum-verified prebuilt; never a silent source build.
+          fallback: none
       # deny.toml [graph].targets lists the Windows, both macOS and the Linux triples,
       # so one run on one OS vets every shipped dependency graph. --locked: the gate
       # checks the exact Cargo.lock the builds use.

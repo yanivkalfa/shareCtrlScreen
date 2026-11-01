@@ -55,21 +55,24 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
-      # VideoToolbox hardware tests (plan task T2). The macOS runner is an
-      # Apple-silicon image, which has a hardware H.264/HEVC encoder and decoder
-      # (GitHub runner-images README: `macos-latest` = macOS 26 arm64, and the
-      # `macos-14`/`macos-15` labels are arm64 too; Intel images are `-large` /
-      # `-intel` labels only). Each test probes first and, with
-      # SCT_MAC_HW_TESTS_REQUIRED=1, a missing encoder or decoder fails the job
-      # instead of skipping. The two timing tests are device-only (a loaded
-      # shared runner cannot hold a wall-clock budget) and skipped by name here.
-      # The golden-stream test checks VideoToolbox's output against FFmpeg's
-      # per-frame hashes (native/testdata/golden/README.md). --nocapture keeps
-      # the printed dB / frame lines in the log.
+      # VideoToolbox hardware tests (plan task T2). Each test probes first and
+      # skips when VideoToolbox has no hardware for it; a skip is a printed line
+      # and a workflow warning annotation, not a pass. Whether a hosted macOS
+      # runner has the hardware is unproven until a run shows it: GitHub's arm64
+      # macOS images run inside Apple's Virtualization framework, and nothing in
+      # the runner-images docs promises a hardware VideoToolbox there (the README
+      # only says `macos-latest` = macOS 26 arm64). So the strict mode
+      # (SCT_MAC_HW_TESTS_REQUIRED) is opt-in through a repository variable, not
+      # set here: enable it after a run proves the hardware is present. The two
+      # timing tests are device-only (a loaded shared runner cannot hold a
+      # wall-clock budget) and skipped by name here. The golden-stream test
+      # checks VideoToolbox's output against FFmpeg's per-frame hashes
+      # (native/testdata/golden/README.md). --nocapture keeps the printed dB /
+      # frame lines in the log.
       - name: VideoToolbox hardware tests (macOS)
         if: runner.os == 'macOS'
         env:
-          SCT_MAC_HW_TESTS_REQUIRED: "1"
+          SCT_MAC_HW_TESTS_REQUIRED: ${{ vars.SCT_MAC_HW_TESTS_REQUIRED }}
         run: |
           cargo test -p platform-macos --lib vt_encoder::tests -- --ignored --nocapture
           cargo test -p platform-macos --lib decode:: -- --ignored --nocapture

@@ -25,7 +25,7 @@ mod hardware;
 
 use std::time::{Duration, Instant};
 
-use hardware::skip;
+use hardware::encoder_gate;
 
 use objc2_core_video::{
     kCVReturnSuccess, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane,
@@ -138,8 +138,7 @@ fn assert_annexb(u: &EncodedUnit) {
 #[test]
 #[ignore = "timing, device-only: a shared CI runner is too loaded (skipped by name in CI)"]
 fn encodes_300_frames_first_idr_mean_under_8ms() {
-    if !platform_macos::h264_hardware_encoder_available() {
-        skip("no hardware H.264 encoder (VideoToolbox)");
+    if !encoder_gate(platform_macos::h264_hardware_encoder()) {
         return;
     }
     logs();
@@ -188,8 +187,7 @@ fn encodes_300_frames_first_idr_mean_under_8ms() {
 #[test]
 #[ignore = "timing, device-only: a shared CI runner is too loaded (skipped by name in CI)"]
 fn holds_the_bitrate_within_15_percent_over_5_seconds() {
-    if !platform_macos::h264_hardware_encoder_available() {
-        skip("no hardware H.264 encoder (VideoToolbox)");
+    if !encoder_gate(platform_macos::h264_hardware_encoder()) {
         return;
     }
     logs();
@@ -304,8 +302,7 @@ fn psnr(a: &[u8], b: &[u8]) -> f64 {
 #[test]
 #[ignore = "needs a Mac with a hardware H.264 encoder (skips without one)"]
 fn round_trip_through_the_platform_decoder_is_at_least_40_db() {
-    if !platform_macos::h264_hardware_encoder_available() {
-        skip("no hardware H.264 encoder (VideoToolbox)");
+    if !encoder_gate(platform_macos::h264_hardware_encoder()) {
         return;
     }
     logs();

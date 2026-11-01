@@ -53,7 +53,8 @@
 //!   <https://developer.apple.com/documentation/videotoolbox/kvtencodeframeoptionkey_forcekeyframe>
 //! * Encoder specification — `EnableLowLatencyRateControl` (macOS 11.3+),
 //!   `RequireHardwareAcceleratedVideoEncoder`:
-//!   <https://developer.apple.com/documentation/videotoolbox/encoder-specification>
+//!   <https://developer.apple.com/documentation/videotoolbox/kvtvideoencoderspecification_requirehardwareacceleratedvideoencoder>,
+//!   <https://developer.apple.com/documentation/videotoolbox/kvtvideoencoderspecification_enablelowlatencyratecontrol>
 //! * Pixel transfer — `ScalingMode`, `DownsamplingMode_Average`, `RealTime`:
 //!   <https://developer.apple.com/documentation/videotoolbox/vtpixeltransfersession>
 //! * `CMSampleBufferGetDataBuffer`, `CMBlockBufferCopyDataBytes`,
@@ -1081,16 +1082,11 @@ mod tests {
     use objc2_core_video::CVPixelBufferGetWidth;
 
     use super::*;
-    use crate::hardware::skip;
 
     /// False, after a printed skip, when this Mac has no hardware H.264
     /// encoder: the probe every hardware test in this module runs first.
     fn hardware_present() -> bool {
-        if crate::h264_hardware_encoder_available() {
-            return true;
-        }
-        skip("no hardware H.264 encoder (VideoToolbox)");
-        false
+        crate::hardware::encoder_gate(crate::h264_hardware_encoder())
     }
 
     /// A `420v` IOSurface buffer with a horizontal luma ramp, like a

@@ -1,7 +1,8 @@
-//! The decoder on real VideoToolbox. Everything except the encoder
-//! round trip runs on any Mac, including GitHub's macOS runners (H.264 has a
-//! software decoder where hardware is missing; no window, no permissions):
-//! `cargo test -p platform-macos decode::`.
+//! The decoder on real VideoToolbox. Everything except the two hardware-gated
+//! tests (the encoder round trip and the golden-stream check, both `#[ignore]`d
+//! and run by the macOS CI step) runs on any Mac, including GitHub's macOS
+//! runners (H.264 has a software decoder where hardware is missing; no window,
+//! no permissions): `cargo test -p platform-macos decode::`.
 //!
 //! The streams come from [`H264Synth`]: lossless I_PCM keyframes and
 //! skip-only deltas, so every decoded sample is checked exactly.
@@ -21,7 +22,7 @@ use sha2::{Digest, Sha256};
 use super::golden;
 use super::synth::{pattern, H264Synth};
 use super::*;
-use crate::hardware::skip;
+use crate::hardware::{encoder_gate, skip};
 
 /// A decoded picture copied out of its pixel buffer (tight rows).
 struct Picture {
@@ -328,8 +329,7 @@ fn psnr(a: &Picture, b: &Picture) -> f64 {
 #[test]
 #[ignore = "needs a Mac with a hardware H.264 encoder (skips without one)"]
 fn round_trip_gradient_psnr_at_least_40_db() {
-    if !crate::h264_hardware_encoder_available() {
-        skip("no hardware H.264 encoder (VideoToolbox)");
+    if !encoder_gate(crate::h264_hardware_encoder()) {
         return;
     }
     let platform = crate::MacPlatform::new();
@@ -427,14 +427,20 @@ fn assert_matches_ffmpeg(g: &golden::Golden, got: &[((u32, u32), String)]) {
 /// changes size mid-session. HEVC is checked only where VideoToolbox decodes
 /// it in hardware (`VTIsHardwareDecodeSupported`).
 ///
-/// Run by the macOS CI step (`--ignored`); skips where hardware decode is
-/// missing, and fails there under `SCT_MAC_HW_TESTS_REQUIRED=1`.
+/// Run by the macOS CI step (`--ignored`). The H.264 check runs on whatever
+/// VideoToolbox decodes with: the hardware decoder where
+/// `VTIsHardwareDecodeSupported` is true, otherwise its software H.264 decoder,
+/// which is the same `VtDecoder` path (and the printed line says which one it
+/// was). Only the hardware-specific part is a skip. HEVC is checked only where
+/// hardware decodes it.
 #[test]
-#[ignore = "needs a Mac with hardware decode (VideoToolbox); the macOS CI step runs it"]
+#[ignore = "needs a Mac with VideoToolbox; the macOS CI step runs it"]
 fn golden_streams_match_ffmpegs_frame_hashes() {
     if !hardware_decodes(Codec::H264) {
-        skip("no hardware H.264 decode (VTIsHardwareDecodeSupported is false)");
-        return;
+        skip(
+            "no hardware H.264 decode (VTIsHardwareDecodeSupported is false): \
+              the golden check runs on VideoToolbox's software decoder",
+        );
     }
     let goldens = golden::all();
     let h264: Vec<&golden::Golden> = goldens.iter().filter(|g| g.codec == Codec::H264).collect();
@@ -448,8 +454,10 @@ fn golden_streams_match_ffmpegs_frame_hashes() {
     for g in &h264 {
         assert_matches_ffmpeg(g, &decode_golden(&mut shared, g));
     }
+    let hardware = shared.session.as_ref().is_some_and(|s| s.hardware());
     println!(
-        "{} H.264 streams on one decoder (resolution changes): all match FFmpeg",
+        "{} H.264 streams on one decoder (resolution changes): all match FFmpeg; \
+         UsingHardwareAcceleratedVideoDecoder = {hardware}",
         h264.len()
     );
     if hardware_decodes(Codec::Hevc) {

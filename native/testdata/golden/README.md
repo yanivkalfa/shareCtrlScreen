@@ -1,7 +1,10 @@
 # Golden encoder outputs
 
 Short Annex-B streams as a host sends them, used to check every hardware
-decoder bit-exactly (`crates/platform-linux/src/codec/golden.rs`). Each
+decoder bit-exactly: Linux (`crates/platform-linux/src/codec/golden.rs`) and macOS
+VideoToolbox (`crates/platform-macos/src/decode/golden.rs`, checked by
+`decode::tests::golden_streams_match_ffmpegs_frame_hashes`). The two loaders are twins;
+keep them in step. Each
 stream comes with:
 
 * `<name>.aus` — one access unit per line: `<byte offset> <length> <keyframe 0|1>`.
@@ -33,6 +36,6 @@ ffprobe -v error -select_streams v -show_entries packet=pos,size,flags -of csv=p
   > x264-high-refs4-cqm-352x288.aus
 ```
 
-Not here yet: Windows Media Foundation (W1) and macOS VideoToolbox (M2)
+Not here yet: Windows Media Foundation (W1) and VideoToolbox *encoder* (M2)
 outputs — they belong to the cross-codec matrix (task I5). Any stream dropped
 in with its `.aus` and `.sha256` is picked up by the decoder tests.

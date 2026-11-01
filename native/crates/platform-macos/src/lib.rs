@@ -50,21 +50,31 @@ use codec_openh264::{OpenH264, WithSoftwareH264};
 use codecs::VtCodecs;
 use platform_api::unavailable::NoAutostart;
 use platform_api::{
-    Autostart, CaptureError, Clipboard, Codec, CodecFactory, DisplayInfo, InputError,
-    InputInjector, OsPermission, Paths, PermissionReport, Platform, PlatformInfo, RawDisplayHandle,
-    RawWindowHandle, ScreenCapture, SecretStore, ShortcutHook, SurfaceError, VideoSurface,
+    Autostart, CaptureError, Clipboard, Codec, CodecError, CodecFactory, DisplayInfo,
+    EncoderConfig, InputError, InputInjector, OsPermission, Paths, PermissionReport, Platform,
+    PlatformInfo, RawDisplayHandle, RawWindowHandle, ScreenCapture, SecretStore, ShortcutHook,
+    SurfaceError, VideoSurface,
 };
 
 mod clipboard;
 mod secret;
 
-/// Whether this Mac opens a hardware H.264 encoder session (a real
-/// VideoToolbox session is built and dropped, with
-/// `RequireHardwareAcceleratedVideoEncoder`). The hardware tests call it
-/// first and skip when it is false; `tests/vt_encode.rs` uses it too. Not part
-/// of the app's behaviour: the app learns the same from the codec factory.
-pub fn h264_hardware_encoder_available() -> bool {
-    vt_encoder::probe(Codec::H264)
+/// Probes for a hardware H.264 encoder: a real VideoToolbox session is built
+/// with `RequireHardwareAcceleratedVideoEncoder` and dropped. `Ok(false)` only
+/// when VideoToolbox reports no such encoder (`NoEncoder`); any other failure is
+/// `Err`, so a broken session never reads as "no hardware". The hardware tests
+/// gate on it (`tests/support/hardware.rs`, `encoder_gate`). Not part of the
+/// app's behaviour: the codec factory uses `vt_encoder::probe`.
+pub fn h264_hardware_encoder() -> Result<bool, CodecError> {
+    let cfg = EncoderConfig {
+        codec: Codec::H264,
+        ..EncoderConfig::default()
+    };
+    match vt_encoder::VtEncoder::new(cfg) {
+        Ok(_) => Ok(true),
+        Err(CodecError::NoEncoder(_)) => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 pub struct MacPlatform {

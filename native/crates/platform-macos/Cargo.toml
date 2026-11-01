@@ -198,3 +198,6 @@ libc = "0.2"
 # does. Both are already workspace dependencies (MIT OR Apache-2.0).
 sha2.workspace = true
 hex.workspace = true
+# The golden streams and their loader, shared with every other decoder's
+# matrix test, and the encoder-output shape check (task I5).
+codec-goldens = { path = "../codec-goldens" }

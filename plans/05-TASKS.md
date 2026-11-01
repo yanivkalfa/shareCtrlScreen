@@ -11,6 +11,7 @@
 | D1 loopback harness | **done** `7f91371` | `engine/tests/loopback.rs` — ~4 s, all OSes, security assertions mutation-checked. |
 | T1 CI matrix | **done** `dc47c95` | Windows / macOS / Ubuntu 22.04 + license gate on all 4 triples. **The macOS job is unverified until the branch is pushed.** |
 | T2 hardware-codec CI on macOS | **done** (Opus, Opus-reviewed; macOS job unverified until pushed) | The macOS job runs the VideoToolbox hardware tests with `--ignored --nocapture`. A skip is a printed line plus a `::warning` annotation, never a pass; strict mode (`SCT_MAC_HW_TESTS_REQUIRED`) is an opt-in repository variable, unset until a run shows the hardware on hosted runners. **Unverified:** no GitHub run yet (branch not pushed) and no Mac run. See the T2 entry. |
+| I5 cross-codec matrix | **in review** (Opus) | `crates/codec-goldens` (dev-only): one golden loader + table-driven decoder row + encoder-shape check for every crate. Media Foundation, OpenH264, NVDEC rows bit-exact on machine A; **fixed an OpenH264 decoder bug** (no picture from Main/High hosts). `mf-*` goldens **device-pending**: machine A's NVIDIA MFTs fail to open (`E_UNEXPECTED`, known quirk), so its MF shape check ran on the software encoder. VideoToolbox goldens and VA-API device-pending (checklists/I5.md). See the I5 entry. |
 | platform-macos / platform-linux | **scaffold → filling in** | Real paths (+ Linux session-type detection); lanes M and L replace the stubs in place (see rows below). Crate-level `#![cfg(target_os = …)]` is the convention; pure-logic tests run on that OS's CI job. |
 | D6 docs | **done** `c4c55d4` (Haiku, Opus-reviewed) | root README install/what-works-where + docs/FIRST-RUN.md |
 | D5 permissions modal | **done** `1f3b607` (Sonnet) | host preflight: screenCapture + inputInjection; viewer preflight only with captureShortcuts on |
@@ -527,7 +528,7 @@ to run (TCC). Use `objc2` 0.6-family crates throughout (`objc2-app-kit`,
 
 ### T1 — CI matrix  (size S) — `native-ci.yml` → `{windows-latest, macos-latest, ubuntu-22.04}`: fmt, clippy `-D warnings`, `cargo test --workspace --exclude service` (Linux/macOS) with mock features; `deny.toml [graph].targets` += `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`; `about.toml` same + allow-list parity with deny (`MIT-0`, `CDLA-Permissive-2.0`).
 ### T2 — Hardware-codec CI on macOS runners  (size S) — M2/M3 tests run on `macos-latest` (VideoToolbox needs no permission). Gate on `VTIsHardwareDecodeSupported` and skip (not fail) when absent.
-* As built (branch `task/T2`, in review; the macOS job has never run): every VideoToolbox hardware test probes first and skips with a printed line without the hardware (`tests/support/hardware.rs`). Encode probe: `h264_hardware_encoder()`, a real session with `RequireHardwareAcceleratedVideoEncoder`; only VideoToolbox's `NoEncoder` counts as "no hardware", any other error fails the test. Decode gate: `VTIsHardwareDecodeSupported`. `SCT_MAC_HW_TESTS_REQUIRED=1` turns a skip into a failure (opt-in: the macOS step passes the repository variable `vars.SCT_MAC_HW_TESTS_REQUIRED`, unset by default); the macOS step of `native-ci.yml` runs `vt_encoder::tests`, `decode::` and `tests/vt_encode` with `--ignored --nocapture`, skipping the two timing tests by name. Timing tests (`mean under 8 ms`, bitrate within 15 %) stay device-only (a loaded shared runner cannot hold a wall-clock budget). New: `decode::golden` checks VideoToolbox's H.264 (on whichever decoder it has, reported in the log) and HEVC (where hardware decodes it) NV12 output against FFmpeg's per-frame SHA-256 from `native/testdata/golden`, including one decoder across the three golden resolutions. `decode/golden.rs` duplicates `platform-linux/src/codec/golden.rs` (no shared crate). `macos-latest` is macOS 26 on arm64 (runner-images README, read 2026-11-01); whether that hosted image exposes VideoToolbox hardware is unproven (it runs inside Apple's Virtualization framework), so the first run decides whether strict mode can be switched on. **Not verified:** the CI run itself and any Mac; first real run is the owner's push of `port/multi-os`.
+* As built (branch `task/T2`, in review; the macOS job has never run): every VideoToolbox hardware test probes first and skips with a printed line without the hardware (`tests/support/hardware.rs`). Encode probe: `h264_hardware_encoder()`, a real session with `RequireHardwareAcceleratedVideoEncoder`; only VideoToolbox's `NoEncoder` counts as "no hardware", any other error fails the test. Decode gate: `VTIsHardwareDecodeSupported`. `SCT_MAC_HW_TESTS_REQUIRED=1` turns a skip into a failure (opt-in: the macOS step passes the repository variable `vars.SCT_MAC_HW_TESTS_REQUIRED`, unset by default); the macOS step of `native-ci.yml` runs `vt_encoder::tests`, `decode::` and `tests/vt_encode` with `--ignored --nocapture`, skipping the two timing tests by name. Timing tests (`mean under 8 ms`, bitrate within 15 %) stay device-only (a loaded shared runner cannot hold a wall-clock budget). New: `decode::golden` checks VideoToolbox's H.264 (on whichever decoder it has, reported in the log) and HEVC (where hardware decodes it) NV12 output against FFmpeg's per-frame SHA-256 from `native/testdata/golden`, including one decoder across the three golden resolutions. `decode/golden.rs` duplicated `platform-linux/src/codec/golden.rs`; I5 replaced both with the shared dev-only `codec-goldens` crate (the test itself is unchanged). `macos-latest` is macOS 26 on arm64 (runner-images README, read 2026-11-01); whether that hosted image exposes VideoToolbox hardware is unproven (it runs inside Apple's Virtualization framework), so the first run decides whether strict mode can be switched on. **Not verified:** the CI run itself and any Mac; first real run is the owner's push of `port/multi-os`.
 ### T3 — X11 CI job  (size S) — `Xvfb` + `LIBGL_ALWAYS_SOFTWARE=1` + `xterm` + `xdotool`: runs L2, L5 (X11), L6 (XTest + uinput with sudo), L7.
 ### T4 — Wayland CI job  (size M) — two jobs: (a) `sway --unsupported-gpu` with `WLR_BACKENDS=headless WLR_RENDERER=pixman` + `pipewire` + `wireplumber` + `xdg-desktop-portal` + `xdg-desktop-portal-wlr` under `dbus-run-session`, `portals.conf` set, `XDG_CURRENT_DESKTOP=sway` exported to the bus; runs L1 and the L5 Wayland surface (`tests/wayland_surface.rs`, which starts its own headless sway; set `SCT_WAYLAND_TESTS_REQUIRED=1` so a missing sway fails the job instead of skipping); (b) `mutter --headless --virtual-monitor 1920x1080` + `xdg-desktop-portal-gnome` for L6's libei path (copy the DeskShare `linux-wayland-e2e` recipe).
 ### T5 — Per-OS `latency_smoketest`  (size S) — generalise `engine/examples/latency_smoketest.rs` to the traits; print the §2 budget table on every OS; add `--software` flag.
@@ -543,6 +544,47 @@ to run (TCC). Use `objc2` 0.6-family crates throughout (`objc2-app-kit`,
 | I3 | Linux X11 host (Ubuntu 22.04 VM, software codec) ↔ Windows viewer; Linux Wayland GNOME 46 host (VM) with portal token across restarts; KDE 6 (token bug behaviour); Sway (view-only path) | VMs on machine A (VirtualBox/VMware Workstation, free for personal use) |
 | I4 | Hardware encode on Linux: machine B from a live USB (Intel/AMD VA-API) or your NVIDIA box in WSL2 (NVENC) | machine B / machine A |
 | I5 | Cross-codec matrix: every encoder output decodes on every decoder (golden files from T2/L3/W1/D2) | CI (golden files) |
+
+### I5 — Cross-codec matrix (in review)
+* As built: `native/crates/codec-goldens`, a dev-only pure-Rust crate (sha2 + hex,
+  already in the tree) that every codec crate takes as a dev-dependency.
+  * `golden` loads `testdata/golden` and runs `check_decoder`, the table-driven
+    row: every stream of a codec the decoder advertises, every frame's NV12 SHA-256
+    against FFmpeg's framehash, plus a resolution change on one decoder. Hashing is
+    a closure, so GPU decoders read back their own surface (MF: a D3D11 NV12 staging
+    copy; VideoToolbox: the `420v` planes).
+  * `shape` is the encoder conformance check: Annex-B, IDR first, the keyframe flag
+    on exactly the IDRs, SPS/PPS(/VPS) in front of every IDR, and **no reordering**
+    (the picture order count rises strictly between IDRs; low-delay B is accepted).
+    It runs on every committed golden and on each encoder that can run.
+  * `session` is L3's scripted host session: a forced IDR at frame 15 and a live
+    bitrate drop at frame 22.
+  * `skip` reads `SCT_CODEC_TESTS_REQUIRED`: `1`/`all` or a list of backend names.
+  * platform-linux's `golden.rs` and T2's macOS twin loader are replaced by the
+    shared crate.
+* **Bug found and fixed (production code, own commit):** the Cisco OpenH264 decoder
+  returned no picture for Main/High-profile streams, i.e. from NVENC, Media
+  Foundation and VideoToolbox hosts, because OpenH264 buffers those pictures for
+  reordering and `SoftwareDecoder` never flushed. It now flushes after each access
+  unit that gave none. That is exact because no encoder in the project reorders. A
+  regression test decodes the NVENC Main golden.
+* Matrix on machine A: Media Foundation (Microsoft software H.264 decoder), OpenH264
+  (Windows + WSL2) and NVDEC pass every golden of their codecs bit-exactly. MF and
+  OpenH264 skip HEVC (not advertised / H.264 only). Encoder shape passes for NVENC,
+  OpenH264 and MF.
+* On machine A the MF encoder shape check ran against **Microsoft's software
+  encoder**, because both NVIDIA MFTs failed to open (the owner's known quirk of
+  that machine): `hardware H264 encoder failed (windows: Catastrophic failure
+  (0x8000FFFF)) — trying the software encoder`, and the same line for Hevc. So
+  no `mf-*` golden was written. They are **device-pending**: a Windows machine
+  whose hardware MFT opens runs the ignored regenerate test, then the FFmpeg
+  hash step, and commits them once (checklists/I5.md §1).
+* Device-pending: the VideoToolbox goldens and encoder shape (`tests/vt_goldens.rs`,
+  §2) and the VA-API decode + encoder shape (§3).
+* CI: `SCT_CODEC_TESTS_REQUIRED=openh264` on windows-latest and ubuntu-22.04. The MF
+  rows probe and skip until a run proves the runner has the MFTs (§4).
+* Additive API: `codec::Encoder::is_hardware()`; `platform-windows`
+  `adapters::mf_encoder()` (crate-private). No platform-api change.
 
 ## Parallel schedule (rough, 1 person per task unless noted)
 

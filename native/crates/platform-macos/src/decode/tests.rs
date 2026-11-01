@@ -9,6 +9,7 @@
 
 use std::ptr::NonNull;
 
+use codec_goldens::golden;
 use objc2_core_foundation::{CFDictionary, CFRetained, CFString, CFType};
 use objc2_core_video::{
     kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferMetalCompatibilityKey,
@@ -19,7 +20,6 @@ use objc2_core_video::{
 use platform_api::{Codec, CodecFactory, EncoderConfig, Frame, FrameData, VideoDecoder};
 use sha2::{Digest, Sha256};
 
-use super::golden;
 use super::synth::{pattern, H264Synth};
 use super::*;
 use crate::hardware::{encoder_gate, skip};

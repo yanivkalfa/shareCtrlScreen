@@ -27,6 +27,27 @@ jobs:
       matrix:
         # ubuntu-22.04: the oldest supported Linux (glibc 2.35, WebKitGTK 4.1).
         os: [windows-latest, macos-latest, ubuntu-22.04]
+        # Cross-codec matrix (task I5, crates/codec-goldens): the codec
+        # backends each runner is known to have, so their golden-stream and
+        # encoder-shape tests fail instead of skipping when absent
+        # (SCT_CODEC_TESTS_REQUIRED, comma list of backend names).
+        # * windows-latest: OpenH264 (Cisco download; runners have network).
+        #   The Media Foundation rows (MF H.264 decoder, MF encoder shape)
+        #   run too but probe and skip: no run has yet proven the runner
+        #   image has Microsoft's H.264 MFTs (Windows Server ships them only
+        #   with the Media Foundation feature). Once a run's log shows
+        #   `matrix: media-foundation × … PASS`, make this
+        #   `openh264,media-foundation` (plans/checklists/I5.md).
+        # * ubuntu-22.04: OpenH264. No GPU, so NVENC/NVDEC print SKIP and the
+        #   VA-API decode is device-only (#[ignore]); the device-free VA-API
+        #   planner still runs every H.264 golden.
+        # * macos-latest: none here; the VideoToolbox step below (task T2)
+        #   has its own strict-mode switch.
+        include:
+          - os: windows-latest
+            codec_required: openh264
+          - os: ubuntu-22.04
+            codec_required: openh264
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -54,6 +75,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
+        env:
+          SCT_CODEC_TESTS_REQUIRED: ${{ matrix.codec_required }}
         run: cargo test --workspace
       # VideoToolbox hardware tests (plan task T2). Each test probes first and
       # skips when VideoToolbox has no hardware for it; a skip is a printed line

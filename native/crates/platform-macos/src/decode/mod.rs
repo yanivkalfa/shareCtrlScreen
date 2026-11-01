@@ -73,8 +73,6 @@ mod session;
 mod status;
 
 #[cfg(test)]
-mod golden;
-#[cfg(test)]
 mod synth;
 #[cfg(test)]
 mod tests;

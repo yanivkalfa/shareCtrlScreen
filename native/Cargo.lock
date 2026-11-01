@@ -881,10 +881,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-goldens"
+version = "2.0.0"
+dependencies = [
+ "hex",
+ "platform-api",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "codec-openh264"
 version = "2.0.0"
 dependencies = [
  "bzip2-rs",
+ "codec-goldens",
  "hex",
  "openh264",
  "openh264-sys2",
@@ -3867,13 +3877,13 @@ version = "2.0.0"
 dependencies = [
  "arboard",
  "ashpd",
+ "codec-goldens",
  "codec-openh264",
  "dirs",
  "futures-util",
  "gdkwayland-sys",
  "gdkx11",
  "gtk",
- "hex",
  "keyring-core",
  "libloading 0.8.9",
  "pipewire",
@@ -3881,7 +3891,6 @@ dependencies = [
  "pollster",
  "raw-window-handle",
  "secret-service",
- "sha2 0.10.9",
  "surface-wgpu",
  "tempfile",
  "tokio",
@@ -3904,6 +3913,7 @@ name = "platform-macos"
 version = "2.0.0"
 dependencies = [
  "block2",
+ "codec-goldens",
  "codec-openh264",
  "dirs",
  "dispatch2",
@@ -3939,6 +3949,7 @@ version = "2.0.0"
 dependencies = [
  "capture",
  "codec",
+ "codec-goldens",
  "codec-openh264",
  "dirs",
  "elevation",

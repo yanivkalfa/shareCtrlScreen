@@ -706,7 +706,9 @@ to run (TCC). Use `objc2` 0.6-family crates throughout (`objc2-app-kit`,
     Quit Cmd+Option+Esc (also with Shift), Lock Screen Cmd+Ctrl+Q. Never delivered to a
     tap at all: Touch ID / power, media and brightness keys (system-defined events below
     the tap's mask; "Lower levels of the system trap and handle some events early"), and
-    every key while Secure Input is on. Screenshots (Cmd+Shift+3/4/5) are now taken — M6
+    every key while Secure Input is on. The video view's key monitor lets Cmd+Q and the
+    `NEVER_TAKEN` chords through to macOS too (`shortcut_filter::stays_local`, tested;
+    review round 1), so neither path sends them to the remote. Screenshots (Cmd+Shift+3/4/5) are now taken — M6
     left them local; the M12 acceptance wants Cmd+Shift+4 on the host.
   * Sentinel (own injected events, `Key::own`) and the `kCGEventTapDisabledByTimeout`
     re-enable + health check are unchanged; the sentinel decision moved into the pure

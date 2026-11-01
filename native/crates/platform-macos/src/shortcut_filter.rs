@@ -40,7 +40,9 @@
 //!   video view's key monitor forwards those, and macOS acts on none of them.
 //!
 //! ## Invariants (`platform_api::ShortcutHook`)
-//! * A key is swallowed only while the video surface has the keyboard.
+//! * A key-down is taken only while the video surface has the keyboard; the
+//!   only events swallowed afterwards are the repeats and the key-up of a
+//!   key taken before focus moved (see below).
 //! * Once a key-down was forwarded, its key-up is forwarded — at the latest
 //!   when the surface loses the keyboard ([`ShortcutFilter::set_focus`]), so
 //!   the host never keeps a key down while the user works elsewhere.
@@ -65,6 +67,15 @@
 //!   modifiers, which M12 needs: Cmd+Shift+4 must never reach the host as
 //!   Cmd+4 because Shift was still queued behind it. (The same fix as the
 //!   Windows hook's synthesized Alt, `input/src/keyhook.rs`.)
+//!
+//! ## References
+//! * Cocoa Event Handling Guide, "The Path of Key Events" (key equivalents
+//!   go down the key window's views, then to the menu bar) and "How an Event
+//!   Enters a Cocoa Application" (reserved keys handled below the app):
+//!   <https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/EventOverview/EventArchitecture/EventArchitecture.html>
+//! * `NSResponder.performKeyEquivalent(_:)`:
+//!   <https://developer.apple.com/documentation/appkit/nsresponder/performkeyequivalent(_:)>
+//! * The Quartz event-tap references are in `shortcut_hook.rs`.
 
 /// `kVK_*` virtual key codes (Carbon `HIToolbox/Events.h`).
 pub(crate) mod kvk {
@@ -201,6 +212,35 @@ pub(crate) fn never_taken(code: u16, flags: u64, ch: Option<char>) -> Option<&'s
         };
         key_matches && flags & r.modifiers == r.modifiers
     })
+}
+
+/// Whether the video view's key monitor must let this key event go on to
+/// macOS instead of sending it to the remote: the escape hatches (Cmd+Q and
+/// [`NEVER_TAKEN`]), which the tap passes too. `remote_holds` = the remote
+/// already got this key's press; then its release is owed to the remote.
+///
+/// WHY the key-up rule: the up of an escape-hatch key whose press stayed
+/// local belongs to macOS as well (a lone up on the remote is meaningless);
+/// layout and modifiers may have changed since the press, so the key alone
+/// decides.
+pub(crate) fn stays_local(
+    down: bool,
+    code: u16,
+    flags: u64,
+    ch: Option<char>,
+    remote_holds: bool,
+) -> bool {
+    if remote_holds {
+        return false;
+    }
+    if down {
+        is_local_quit(code, flags, ch) || never_taken(code, flags, ch).is_some()
+    } else {
+        is_q(code, ch)
+            || NEVER_TAKEN
+                .iter()
+                .any(|r| r.key != kvk::ANSI_Q && r.key == code)
+    }
 }
 
 /// Whether the tap takes this key-down while the surface has the keyboard

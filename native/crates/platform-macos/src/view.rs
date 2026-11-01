@@ -496,8 +496,10 @@ impl VideoView {
 
     /// Install the keyboard monitor. WHY a local monitor and not
     /// `keyDown:`/`keyUp:`: AppKit routes Command chords through the menu
-    /// (`performKeyEquivalent:`, so Cmd+Q would quit us instead of reaching
-    /// the remote) and `-[NSApplication sendEvent:]` drops the key-up of any
+    /// and the web view (`performKeyEquivalent:`, so Cmd+W or Cmd+C would act
+    /// on our window instead of reaching the remote; only the escape hatches,
+    /// `shortcut_filter::stays_local`, are let through on purpose) and
+    /// `-[NSApplication sendEvent:]` drops the key-up of any
     /// key released while Command is held — the host would keep that key down.
     /// A local monitor sees every key event before `sendEvent:`.
     pub(crate) fn install_key_monitor(
@@ -551,24 +553,18 @@ impl VideoView {
             NSEventType::KeyDown | NSEventType::KeyUp => {
                 let down = event.r#type() == NSEventType::KeyDown;
                 let code = keymap::dom_code(key_code);
-                // Cmd+Q is the local escape hatch (M12): its key-down goes on
-                // to the menu bar's Quit, and its key-up too unless the remote
-                // got the press. The shortcut tap passes it on for the same
-                // reason (`shortcut_filter::is_local_quit`).
+                // The escape hatches stay with macOS (M12): Cmd+Q goes on to
+                // the menu bar's Quit, and Force Quit / Lock Screen (which the
+                // tap never claims, and AppKit may still hand to us as Apple-
+                // menu key equivalents) to the system — never to the remote.
+                // The same rule as the tap's (`shortcut_filter::stays_local`).
                 let held = code.is_some_and(|c| input.is_key_held(c));
-                if !held {
-                    let flags = event.modifierFlags().0 as u64;
-                    let ch = event
-                        .charactersIgnoringModifiers()
-                        .and_then(|s| single_char(&s.to_string()));
-                    let quit = if down {
-                        shortcut_filter::is_local_quit(key_code, flags, ch)
-                    } else {
-                        shortcut_filter::is_q(key_code, ch)
-                    };
-                    if quit {
-                        return false;
-                    }
+                let flags = event.modifierFlags().0 as u64;
+                let ch = event
+                    .charactersIgnoringModifiers()
+                    .and_then(|s| single_char(&s.to_string()));
+                if shortcut_filter::stays_local(down, key_code, flags, ch, held) {
+                    return false;
                 }
                 // Unmapped keys (Fn) are consumed too: they mean nothing
                 // locally while the remote has focus.

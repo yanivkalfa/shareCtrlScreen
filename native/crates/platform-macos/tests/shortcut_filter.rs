@@ -14,8 +14,8 @@
 mod shortcut_filter;
 
 use shortcut_filter::{
-    flag, is_local_quit, is_q, kvk, never_taken, takes, Key, KeyEvent, ShortcutFilter, Verdict,
-    NEVER_TAKEN,
+    flag, is_local_quit, is_q, kvk, never_taken, stays_local, takes, Key, KeyEvent, ShortcutFilter,
+    Verdict, NEVER_TAKEN,
 };
 
 /// Cmd held with the left key, as hardware reports it.
@@ -277,6 +277,46 @@ fn reserved_combos_are_listed_and_never_claimed() {
     assert!(h.take().is_empty());
     // Escape with Cmd alone is an ordinary Cmd chord.
     assert!(never_taken(kvk::ESCAPE, CMD_L, None).is_none());
+}
+
+#[test]
+fn the_key_monitor_lets_every_escape_hatch_through() {
+    // Key-downs: Cmd+Q, Force Quit (also with Shift), Lock Screen.
+    assert!(stays_local(true, kvk::ANSI_Q, CMD_L, Some('q'), false));
+    assert!(stays_local(true, kvk::ESCAPE, CMD_L | OPT_L, None, false));
+    assert!(stays_local(
+        true,
+        kvk::ESCAPE,
+        CMD_R | OPT_L | SHIFT_L,
+        None,
+        false
+    ));
+    assert!(stays_local(
+        true,
+        kvk::ANSI_Q,
+        CMD_L | CTRL_L,
+        Some('q'),
+        false
+    ));
+    assert!(stays_local(true, KEY_A, CMD_L | CTRL_L, Some('q'), false));
+    // Their key-ups, whatever the modifiers are by then.
+    assert!(stays_local(false, kvk::ANSI_Q, 0, Some('q'), false));
+    assert!(stays_local(false, kvk::ESCAPE, 0, None, false));
+    // Unless the remote got the press: its release is owed there.
+    assert!(!stays_local(true, kvk::ANSI_Q, CMD_L, Some('q'), true));
+    assert!(!stays_local(false, kvk::ESCAPE, 0, None, true));
+    // Everything else goes to the remote.
+    for (code, flags, ch) in [
+        (kvk::ANSI_Q, CMD_L | SHIFT_L, Some('q')),
+        (kvk::ANSI_Q, 0, Some('q')),
+        (kvk::ESCAPE, 0, None),
+        (kvk::ESCAPE, CMD_L, None),
+        (KEY_C, CMD_L, Some('c')),
+        (KEY_A, CMD_L, Some('a')),
+    ] {
+        assert!(!stays_local(true, code, flags, ch, false), "{code:#04x}");
+    }
+    assert!(!stays_local(false, KEY_C, CMD_L, Some('c'), false));
 }
 
 #[test]

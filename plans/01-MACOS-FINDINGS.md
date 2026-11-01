@@ -139,6 +139,18 @@ Deep links for the preflight UI: `x-apple.systempreferences:com.apple.preference
 | Autostart | LaunchAgent plist, `--autostart` flag preserved | `auto-launch` 0.6 |
 | Dirs | `~/Library/Application Support/ShareCtrlScreen`, logs `~/Library/Logs/ShareCtrlScreen`, `~/Downloads/ShareCtrlScreen` | `dirs` 6 |
 
+**Keychain items and signing (M8).** A Keychain item's access list is tied to the
+code signature and the bundle identifier that created it. So:
+
+* An ad-hoc (`"-"`) build has no stable identity: macOS prompts for Keychain access
+  on every rebuild, and each saved login must be re-approved.
+* Rotating the self-signed certificate (decision 9) re-prompts every saved login,
+  the same as the TCC grant in §8.
+* The bundle identifier must stay `dev.netameta.sharectrl`. The service name is a code
+  constant (`secret.rs`), so a new bundle identifier does not rename the items, but the
+  new app is a different identity to their access list and every saved login is lost
+  to a re-prompt.
+
 ## 7. The video surface (see 04 §4)
 
 `WebviewWindow::ns_view()` returns the window's content `NSView` (`tauri-2.11.5

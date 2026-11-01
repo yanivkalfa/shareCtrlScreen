@@ -19,8 +19,9 @@
 //!
 //! Limits: the item is readable only while the login keychain is unlocked, so an
 //! unattended Mac that has logged out or rebooted cannot auto-login until the
-//! user unlocks it. Superseded items (a host saved again) are not deleted, because
-//! [`SecretStore`] has no `forget` operation.
+//! user unlocks it. Superseded items (a host saved again) are not deleted yet:
+//! `forget` is planned on [`SecretStore`]. When it lands it is `is_key_id`, then
+//! `entry`, then `delete_credential`, with `NoEntry` treated as success.
 //!
 //! ## References
 //! * Apple, Keychain Services: <https://developer.apple.com/documentation/security/keychain-services>
@@ -141,6 +142,13 @@ mod tests {
         assert!(is_key_id(&sealed));
         assert!(!sealed.contains("correct"));
         assert_eq!(KeychainSecretStore.open(&sealed).as_deref(), Some(secret));
+        // Read the item straight from the Keychain, so an in-memory stand-in for
+        // the store could not pass this test.
+        let stored = keyring::Entry::new(SERVICE, &sealed)
+            .expect("Keychain entry")
+            .get_password()
+            .expect("Keychain item");
+        assert_eq!(stored, secret);
         forget(&sealed);
     }
 

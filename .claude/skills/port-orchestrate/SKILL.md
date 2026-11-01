@@ -94,7 +94,9 @@ worktree of C:\Yanivs\shareCtrlScreen. The harness creates worktrees from
 `main`, NOT from the port branch, so FIRST run exactly:
 `git checkout -B task/<ID> port/multi-os` and confirm `plans/` and
 `native/crates/platform-api` exist. Commit to that branch only. Never push,
-never merge, never touch other branches.
+never merge, never touch other branches. Never use `SendMessage` or
+`ListAgents` toward other Claude sessions: only the orchestrator talks to peer
+sessions, and the completion ping is the orchestrator's alone.
 
 Read, in this order, before writing code:
 1. plans/00-DECISIONS.md — locked decisions; they override everything.
@@ -247,6 +249,11 @@ Builds come from CI; pushing `port/multi-os` needs the owner's OK — ask once
 per session. The macOS CI job is unverified until the first push.
 
 ## 8. Reporting
+
+Completion ping: when EVERY wave is merged and swept, the orchestrator (never a
+builder or reviewer) sends `SendMessage` to the peer session recorded in the
+ledger with the text "finished building, everything is done, please resume
+working". Not after a wave, only at the very end.
 
 After each merge batch, one message: status delta per task; what was rejected
 and why; what is device-pending and what the tester must do; decisions needed

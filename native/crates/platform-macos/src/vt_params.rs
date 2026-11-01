@@ -187,67 +187,101 @@ fn h264_level_at(
 
 // ---- result codes ----------------------------------------------------------
 
+// The framework's result codes keep their C names (`kVT…Err`), which Rust
+// may not match on as lower-case constants; they are looked up in a table
+// and compared by value instead.
+
+const NO_ENCODER_ADVICE: &str = "this Mac has no hardware encoder for this codec at this \
+     size; the software H.264 encoder is used instead when it is turned on (Settings → \
+     Advanced)";
+const RESET_ADVICE: &str = "macOS reset the hardware encoder (sleep, display or GPU \
+     change); it is restarted automatically — if this keeps happening, restart the Mac";
+const TRANSFER_ADVICE: &str = "the captured picture cannot be converted for the encoder; \
+     report this with your macOS version and display setup";
+const PROPERTY_ADVICE: &str = "this macOS version does not support the setting";
+
+/// `(code, VTErrors.h name, what the user can do)`.
+const STATUSES: &[(i32, &str, &str)] = &[
+    (
+        kVTPropertyNotSupportedErr,
+        "kVTPropertyNotSupportedErr",
+        PROPERTY_ADVICE,
+    ),
+    (kVTPropertyReadOnlyErr, "kVTPropertyReadOnlyErr", PROPERTY_ADVICE),
+    (
+        kVTParameterErr,
+        "kVTParameterErr",
+        "VideoToolbox refused the encoder settings for this size or frame rate; try a \
+         smaller session window or a lower display resolution",
+    ),
+    (kVTInvalidSessionErr, "kVTInvalidSessionErr", RESET_ADVICE),
+    (
+        kVTAllocationFailedErr,
+        "kVTAllocationFailedErr",
+        "macOS ran out of memory for video buffers; close apps that record or stream the \
+         screen, or lower the display resolution",
+    ),
+    (
+        kVTPixelTransferNotSupportedErr,
+        "kVTPixelTransferNotSupportedErr",
+        TRANSFER_ADVICE,
+    ),
+    (
+        kVTPixelTransferNotPermittedErr,
+        "kVTPixelTransferNotPermittedErr",
+        TRANSFER_ADVICE,
+    ),
+    (
+        kVTCouldNotCreateInstanceErr,
+        "kVTCouldNotCreateInstanceErr",
+        NO_ENCODER_ADVICE,
+    ),
+    (
+        kVTCouldNotFindVideoEncoderErr,
+        "kVTCouldNotFindVideoEncoderErr",
+        NO_ENCODER_ADVICE,
+    ),
+    (
+        kVTVideoEncoderMalfunctionErr,
+        "kVTVideoEncoderMalfunctionErr",
+        RESET_ADVICE,
+    ),
+    (
+        kVTVideoEncoderNotAvailableNowErr,
+        "kVTVideoEncoderNotAvailableNowErr",
+        "the hardware encoder is busy (another app may be recording or streaming the \
+         screen) or the Mac is waking from sleep; it is retried automatically",
+    ),
+    (
+        kVTVideoEncoderAuthorizationErr,
+        "kVTVideoEncoderAuthorizationErr",
+        "macOS refused this app access to the video encoder; reinstall the app from the \
+         official download",
+    ),
+    (kVTSessionMalfunctionErr, "kVTSessionMalfunctionErr", RESET_ADVICE),
+    (
+        kVTVideoEncoderNeedsRosettaErr,
+        "kVTVideoEncoderNeedsRosettaErr",
+        "the encoder needs Rosetta 2; install it (softwareupdate --install-rosetta) or use \
+         the Apple-silicon build",
+    ),
+];
+
+fn lookup(status: i32) -> Option<&'static (i32, &'static str, &'static str)> {
+    STATUSES.iter().find(|(code, ..)| *code == status)
+}
+
 /// The `VTErrors.h` name of a result code, for logs and bug reports.
 pub(crate) fn status_name(status: i32) -> &'static str {
-    match status {
-        kVTPropertyNotSupportedErr => "kVTPropertyNotSupportedErr",
-        kVTPropertyReadOnlyErr => "kVTPropertyReadOnlyErr",
-        kVTParameterErr => "kVTParameterErr",
-        kVTInvalidSessionErr => "kVTInvalidSessionErr",
-        kVTAllocationFailedErr => "kVTAllocationFailedErr",
-        kVTPixelTransferNotSupportedErr => "kVTPixelTransferNotSupportedErr",
-        kVTPixelTransferNotPermittedErr => "kVTPixelTransferNotPermittedErr",
-        kVTCouldNotCreateInstanceErr => "kVTCouldNotCreateInstanceErr",
-        kVTCouldNotFindVideoEncoderErr => "kVTCouldNotFindVideoEncoderErr",
-        kVTVideoEncoderMalfunctionErr => "kVTVideoEncoderMalfunctionErr",
-        kVTVideoEncoderNotAvailableNowErr => "kVTVideoEncoderNotAvailableNowErr",
-        kVTVideoEncoderAuthorizationErr => "kVTVideoEncoderAuthorizationErr",
-        kVTSessionMalfunctionErr => "kVTSessionMalfunctionErr",
-        kVTVideoEncoderNeedsRosettaErr => "kVTVideoEncoderNeedsRosettaErr",
-        _ => "unknown VideoToolbox error",
-    }
+    lookup(status).map_or("unknown VideoToolbox error", |&(_, name, _)| name)
 }
 
 /// What the user can do about a result code.
 fn status_advice(status: i32) -> &'static str {
-    match status {
-        kVTCouldNotFindVideoEncoderErr | kVTCouldNotCreateInstanceErr => {
-            "this Mac has no hardware encoder for this codec at this size; the software \
-             H.264 encoder is used instead when it is turned on (Settings → Advanced)"
-        }
-        kVTVideoEncoderNotAvailableNowErr => {
-            "the hardware encoder is busy (another app may be recording or streaming the \
-             screen) or the Mac is waking from sleep; it is retried automatically"
-        }
-        kVTInvalidSessionErr | kVTSessionMalfunctionErr | kVTVideoEncoderMalfunctionErr => {
-            "macOS reset the hardware encoder (sleep, display or GPU change); it is \
-             restarted automatically — if this keeps happening, restart the Mac"
-        }
-        kVTAllocationFailedErr => {
-            "macOS ran out of memory for video buffers; close apps that record or stream \
-             the screen, or lower the display resolution"
-        }
-        kVTParameterErr => {
-            "VideoToolbox refused the encoder settings for this size or frame rate; try a \
-             smaller session window or a lower display resolution"
-        }
-        kVTPixelTransferNotSupportedErr | kVTPixelTransferNotPermittedErr => {
-            "the captured picture cannot be converted for the encoder; report this with \
-             your macOS version and display setup"
-        }
-        kVTVideoEncoderAuthorizationErr => {
-            "macOS refused this app access to the video encoder; reinstall the app from \
-             the official download"
-        }
-        kVTVideoEncoderNeedsRosettaErr => {
-            "the encoder needs Rosetta 2; install it (softwareupdate --install-rosetta) or \
-             use the Apple-silicon build"
-        }
-        kVTPropertyNotSupportedErr | kVTPropertyReadOnlyErr => {
-            "this macOS version does not support the setting"
-        }
-        _ => "unexpected VideoToolbox failure; reconnect, and report the code if it repeats",
-    }
+    lookup(status).map_or(
+        "unexpected VideoToolbox failure; reconnect, and report the code if it repeats",
+        |&(_, _, advice)| advice,
+    )
 }
 
 /// `"<what> failed: <name> (<code>) — <advice>"`.
@@ -262,13 +296,13 @@ pub(crate) fn describe(what: &str, status: i32) -> String {
 /// The session is gone (sleep, GPU change, encoder crash): drop it and build
 /// a new one rather than failing every following frame.
 pub(crate) fn session_lost(status: i32) -> bool {
-    matches!(
-        status,
-        kVTInvalidSessionErr
-            | kVTSessionMalfunctionErr
-            | kVTVideoEncoderMalfunctionErr
-            | kVTVideoEncoderNotAvailableNowErr
-    )
+    [
+        kVTInvalidSessionErr,
+        kVTSessionMalfunctionErr,
+        kVTVideoEncoderMalfunctionErr,
+        kVTVideoEncoderNotAvailableNowErr,
+    ]
+    .contains(&status)
 }
 
 /// The low-latency session was refused, so the classic one is worth trying:
@@ -276,17 +310,14 @@ pub(crate) fn session_lost(status: i32) -> bool {
 /// §4); `kVTCouldNotFindVideoEncoderErr` means no encoder with low-latency
 /// support, which does not rule out a plain hardware one.
 pub(crate) fn low_latency_refused(status: i32) -> bool {
-    matches!(status, kVTParameterErr | kVTCouldNotFindVideoEncoderErr)
+    [kVTParameterErr, kVTCouldNotFindVideoEncoderErr].contains(&status)
 }
 
 /// No hardware encoder for this codec (as opposed to a failure of one that
 /// exists): the factory reports [`CodecError::NoEncoder`] so the software
 /// fallback takes over.
 pub(crate) fn no_encoder(status: i32) -> bool {
-    matches!(
-        status,
-        kVTCouldNotFindVideoEncoderErr | kVTCouldNotCreateInstanceErr
-    )
+    [kVTCouldNotFindVideoEncoderErr, kVTCouldNotCreateInstanceErr].contains(&status)
 }
 
 #[cfg(test)]

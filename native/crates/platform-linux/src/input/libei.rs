@@ -75,7 +75,7 @@ pub(super) struct Libei {
 impl Libei {
     /// Start the background connection; returns at once.
     pub(super) fn start(state_dir: &Path) -> Result<Self, String> {
-        let rt = crate::permissions::runtime()
+        let rt = crate::portal_session::runtime()
             .ok_or("RemoteDesktop portal: the portal runtime could not start (see app.log)")?;
         let session = portal_shared::acquire(state_dir);
         let (tx, rx) = unbounded_channel();

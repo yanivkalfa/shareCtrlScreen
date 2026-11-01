@@ -2,7 +2,8 @@
 
 This is the design every task in [05-TASKS.md](05-TASKS.md) builds toward. It keeps the
 Windows product exactly as it behaves today and adds macOS and Linux as *backends* behind
-one set of traits. Nothing here changes the wire protocol, the signaling server, or the
+one set of traits. Nothing here changes the wire protocol (except one additive optional
+field, `connect-response.os`, §6), the signaling server, or the
 Tauri UI contract (commands/events) — those were verified portable by the code sweep
 ([07-CODEBASE-SEAMS.md](07-CODEBASE-SEAMS.md)).
 
@@ -236,6 +237,17 @@ USB HID usage ↔ evdev ↔ XKB ↔ Windows scancode ↔ macOS `kVK_*` ↔ DOM c
   identity the protocol wants.
 * The viewer side needs the inverse (native → DOM) for its captured keys; the hook path
   (`keyhook.rs`) already emits DOM codes directly.
+
+**Modifier translation (D8).** Codes stay physical on the wire; the *viewer* rewrites
+modifiers for the host's OS before sending (`engine/src/modifiers.rs`): Mac → Windows/Linux
+swaps Cmd ↔ Ctrl and turns Cmd+Tab / Cmd+\` into Alt+Tab / Alt+\`; Windows/Linux → Mac swaps
+Ctrl ↔ Cmd (Win/Super becomes Control) and turns Alt+Tab into Cmd+Tab; Ctrl+Tab is kept in
+both directions; every other pair is identity. Releases use the code that was sent, so held
+keys survive a toggle flip. Setting `translateModifiers` (default on). The host learns
+nothing new and injects what arrives. **The one protocol addition:** `connect-response`
+carries an optional `os` (`"windows"` | `"macos"` | `"linux"`), set by the host from
+`PlatformInfo::name`. Absent (older hosts) or unknown → the viewer forwards keys literally.
+The signaling server relays it opaquely, like `codec`.
 
 ## 7. Threads, runtimes, and ownership (unchanged shape)
 

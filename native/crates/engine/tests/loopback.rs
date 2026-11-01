@@ -135,8 +135,17 @@ fn temp_root(name: &str) -> PathBuf {
 }
 
 fn start_peer(name: &str, relay: &str) -> Peer {
+    start_peer_on(name, relay, "mock")
+}
+
+/// A peer whose mock platform reports `os` as its [`PlatformInfo::name`].
+///
+/// [`PlatformInfo::name`]: platform_api::PlatformInfo::name
+fn start_peer_on(name: &str, relay: &str, os: &'static str) -> Peer {
     let root = temp_root(name);
-    let platform = Arc::new(MockPlatform::new(&root));
+    let mut platform = MockPlatform::new(&root);
+    platform.os_name = os;
+    let platform = Arc::new(platform);
     // Seed the config before the engine loads it: our relay, no public STUN.
     let cfg = Config {
         server_url: relay.to_string(),
@@ -406,4 +415,191 @@ async fn unsolicited_responses_and_offers_are_ignored() {
     assert_eq!(victim.engine.role(), Role::Idle);
     assert!(!victim.platform.surface.state().visible);
     assert!(victim.platform.surface.state().presented.is_empty());
+}
+
+// ---- modifier translation for the host's OS (D8) --------------------------------
+
+/// The key events in `msgs` as "+Code" (down) / "-Code" (up).
+fn key_log(msgs: &[InputMsg]) -> Vec<String> {
+    msgs.iter()
+        .filter_map(|m| match m {
+            InputMsg::KeyDown { code } => Some(format!("+{code}")),
+            InputMsg::KeyUp { code } => Some(format!("-{code}")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A controlling session between a viewer reporting `viewer_os` and a host
+/// reporting `host_os`, with input proven to flow end to end. `tag` keeps the
+/// peers' temp dirs apart from those of tests running in parallel.
+async fn controlled_session(
+    tag: &str,
+    relay: &str,
+    viewer_os: &'static str,
+    host_os: &'static str,
+) -> (Peer, Peer) {
+    let host = start_peer_on(&format!("{tag}-host"), relay, host_os);
+    let viewer = start_peer_on(&format!("{tag}-viewer"), relay, viewer_os);
+    let t = Duration::from_secs(15);
+    eventually("both registered", t, || {
+        host.engine.server_connected() && viewer.engine.server_connected()
+    })
+    .await;
+    viewer.engine.connect_to(host.uuid.clone());
+    eventually("video presented", t, || {
+        matches!(
+            host.engine.role(),
+            Role::Host {
+                permission: Permission::Control,
+                ..
+            }
+        ) && !viewer.platform.surface.state().presented.is_empty()
+    })
+    .await;
+    // A plain key is never translated: once it arrives, the ctl channel is up.
+    press(&viewer, &host, &["+KeyA", "-KeyA"], &["+KeyA", "-KeyA"]).await;
+    (viewer, host)
+}
+
+/// Press `keys` on the viewer's surface and assert the host injected exactly
+/// `expect` for them, in order.
+async fn press(viewer: &Peer, host: &Peer, keys: &[&'static str], expect: &[&str]) {
+    let before = injected(host).len();
+    for &k in keys {
+        let (down, code) = match k.split_at(1) {
+            ("+", c) => (true, c),
+            ("-", c) => (false, c),
+            _ => panic!("bad test key {k}"),
+        };
+        assert!(viewer
+            .platform
+            .surface
+            .user_input(VideoInput::Key { code, down }));
+    }
+    let what = format!("{keys:?} injected as {expect:?}");
+    eventually(&what, Duration::from_secs(15), || {
+        key_log(&injected(host)[before..]).len() >= expect.len()
+    })
+    .await;
+    // Anything extra (a stray release, a doubled press) arrives within this.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(key_log(&injected(host)[before..]), expect, "for {keys:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mac_viewer_keys_mean_the_same_on_a_windows_host() {
+    let relay = start_relay().await;
+    let (viewer, host) = controlled_session("mac-win", &relay, "macos", "windows").await;
+
+    // Cmd+C is Copy: Ctrl+C on Windows.
+    press(
+        &viewer,
+        &host,
+        &["+MetaLeft", "+KeyC", "-KeyC", "-MetaLeft"],
+        &["+ControlLeft", "+KeyC", "-KeyC", "-ControlLeft"],
+    )
+    .await;
+    // Cmd+Tab is the app switcher: Alt+Tab.
+    press(
+        &viewer,
+        &host,
+        &["+MetaLeft", "+Tab", "-Tab", "-MetaLeft"],
+        &[
+            "+ControlLeft",
+            "+AltLeft",
+            "-ControlLeft",
+            "+Tab",
+            "-Tab",
+            "-AltLeft",
+        ],
+    )
+    .await;
+
+    // A Cmd held while the setting is switched off is released as the Ctrl it
+    // was sent as; the next Cmd is literal.
+    press(&viewer, &host, &["+MetaLeft"], &["+ControlLeft"]).await;
+    viewer
+        .engine
+        .update_config(|c| c.translate_modifiers = false);
+    press(&viewer, &host, &["-MetaLeft"], &["-ControlLeft"]).await;
+    press(
+        &viewer,
+        &host,
+        &["+MetaLeft", "+KeyC", "-KeyC", "-MetaLeft"],
+        &["+MetaLeft", "+KeyC", "-KeyC", "-MetaLeft"],
+    )
+    .await;
+    // And back on: translated again, and nothing is left held on the host.
+    viewer
+        .engine
+        .update_config(|c| c.translate_modifiers = true);
+    press(
+        &viewer,
+        &host,
+        &["+MetaLeft", "+KeyV", "-KeyV", "-MetaLeft"],
+        &["+ControlLeft", "+KeyV", "-KeyV", "-ControlLeft"],
+    )
+    .await;
+    assert!(host
+        .platform
+        .injector
+        .lock()
+        .unwrap()
+        .held_keys()
+        .is_empty());
+    viewer.engine.end_session();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn windows_viewer_ctrl_c_is_cmd_c_on_a_mac_host() {
+    let relay = start_relay().await;
+    let (viewer, host) = controlled_session("win-mac", &relay, "windows", "macos").await;
+    press(
+        &viewer,
+        &host,
+        &["+ControlLeft", "+KeyC", "-KeyC", "-ControlLeft"],
+        &["+MetaLeft", "+KeyC", "-KeyC", "-MetaLeft"],
+    )
+    .await;
+    press(
+        &viewer,
+        &host,
+        &["+AltLeft", "+Tab", "-Tab", "-AltLeft"],
+        &[
+            "+AltLeft",
+            "+MetaLeft",
+            "-AltLeft",
+            "+Tab",
+            "-Tab",
+            "-MetaLeft",
+        ],
+    )
+    .await;
+    viewer.engine.end_session();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_os_and_linux_windows_pairs_are_untouched() {
+    let literal = [
+        "+MetaLeft",
+        "+KeyC",
+        "-KeyC",
+        "-MetaLeft",
+        "+ControlLeft",
+        "+Tab",
+        "-Tab",
+        "-ControlLeft",
+    ];
+    let relay = start_relay().await;
+    for (viewer_os, host_os) in [("macos", "macos"), ("linux-x11", "windows")] {
+        let tag = format!("{viewer_os}-{host_os}");
+        let (viewer, host) = controlled_session(&tag, &relay, viewer_os, host_os).await;
+        press(&viewer, &host, &literal, &literal).await;
+        viewer.engine.end_session();
+        eventually("both idle", Duration::from_secs(15), || {
+            host.engine.role() == Role::Idle && viewer.engine.role() == Role::Idle
+        })
+        .await;
+    }
 }

@@ -208,6 +208,7 @@ function openSettings() {
   $('set-paste-dropped').checked = config.pasteDroppedFiles !== false;
   $('set-start-with-windows').checked = !!config.startWithWindows;
   $('set-openh264').checked = config.useOpenH264 !== false;
+  $('set-translate-modifiers').checked = config.translateModifiers !== false;
   $('openh264-license').classList.add('hidden');
   refreshOpenH264();
   const saved = config.savedLoginCount || 0;
@@ -240,6 +241,7 @@ async function saveSettings() {
     pasteDroppedFiles: $('set-paste-dropped').checked,
     startWithWindows: $('set-start-with-windows').checked,
     useOpenH264: $('set-openh264').checked,
+    translateModifiers: $('set-translate-modifiers').checked,
     clearSavedLogins: $('set-clear-logins').checked
   };
 

@@ -41,14 +41,14 @@
 | advisories | **clean** `e92735f` | tokio → 1.54.1; `cargo deny check` passes on all four triples |
 | M2 VideoToolbox encode | **done** `096a90f` (Opus, Opus-reviewed; type-checked for aarch64-apple-darwin, device-pending) | H.264 + HEVC, hardware only (OpenH264 fallback via `WithSoftwareH264`). Low-latency rate control first (Apple: High profiles only → H.264 Constrained High, auto level); classic Main session with L3's level rule on `-12902`/`-12908`. Burst cap = WebRTC's 1.5 × target over 1 s (a one-frame hard cap would drop keyframes); max QP 32; live bitrate; sticky forced keyframes; lost sessions rebuilt with backoff. **Acceptance device-pending** (checklists/M2.md): `tests/vt_encode.rs` is all `#[ignore]` and CI's `cargo test --workspace` runs none of it; the GitHub macOS-runner step is T2's (`native-ci.yml`, in review) |
 | M3 VideoToolbox decoder | **done** `a90ddfb` (Opus, Opus-reviewed; type-checked for aarch64-apple-darwin, device-pending) | H.264/HEVC/AV1 → IOSurface `420v` `CvPixelBufferFrame`; format changes keep or rebuild the session; synthetic I_PCM streams test it bit-exact on CI; encode→decode PSNR test and the golden-stream hash test run in T2's macOS CI step (`--ignored`, skip without hardware). **Device-pending** (checklists/M3.md) |
-| M6 shortcut tap | **done** (Opus) | session `CGEventTap` on the hook thread; Cmd+Tab/Cmd+\`/Cmd+Space/Ctrl+arrows while the video view has the keyboard (focus published by the view into `SurfaceState::key_focus`); Cmd+Q left to the view's key monitor; macOS `input_monitoring` now needs Input Monitoring **and** Accessibility. **Device-pending** (checklists/M6.md); the Cmd+Tab acceptance is **blocked** on the owner's host-modifier-mapping decision |
+| M6 shortcut tap | **done** (Opus) | session `CGEventTap` on the hook thread; Cmd+Tab/Cmd+\`/Cmd+Space/Ctrl+arrows while the video view has the keyboard (focus published by the view into `SurfaceState::key_focus`); Cmd+Q left to the view's key monitor; macOS `input_monitoring` now needs Input Monitoring **and** Accessibility. **Device-pending** (checklists/M6.md); the Cmd+Tab acceptance (Meta+Tab translated to Alt+Tab) depends on D8 (done; I2 device pass pending) |
 | L2 X11 capture | **done** (Opus) | `platform_linux::X11Capture`: Damage `NonEmpty` → `DamageSubtract`/`FetchRegion` dirty rects (≤ 16, disjoint), MIT-SHM 1.2 segment read via its fd (core `GetImage` fallback), cursor out of band (`QueryPointer` + XFixes), RandR monitors as `x11:<name>` ids in `Platform::displays()`, refuses Xwayland; abstract-socket connect fallback (`x11_connect`). Xvfb/Xephyr tests in `tests/x11_capture.rs`. **Device-pending** (checklists/L2.md) |
 | L7 shortcut capture | **done** `078793c` (Opus, Opus-reviewed) | XI2 keyboard grab (X11, deviation from `XGrabKeyboard` recorded on the card) + shortcuts inhibitor (Wayland); Xvfb acceptance green. **Device-pending** (checklists/L7.md) |
 | L4 VA-API + NVDEC decode | **done** (Opus) | in-tree H.264 header parser + reference model (POC, MMCO, LTR, list modification, frame-num gaps) for stateless VA-API VLD; NVDEC through the driver parser (H.264/HEVC per caps; AV1 built but not advertised until the device check, `ADVERTISE_AV1_DECODE`); CPU NV12 out; golden streams + FFmpeg hashes in `native/testdata/golden`. NVDEC bit-exact vs FFmpeg on the GTX 1080 Ti; **VA-API device-pending** (checklists/L4.md). MF (W1) and macOS (M2) goldens → I5 |
 | W3 keymap switch | **done** `e2d6b1c` (Sonnet, Opus-reviewed) | `input::scancode` is an adapter over the generated keymap; NumLock is E0 45 (plain 45 is Pause). Device check: NumLock LED toggles, Pause does nothing |
 | W2 software codec selection | **done** (Sonnet, Opus-reviewed) | H.264 policy on Windows: hardware → MF software decoder → OpenH264 (only while `useOpenH264` is on); `h264_problem()` gives an actionable report when Media Foundation has no H.264 MFTs (N editions without the Media Feature Pack fail at launch — documented). Machine-B check: ignored test + log line "no hardware H264 decoder — using software decode" |
 | D7 release pipeline | **done** `448df49` (Opus, Opus-reviewed) | tag-triggered `release.yml` → reusable `build-assets.yml` → `scripts/release-assets.sh` (one recipe); NSIS/DMG/AppImage/deb/rpm, SHA256SUMS, per-OS third-party notices generated and attached (never committed), version read from cargo metadata, actions pinned to SHAs; macOS: certificate required when the secrets exist, ad-hoc only without them. macOS leg + AppImage verified only on GitHub |
-| D8 modifier translation | **in progress** (Opus) | viewer-side Cmd/Ctrl swap + Cmd+Tab→Alt+Tab per host OS, default-on toggle in Settings → Advanced, loopback-tested; closes M6's blocked Cmd+Tab line (owner decision 2026-11-01) |
+| D8 modifier translation | **done** (Opus, Opus-reviewed; I2 device pass pending) | viewer-side `KeyTranslator` (`engine/src/modifiers.rs`): Cmd ↔ Ctrl swap and Cmd+Tab→Alt+Tab (Mac → PC), Ctrl ↔ Cmd and Alt+Tab→Cmd+Tab (PC → Mac), sent-code tracking; host OS via new optional `connect-response.os`; `translateModifiers` toggle (default on) in Settings → Advanced; unit + loopback-tested. **Device-pending** (I2 Mac↔Windows); closes M6's blocked Cmd+Tab line |
 | T4 Wayland CI | **done** (Haiku, Opus-reviewed; jobs unverified until pushed; GNOME portal tests are device-pass items) | `native-ci.yml` jobs `wayland-sway` (ubuntu-24.04: sway + xdg-desktop-portal-wlr + pipewire + wireplumber; runs L5 `wayland_surface`, L1 `portal_capture --ignored`, and L6 `input::tests` minus uinput and `xtest_*`) and `wayland-gnome` (ubuntu-24.04: mutter 46 + xdg-desktop-portal-gnome; proves the stack, runs no test: the consent dialog has no headless pre-authorization, so the libei and GNOME portal-capture tests are device-pass items). Scripts in `.github/wayland/`. Local (lane, WSL): `wayland_surface` PASS (T4-02); `input::tests` wlroots and EIS pass, uinput fails under REQUIRED as designed (T4-03). Owner verification after the push: see the T4 card |
 | L5 video surface | **done** (Opus, Opus-reviewed; device-pending per checklists/L5.md) | X11: child window of the GTK toplevel on our own x11rb connection, XShape reveal clip, XDND drops via `XdndProxy`, Expose → redraw of the last frame. Wayland: the spike's area+video subsurface tree on GDK's connection (re-attached when GDK re-creates the toplevel surface), `wp_viewporter` crop + fractional scale, drops through GDK's own data device (sink window); decision-#3 separate window when there is no `wp_viewporter` or `SHARECTRL_VIDEO_WINDOW=separate`. Keys from the GTK toplevel on both (keymap: XKB − 8 = evdev). One wgpu presenter (Vulkan, GL fallback) over `surface-wgpu`. Headless tests: `tests/x11_surface.rs` (Xvfb), `tests/wayland_surface.rs` (headless sway). **Device-pending** (checklists/L5.md) |
 | L1 Wayland capture | **done** (Opus, Opus-reviewed) | `portal_capture/`: portal ScreenCast (handshake shared with L12 in `portal_session.rs`, token scope kept: a combined token reopens a combined session) + pipewire-rs 0.10 stream thread, shared-memory BGRx/BGRA first (no modifiers → no DMA-BUF; L1b), cursor + damage metadata, pause/resize → `Lost` → resume; a stream-level failure → rebuild from the token on a background thread (reinit never blocks the host thread on a dialog); "Stop sharing" in the desktop indicator, a declined dialog or an unanswered one (120 s) end the hosted session (terminal, AnyDesk behaviour). The 120 s dialog wait on the host media thread happens only in the first `create_capture`. Monitor chosen in the portal dialog (Wayland `display` ids → `NoOutput`). Build needs `libpipewire-0.3-dev libspa-0.2-dev libclang-dev`. **Device-pending** (checklists/L1.md); acceptance test `tests/portal_capture.rs` (ignored) for T4. **Note for L6:** L6 layers a shared session slot over `portal_session::start(scope, previous, bound, abandon)` and extends `Granted` with the RemoteDesktop proxy; today the capture's `watch()` owns `granted.session` and closes it when the capture drops it. Once shared, that ownership moves into L6's slot, so only the last holder (capture or injector) closes the session. **Done in L6:** `portal_shared.rs` holds the combined session; the capture joins it (`Held::Shared`) when its token is combined, remote control already holds it, or remote control would use the portal, and owns only screen-only sessions itself |
@@ -298,6 +298,20 @@ to run (TCC). Use `objc2` 0.6-family crates throughout (`objc2-app-kit`,
 * Acceptance (CI with headless `sway` + `xdg-desktop-portal-wlr` + `pipewire`, see T4):
   capture 100 frames of a test pattern window; restore token round-trip skips the dialog on
   the second run (`-wlr` supports it); GNOME VM manual check.
+* As built: proven locally against the PipeWire 0.3.48 headers (Ubuntu 22.04); CI proof is
+  `bundle / linux` on the next push. Inline SPA helpers reimplemented, `flags` gated (task
+  L1-fix). The breakage was in pipewire-rs's `libspa`
+  0.10.1 itself, not in our code. Every upstream release uses `spa_meta_first` and
+  `spa_meta_region_is_valid`, which are macros before PipeWire 0.3.59 (commits 90c955c2,
+  671a7102), so bindgen has nothing to bind. It also uses `spa_video_info_raw.flags` and
+  the `uint64_t` modifier, both from 0.3.65 (commit c61b9a09). Upstream effectively needs
+  0.3.65. The fix vendors libspa 0.10.1 at `native/vendor/libspa` (MIT, `[patch.crates-io]`,
+  excluded from the workspace) with three patches. The helpers are rewritten in Rust; the
+  damage bounds check is one region wide. `VideoInfoRaw::new` is built without naming
+  `flags`, the `flags` accessors sit behind the crate's `v0_3_65` feature, and the modifier
+  is cast for either signedness. `stream.rs` tests cover damage iteration and the
+  raw-format parse. Local proof: the jammy 0.3.48 `-dev` headers through the lane
+  (L1-fix-01).
 
 ### L2 — X11 capture: XShm + XDamage  (size M; runs in WSL under Xvfb and in CI)
 * `x11rb` with `shm`,`damage`,`xfixes`,`randr`; dirty rects from Damage; `GpuFrame::Cpu(Bgra8)`;
@@ -582,6 +596,62 @@ to run (TCC). Use `objc2` 0.6-family crates throughout (`objc2-app-kit`,
 * Owner decision record: option 1 of three (1 = this task; 2 = amend M6 to "delivered as
   Meta+Tab"; 3 = 2 now and 1 later). M6's acceptance line now reads "delivered as Meta+Tab;
   translated to Alt+Tab by D8".
+* **As built (done, Opus-reviewed; I2 device pass pending):**
+  * `engine/src/modifiers.rs`: `OsFamily` + a pure mapping keyed by (viewer OS, host OS,
+    setting) + `KeyTranslator`. One translator per viewer session, behind a mutex, shared
+    by the surface input thread and the shortcut-hook forwarder, so M6/L7/W-lane captured
+    keys and normal keys go through the same held-key state. It emits while holding the
+    lock, so the host gets events in the order the translator decided them.
+  * Mapping: both directions swap `MetaLeft/Right` ↔ `ControlLeft/Right`. Mac → PC chords:
+    Cmd+Tab and Cmd+\` → **AltLeft**+Tab / +\` for either Cmd key (a right Alt is AltGr
+    on many layouts, and AltGr+Tab does not switch apps). PC → Mac: Alt+Tab → Cmd(Left)+Tab.
+    Shift passes through, so Cmd+Shift+Tab → Alt+Shift+Tab. **Decision, Win/Super → Mac
+    Control:** Ctrl already produces Cmd. Leaving Win as Meta would give two keys for Cmd
+    and none for Control (Terminal Ctrl+C, Ctrl+arrows for Spaces). **Addition beyond the
+    card:** Ctrl+Tab is kept as Ctrl+Tab in both directions. The bare swap would make it
+    Win+Tab (Task View) / Cmd+Tab (app switcher), the exact problem this card fixes.
+    Same-OS pairs, Linux ↔ Windows, an unknown host OS, and the setting off are identity.
+  * State: each held physical key remembers the code the host received. Key-up releases
+    that code, auto-repeat repeats it, and a toggle flip affects only new presses. A chord
+    rewrite turns a held modifier into another code **make-before-break** (new down, old
+    up). WHY: a lone Win press and release opens the Start menu, and a Ctrl inside it
+    suppresses that (AutoHotkey `#MenuMaskKey`). The rewritten modifier stays rewritten
+    until it is released, so Cmd held across several Tabs keeps the Alt+Tab switcher open.
+    Two physical keys sharing a sent code (Option held while Cmd+Tab makes Cmd an Alt)
+    produce one press and one release on the host. An up the translator never saw pressed
+    goes out under the current mapping, unless a held key owns that code. Host
+    `release_all` and the surface's focus-loss key-ups therefore release exactly what was
+    sent. Cases covered by unit tests: Tab up before Cmd, Cmd up before Tab, Cmd across
+    several Tabs, Shift added mid-chord, Tab before Cmd (no chord), Option + Cmd+Tab, flips.
+  * Host OS: `PlatformInfo` did not reach the viewer, so `SignalMsg::ConnectResponse`
+    gained the additive `os: Option<String>` (`"windows"|"macos"|"linux"`, from the host's
+    `PlatformInfo::name`; absent or unknown = identity). It arrives before the host's offer,
+    so it is always known before the first key. Documented in plans/04 §6.
+  * Setting `translateModifiers` (`Config::translate_modifiers`, default true; older
+    files keep the default). Checkbox in Settings → Advanced, persisted like the others
+    (the `save_settings` command → `Engine::update_config`), which also publishes it to an `AtomicBool`
+    that the running session reads on every key, so a change applies to the next key.
+  * Paste chord: unchanged. It is already host-side (`InputInjector::paste_chord`; macOS
+    overrides to Cmd+V) and does not go through the translator.
+  * Mock: `MockPlatform.os_name` (default `"mock"` = unknown). Loopback tests
+    (`engine/tests/loopback.rs`) cover: Mac → Windows Cmd+C = Ctrl+C and Cmd+Tab = Alt+Tab,
+    toggle off = literal, Cmd held across a flip released as the Ctrl it was sent as,
+    nothing left held; Windows → Mac Ctrl+C = Cmd+C and Alt+Tab = Cmd+Tab; Mac → Mac and
+    Linux → Windows literal. No platform-api trait change.
+  * **Not verified (I2 device pass):** a Mac viewer on the Windows host. Cmd+Tab and
+    Cmd+Shift+Tab switch apps (needs M6 shortcut capture on). Cmd+C/Cmd+V copy and paste
+    in Notepad. Ctrl+Tab changes browser tabs. Toggle off mid-session = literal (Cmd+Tab
+    opens Task View), with no stuck keys afterwards. A lone Control tap on the Mac viewer
+    opens Start on the Windows host (expected: Mac Control is the Win key; on a Linux GNOME
+    host it opens Activities), and Control+click arrives as Win+click (no right-click
+    mapping). Reverse direction: Windows Ctrl+C copies on the Mac host, Alt+Tab switches
+    apps there.
+  * Risks: on a Mac viewer, Cmd comes through the surface path and Tab through the M6 tap.
+    Their relative order is M6's guarantee (it forwards Cmd itself when the surface has
+    not). If Tab ever reached the translator first, the host would get Tab, then Ctrl.
+    A Mac user's habits around Control change meaning on a PC host: a lone Control tap is a
+    Win/Super tap (Start menu, GNOME Activities), and Control+click is Win+click, not the
+    macOS secondary click (nothing maps it to a right-click).
 
 ## Lane T — tests & CI
 

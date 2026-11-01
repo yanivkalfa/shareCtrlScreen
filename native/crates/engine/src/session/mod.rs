@@ -26,6 +26,7 @@ use protocol::{ControlMsg, InputMsg, Permission, SignalData, SignalMsg};
 
 use crate::media::host::{host_media_loop, HostMedia};
 use crate::media::viewer::{viewer_media_loop, ViewerMedia};
+use crate::modifiers::{KeyTranslator, OsFamily};
 use crate::{Engine, Role};
 
 pub(crate) use crate::tuning::{DESIRED_BITRATE, MIN_BITRATE, TARGET_BITRATE};
@@ -364,13 +365,27 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
         });
     }
 
+    // Every forwarded key — from the surface and from the shortcut hook — goes
+    // through this one translator, which rewrites modifiers for the host's OS
+    // and remembers what it sent for each held key (D8).
+    let keys = {
+        let viewer_os = OsFamily::from_name(platform.info().name);
+        let host_os = engine.peer_os();
+        tracing::info!("key translation: {viewer_os:?} viewer → {host_os:?} host");
+        Arc::new(Mutex::new(KeyTranslator::new(
+            viewer_os,
+            host_os,
+            engine.translate_modifiers_handle(),
+        )))
+    };
+
     // Input from the video surface → protocol messages on ctl. The host enforces
     // its own permission (defence in depth).
     let (input_tx, input_rx) = std::sync::mpsc::channel::<VideoInput>();
     {
-        let (ctl, stop_i) = (ctl_tx.clone(), stop.clone());
+        let (ctl, keys, stop_i) = (ctl_tx.clone(), keys.clone(), stop.clone());
         spawn_or_abort!(engine, stop, threads, "input", move || {
-            input_loop(input_rx, ctl, stop_i)
+            input_loop(input_rx, ctl, keys, stop_i)
         });
     }
 
@@ -426,10 +441,11 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
 
     // OS shortcut capture (Win/Alt+Tab, Cmd+Tab, Super), when the user enabled it.
     if cfg.capture_shortcuts {
-        let (platform, surface, ctl, stop_k) = (
+        let (platform, surface, ctl, keys, stop_k) = (
             platform.clone(),
             surface.clone(),
             ctl_tx.clone(),
+            keys.clone(),
             stop.clone(),
         );
         spawn_or_abort!(engine, stop, threads, "shortcuts", move || {
@@ -437,17 +453,12 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
                 tracing::info!("shortcut capture is not available on this platform");
                 return;
             };
+            // WHY the lock is fine on the hook thread (which must never block):
+            // the only other holder is the input thread, for one translation of
+            // a few comparisons and channel sends, never across a wait.
             let forward: KeyForwarder = Box::new(move |code: &str, down: bool| {
-                let msg = if down {
-                    InputMsg::KeyDown {
-                        code: code.to_string(),
-                    }
-                } else {
-                    InputMsg::KeyUp {
-                        code: code.to_string(),
-                    }
-                };
-                let _ = ctl.send(serde_json::to_vec(&msg).unwrap_or_default());
+                keys.lock()
+                    .key(code, down, &mut |msg| send_input(&ctl, &msg));
             });
             if hook.install(surface.as_ref(), forward) {
                 hook.run(&stop_k);
@@ -479,7 +490,13 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
     });
 }
 
+/// Queue one input message for the host on the ctl channel.
+fn send_input(ctl: &Sender<Vec<u8>>, msg: &InputMsg) {
+    let _ = ctl.send(serde_json::to_vec(msg).unwrap_or_default());
+}
+
 /// Translate surface input to protocol messages, coalescing pointer moves.
+/// Keys go through `keys` (modifier translation for the host's OS).
 ///
 /// Gaming mice emit up to 1000 moves/s; relayed over the reliable ordered
 /// channel they would queue AHEAD of clicks and keys and make input feel drunk on
@@ -488,12 +505,16 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
 fn input_loop(
     input_rx: std::sync::mpsc::Receiver<VideoInput>,
     ctl: Sender<Vec<u8>>,
+    keys: Arc<Mutex<KeyTranslator>>,
     stop: Arc<AtomicBool>,
 ) {
     const MOVE_INTERVAL: Duration = Duration::from_millis(10);
     let send = |ev: VideoInput| {
-        if let Some(msg) = translate_input(ev) {
-            let _ = ctl.send(serde_json::to_vec(&msg).unwrap_or_default());
+        if let VideoInput::Key { code, down } = ev {
+            keys.lock()
+                .key(code, down, &mut |msg| send_input(&ctl, &msg));
+        } else if let Some(msg) = translate_input(ev) {
+            send_input(&ctl, &msg);
         }
     };
     let mut last_move_sent = Instant::now() - MOVE_INTERVAL;
@@ -527,7 +548,9 @@ fn input_loop(
     }
 }
 
-/// Surface input → wire message. Buttons outside 0..=2 are dropped.
+/// Pointer and wheel input → wire message. Buttons outside 0..=2 are dropped.
+/// Keys are not mapped here: they need the session's held-key state, which
+/// lives in [`KeyTranslator`], so `None`.
 fn translate_input(ev: VideoInput) -> Option<InputMsg> {
     use protocol::Button;
     Some(match ev {
@@ -546,14 +569,7 @@ fn translate_input(ev: VideoInput) -> Option<InputMsg> {
             }
         }
         VideoInput::Wheel { dx, dy } => InputMsg::Wheel { dx, dy },
-        VideoInput::Key { code, down } => {
-            let code = code.to_string();
-            if down {
-                InputMsg::KeyDown { code }
-            } else {
-                InputMsg::KeyUp { code }
-            }
-        }
+        VideoInput::Key { .. } => return None,
     })
 }
 
@@ -605,12 +621,60 @@ pub(crate) fn teardown(engine: &Engine) {
 mod tests {
     use super::*;
 
+    fn identity_keys() -> Arc<Mutex<KeyTranslator>> {
+        Arc::new(Mutex::new(KeyTranslator::new(
+            OsFamily::Windows,
+            OsFamily::Windows,
+            Arc::new(AtomicBool::new(true)),
+        )))
+    }
+
+    fn sent(ctl_rx: &std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<InputMsg> {
+        ctl_rx
+            .try_iter()
+            .map(|b| serde_json::from_slice(&b).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn input_loop_sends_keys_through_the_translator() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (ctl_tx, ctl_rx) = std::sync::mpsc::channel();
+        for (code, down) in [("MetaLeft", true), ("KeyC", true), ("KeyC", false)] {
+            tx.send(VideoInput::Key { code, down }).unwrap();
+        }
+        drop(tx);
+        let keys = Arc::new(Mutex::new(KeyTranslator::new(
+            OsFamily::Mac,
+            OsFamily::Windows,
+            Arc::new(AtomicBool::new(true)),
+        )));
+        input_loop(rx, ctl_tx, keys, Arc::new(AtomicBool::new(false)));
+        let codes: Vec<(String, bool)> = sent(&ctl_rx)
+            .into_iter()
+            .map(|m| match m {
+                InputMsg::KeyDown { code } => (code, true),
+                InputMsg::KeyUp { code } => (code, false),
+                other => panic!("not a key: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            codes,
+            [
+                ("ControlLeft".to_string(), true),
+                ("KeyC".to_string(), true),
+                ("KeyC".to_string(), false)
+            ]
+        );
+    }
+
     #[test]
     fn translate_input_maps_every_variant() {
-        assert!(matches!(
-            translate_input(VideoInput::Key { code: "KeyA", down: true }),
-            Some(InputMsg::KeyDown { code }) if code == "KeyA"
-        ));
+        assert!(translate_input(VideoInput::Key {
+            code: "KeyA",
+            down: true
+        })
+        .is_none());
         assert!(matches!(
             translate_input(VideoInput::Button {
                 button: 2,
@@ -656,7 +720,7 @@ mod tests {
         })
         .unwrap();
         drop(tx);
-        input_loop(rx, ctl_tx, stop);
+        input_loop(rx, ctl_tx, identity_keys(), stop);
         let msgs: Vec<InputMsg> = ctl_rx
             .try_iter()
             .map(|b| serde_json::from_slice(&b).unwrap())

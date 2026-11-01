@@ -70,6 +70,13 @@ pub enum SignalMsg {
         /// relays it opaquely (no server change).
         #[serde(skip_serializing_if = "Option::is_none")]
         codec: Option<String>,
+        /// The host's operating-system family: "windows" | "macos" | "linux".
+        /// The viewer translates modifier keys for it (Cmd ↔ Ctrl, Cmd+Tab →
+        /// Alt+Tab). Additive: absent (older hosts) or an unknown value means
+        /// "unknown", and the viewer then forwards keys literally. Relayed
+        /// opaquely by the server, like `codec`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        os: Option<String>,
     },
 
     /// WebRTC negotiation (contract §3.2 step 4). `data` is opaque to the server.
@@ -185,6 +192,39 @@ mod tests {
         assert!(v.get("from").is_none());
         // password:null must still be present per contract (explicit null first try).
         assert!(v["password"].is_null());
+    }
+
+    #[test]
+    fn connect_response_os_is_optional_and_additive() {
+        let m = SignalMsg::ConnectResponse {
+            to: Some("viewer".into()),
+            from: None,
+            accepted: true,
+            permission: Some("control".into()),
+            reason: None,
+            codec: Some("H264".into()),
+            os: Some("macos".into()),
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(v["os"], "macos");
+        // A response from a host that predates the field still parses (as
+        // "unknown"), and a response without it carries no `os` key.
+        let old: SignalMsg = serde_json::from_str(
+            r#"{"type":"connect-response","from":"h","accepted":true,"permission":"view"}"#,
+        )
+        .unwrap();
+        assert!(matches!(old, SignalMsg::ConnectResponse { os: None, .. }));
+        let none = SignalMsg::ConnectResponse {
+            to: None,
+            from: None,
+            accepted: false,
+            permission: None,
+            reason: Some("busy".into()),
+            codec: None,
+            os: None,
+        };
+        assert!(!serde_json::to_string(&none).unwrap().contains("\"os\""));
     }
 
     #[test]

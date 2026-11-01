@@ -60,7 +60,12 @@ fn start_private_x() -> Option<PrivateX> {
     // the abstract socket, which `x11_connect` handles but arboard's own x11rb
     // connection (clipboard text) does not; TCP reaches both.
     let tcp = !socket_dir_writable();
-    let server = XServer::start("Xvfb", &["-screen", "0", "640x480x24", "-terminate"], None, tcp)?;
+    let server = XServer::start(
+        "Xvfb",
+        &["-screen", "0", "640x480x24", "-terminate"],
+        None,
+        tcp,
+    )?;
     let (keepalive, _) = x11_connect(&server.name).expect("connect to the private Xvfb");
     // One display for the whole process, fixed before the first clipboard
     // use: arboard and the selection owner read `DISPLAY`, and arboard keeps

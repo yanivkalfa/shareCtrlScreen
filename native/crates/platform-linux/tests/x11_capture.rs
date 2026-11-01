@@ -63,7 +63,11 @@ impl TestServer for XServer {
     /// Capture `monitor` of this server, checked to be on the MIT-SHM path.
     fn capture(&self, monitor: Option<&str>) -> X11Capture {
         let cap = X11Capture::open(Some(&self.name), monitor).expect("open capture");
-        eprintln!("{}: capture open, MIT-SHM {}", self.name, cap.uses_mit_shm());
+        eprintln!(
+            "{}: capture open, MIT-SHM {}",
+            self.name,
+            cap.uses_mit_shm()
+        );
         assert!(cap.uses_mit_shm(), "a Unix-socket server must give MIT-SHM");
         cap
     }

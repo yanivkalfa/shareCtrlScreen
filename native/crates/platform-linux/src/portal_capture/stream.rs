@@ -379,7 +379,10 @@ fn on_process(stream: &Stream, cb: &mut Callbacks) {
         return;
     };
     let damage = if lost { Damage::Full } else { damage };
-    if !copy_newest(cb, &mut buffer, size, layout, damage) {
+    // A skipped buffer may be newer than the one copied (drained after it), so its
+    // changes are not in this picture either: the next picture must count as full
+    // too. Marked after the copy, because accepting a picture clears the mark.
+    if !copy_newest(cb, &mut buffer, size, layout, damage) || lost {
         cb.slot.lose_damage();
     }
 }

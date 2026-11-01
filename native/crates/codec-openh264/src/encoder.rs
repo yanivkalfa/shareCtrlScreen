@@ -328,7 +328,7 @@ mod tests {
         assert_eq!(encode_size(5120, 2880), (3840, 2160));
         assert_eq!(encode_size(2160, 3840), (2160, 3840));
         let (w, h) = encode_size(6016, 3384);
-        assert!(w <= 3840 && h <= 2160 && w % 2 == 0 && h % 2 == 0);
+        assert!(w <= 3840 && h <= 2160 && w.is_multiple_of(2) && h.is_multiple_of(2));
     }
 
     #[test]

@@ -3,9 +3,9 @@
 //! promises and what the SPS's VUI declares, so any decoder (hardware or this
 //! one) reproduces the host's colours.
 //!
-//! Integer arithmetic only, row-pair loops over `chunks_exact`, no per-pixel
-//! branches: the compiler vectorises these, which keeps 1080p conversion at a
-//! few milliseconds.
+//! Integer arithmetic only, row-pair loops over fixed-size `as_chunks` arrays,
+//! no per-pixel branches: the compiler vectorises these, which keeps 1080p
+//! conversion at a few milliseconds.
 
 use openh264::formats::YUVSource;
 
@@ -40,7 +40,7 @@ pub struct I420 {
 
 impl I420 {
     pub fn new(width: usize, height: usize) -> Self {
-        debug_assert!(width % 2 == 0 && height % 2 == 0);
+        debug_assert!(width.is_multiple_of(2) && height.is_multiple_of(2));
         let (cw, ch) = (width / 2, height / 2);
         Self {
             width,
@@ -155,15 +155,17 @@ fn bgra_band(src: &[u8], stride: usize, w: usize, y: &mut [u8], u: &mut [u8], v:
         // Luma in 16-bit lanes (the Q8 sum is at most 255 · 220 + 128 < 2^16),
         // which baseline SSE2/NEON multiply natively, so LLVM vectorises it.
         for (row, out) in [(r0, y0), (r1, y1)] {
-            for (px, y) in row.chunks_exact(4).zip(out.iter_mut()) {
+            for (px, y) in row.as_chunks::<4>().0.iter().zip(out.iter_mut()) {
                 let (b, g, r) = (px[0] as u16, px[1] as u16, px[2] as u16);
                 *y = (16 + ((Y8_R * r + Y8_G * g + Y8_B * b + 128) >> 8)) as u8;
             }
         }
         // Chroma: the 2×2 box average, from the two rows just read (in cache).
         for (((a, b), u), v) in r0
-            .chunks_exact(8)
-            .zip(r1.chunks_exact(8))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(r1.as_chunks::<8>().0)
             .zip(u.iter_mut())
             .zip(v.iter_mut())
         {
@@ -193,7 +195,13 @@ pub fn split_uv(uv: &[u8], uv_stride: usize, cw: usize, ch: usize, u: &mut [u8],
         let src = &uv[row * uv_stride..][..cw * 2];
         let u = &mut u[row * cw..][..cw];
         let v = &mut v[row * cw..][..cw];
-        for ((p, u), v) in src.chunks_exact(2).zip(u.iter_mut()).zip(v.iter_mut()) {
+        for ((p, u), v) in src
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(u.iter_mut())
+            .zip(v.iter_mut())
+        {
             *u = p[0];
             *v = p[1];
         }
@@ -222,7 +230,7 @@ pub fn interleave_uv(
     for row in 0..ch {
         let out = &mut dst[row * cw * 2..][..cw * 2];
         let (u, v) = (&u[row * u_stride..][..cw], &v[row * v_stride..][..cw]);
-        for ((o, &u), &v) in out.chunks_exact_mut(2).zip(u).zip(v) {
+        for ((o, &u), &v) in out.as_chunks_mut::<2>().0.iter_mut().zip(u).zip(v) {
             o[0] = u;
             o[1] = v;
         }
@@ -263,7 +271,7 @@ pub fn scale_bilinear<const C: usize>(
         let a = &src[y0 * s_stride..];
         let b = &src[y1 * s_stride..];
         let out = &mut dst[row * dw * C..][..dw * C];
-        for (o, &(x0, x1, fx)) in out.chunks_exact_mut(C).zip(&xs) {
+        for (o, &(x0, x1, fx)) in out.as_chunks_mut::<C>().0.iter_mut().zip(&xs) {
             for c in 0..C {
                 let p = |r: &[u8], x: usize| r[x * C + c] as u32;
                 let top = p(a, x0) * (256 - fx) + p(a, x1) * fx;

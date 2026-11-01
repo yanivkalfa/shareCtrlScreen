@@ -328,7 +328,6 @@ fn tool_available(name: &str) -> bool {
         .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
 }
 
-
 /// A child process killed on drop.
 struct Reaped(Child);
 

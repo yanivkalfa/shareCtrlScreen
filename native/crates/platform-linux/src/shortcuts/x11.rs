@@ -228,8 +228,16 @@ impl X11Grab {
         parent: Window,
         forward: KeyForwarder,
     ) -> Result<Self, String> {
-        let (conn, screen) = RustConnection::connect(options.display.as_deref())
-            .map_err(|e| format!("cannot connect to the X server: {e}"))?;
+        let display = match &options.display {
+            Some(d) => d.clone(),
+            None => std::env::var("DISPLAY").map_err(|_| {
+                "DISPLAY is not set, so there is no X server to grab on".to_string()
+            })?,
+        };
+        // The crate's connect: also reaches a local server that only has an
+        // abstract socket (WSLg, where /tmp/.X11-unix is read-only).
+        let (conn, screen) = crate::x11_connect(&display)
+            .map_err(|e| format!("cannot connect to the X server at {display}: {e}"))?;
         let conn = Arc::new(conn);
         let root = conn
             .setup()
@@ -478,7 +486,17 @@ impl X11Grab {
             }
             return;
         }
+        let pressed_before_grab = self.down_at_grab.contains(&keycode);
         if virtual_keyboard {
+            // A virtual key held since before the grab reached the remote
+            // through GTK; its release is ours now and can be replayed to no
+            // one (the key is already up), so the trait's owed key-up is sent
+            // here. A stray key-up is harmless and cannot loop.
+            if pressed_before_grab && !down {
+                if let Some(code) = dom_code(keycode) {
+                    (self.forward)(code, false);
+                }
+            }
             tracing::info!(
                 "keys from a virtual (XTEST) keyboard: shortcut capture paused until the \
                  session window is focused again"
@@ -488,7 +506,6 @@ impl X11Grab {
             self.replay(keycode, down, true);
             return;
         }
-        let pressed_before_grab = self.down_at_grab.contains(&keycode);
         if pressed_before_grab {
             if down && repeat {
                 // Its press went to the remote through GTK; repeats did too.

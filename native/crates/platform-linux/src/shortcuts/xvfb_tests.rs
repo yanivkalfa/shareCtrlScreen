@@ -10,9 +10,10 @@
 //! keys (they may be our own injector's), so the delivery tests turn that off
 //! and [`virtual_keyboard_input_is_not_forwarded`] checks the production path.
 
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+#[path = "../../tests/support/xserver.rs"]
+mod xserver;
+
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -31,87 +32,37 @@ use x11rb::{COPY_DEPTH_FROM_PARENT, CURRENT_TIME};
 
 use super::tests::{xcb, TestSurface};
 use super::LinuxShortcutHook;
+use xserver::XServer;
 
 const SUPER_L: u8 = 133;
 const ALT_L: u8 = 64;
 const TAB: u8 = 23;
 const WAIT: Duration = Duration::from_secs(5);
 
-/// A private X server for one test.
-struct Xvfb {
-    child: Child,
-    display: String,
-}
-
-impl Xvfb {
-    /// `None` when Xvfb is not installed (the test is then skipped).
-    fn start() -> Option<Self> {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let base = 300 + std::process::id() % 400;
-        for _ in 0..32 {
-            let n = base + NEXT.fetch_add(1, Ordering::SeqCst);
-            if Path::new(&format!("/tmp/.X{n}-lock")).exists() {
-                continue;
-            }
-            let (display, listen) = if unix_sockets_work() {
-                (format!(":{n}"), ["-nolisten", "tcp"])
-            } else {
-                (format!("127.0.0.1:{n}"), ["-listen", "tcp"])
-            };
-            let server = format!(":{n}");
-            let spawned = Command::new("Xvfb")
-                .args([server.as_str(), listen[0], listen[1]])
-                // -noreset: an X server resets when its last client leaves,
-                // and drops whoever connects mid-reset; the readiness probe
-                // below is such a last client.
-                .args(["-noreset", "-screen", "0", "640x480x24"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn();
-            let mut child = match spawned {
-                Ok(child) => child,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    eprintln!("skipping: Xvfb is not installed (apt-get install xvfb)");
-                    return None;
-                }
-                Err(e) => panic!("cannot start Xvfb: {e}"),
-            };
-            let deadline = Instant::now() + WAIT;
-            while Instant::now() < deadline {
-                if RustConnection::connect(Some(&display)).is_ok() {
-                    return Some(Self { child, display });
-                }
-                if matches!(child.try_wait(), Ok(Some(_))) {
-                    break; // display number taken after all; try the next
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        panic!("could not start Xvfb on any display number");
+/// A private Xvfb for one test, from the crate's shared test-server harness
+/// (display numbers, readiness, the WSLg abstract-socket case). `None` = not
+/// installed: the test is skipped.
+///
+/// `-noreset`: an X server resets when its last client leaves and refuses
+/// whoever connects during the reset; tests here open and close clients
+/// freely.
+fn xvfb() -> Option<XServer> {
+    if !xserver::installed("Xvfb") {
+        return None;
     }
+    XServer::start(
+        "Xvfb",
+        &["-noreset", "-screen", "0", "640x480x24"],
+        None,
+        false,
+    )
 }
 
-/// Whether a server can listen in `/tmp/.X11-unix`. Under WSLg that directory
-/// is a read-only mount holding WSLg's own socket, so Xvfb only gets its
-/// Linux abstract socket, which x11rb does not dial; the tests then use TCP on
-/// loopback instead (X access control still admits only local clients).
-fn unix_sockets_work() -> bool {
-    static WORKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *WORKS.get_or_init(|| {
-        let probe = format!("/tmp/.X11-unix/sct-probe-{}", std::process::id());
-        let ok = std::os::unix::net::UnixListener::bind(&probe).is_ok();
-        let _ = std::fs::remove_file(&probe);
-        ok
-    })
-}
-
-impl Drop for Xvfb {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+/// A test client on `display`, through the same connect the hook uses.
+fn connect(display: &str) -> (RustConnection, usize) {
+    match crate::x11_connect(display) {
+        Ok(c) => c,
+        Err(e) => panic!("connect to {display}: {e}"),
     }
 }
 
@@ -127,10 +78,7 @@ struct Desk {
 
 impl Desk {
     fn new(display: &str) -> Self {
-        let (conn, screen) = match RustConnection::connect(Some(display)) {
-            Ok(c) => c,
-            Err(e) => panic!("connect: {e}"),
-        };
+        let (conn, screen) = connect(display);
         let root = conn.setup().roots[screen].root;
         let window = |parent, w, h| {
             let id = conn.generate_id().unwrap_or_else(|e| panic!("id: {e}"));
@@ -258,10 +206,7 @@ struct WindowManager {
 
 impl WindowManager {
     fn new(display: &str, root: Window) -> Self {
-        let (conn, _) = match RustConnection::connect(Some(display)) {
-            Ok(c) => c,
-            Err(e) => panic!("connect: {e}"),
-        };
+        let (conn, _) = connect(display);
         for (key, mods) in [(SUPER_L, ModMask::ANY), (TAB, ModMask::M1)] {
             conn.grab_key(false, root, mods, key, GrabMode::ASYNC, GrabMode::ASYNC)
                 .unwrap_or_else(|e| panic!("grab_key: {e}"));
@@ -296,10 +241,7 @@ struct Observer {
 
 impl Observer {
     fn new(display: &str, window: Window) -> Self {
-        let (conn, _) = match RustConnection::connect(Some(display)) {
-            Ok(c) => c,
-            Err(e) => panic!("connect: {e}"),
-        };
+        let (conn, _) = connect(display);
         conn.change_window_attributes(
             window,
             &ChangeWindowAttributesAux::new()
@@ -416,9 +358,9 @@ fn k(code: &str, down: bool) -> (String, bool) {
 
 #[test]
 fn grabbed_shortcuts_reach_the_hook_not_the_window_manager() {
-    let Some(x) = Xvfb::start() else { return };
-    let desk = Desk::new(&x.display);
-    let wm = WindowManager::new(&x.display, desk.root);
+    let Some(x) = xvfb() else { return };
+    let desk = Desk::new(&x.name);
+    let wm = WindowManager::new(&x.name, desk.root);
 
     // Control: without the hook the window manager gets Super and Alt+Tab.
     desk.tap(SUPER_L);
@@ -431,7 +373,7 @@ fn grabbed_shortcuts_reach_the_hook_not_the_window_manager() {
         "test setup: WM grabs work"
     );
 
-    let hook = Running::start(&x.display, desk.video, desk.parent, true);
+    let hook = Running::start(&x.name, desk.video, desk.parent, true);
     assert!(hook.installed, "install on a focused, mapped window");
     assert!(
         desk.keyboard_grabbed(),
@@ -490,12 +432,9 @@ fn grabbed_shortcuts_reach_the_hook_not_the_window_manager() {
 
 #[test]
 fn install_reports_false_while_another_client_holds_the_keyboard() {
-    let Some(x) = Xvfb::start() else { return };
-    let desk = Desk::new(&x.display);
-    let (other, _) = match RustConnection::connect(Some(&x.display)) {
-        Ok(c) => c,
-        Err(e) => panic!("connect: {e}"),
-    };
+    let Some(x) = xvfb() else { return };
+    let desk = Desk::new(&x.name);
+    let (other, _) = connect(&x.name);
     let status = other
         .grab_keyboard(
             false,
@@ -510,7 +449,7 @@ fn install_reports_false_while_another_client_holds_the_keyboard() {
         .status;
     assert_eq!(status, GrabStatus::SUCCESS);
 
-    let hook = Running::start(&x.display, desk.video, desk.parent, true);
+    let hook = Running::start(&x.name, desk.video, desk.parent, true);
     assert!(
         !hook.installed,
         "AlreadyGrabbed must report install == false"
@@ -519,18 +458,18 @@ fn install_reports_false_while_another_client_holds_the_keyboard() {
 
 #[test]
 fn install_refuses_a_video_window_outside_the_app_window() {
-    let Some(x) = Xvfb::start() else { return };
-    let desk = Desk::new(&x.display);
-    let hook = Running::start(&x.display, desk.elsewhere, desk.parent, true);
+    let Some(x) = xvfb() else { return };
+    let desk = Desk::new(&x.name);
+    let hook = Running::start(&x.name, desk.elsewhere, desk.parent, true);
     assert!(!hook.installed);
 }
 
 #[test]
 fn virtual_keyboard_input_is_not_forwarded() {
-    let Some(x) = Xvfb::start() else { return };
-    let desk = Desk::new(&x.display);
-    let wm = WindowManager::new(&x.display, desk.root);
-    let hook = Running::start(&x.display, desk.video, desk.parent, false);
+    let Some(x) = xvfb() else { return };
+    let desk = Desk::new(&x.name);
+    let wm = WindowManager::new(&x.name, desk.root);
+    let hook = Running::start(&x.name, desk.video, desk.parent, false);
     assert!(hook.installed);
     assert!(desk.keyboard_grabbed());
 
@@ -558,10 +497,10 @@ fn virtual_keyboard_input_is_not_forwarded() {
 
 #[test]
 fn a_held_virtual_key_is_replayed_without_sticking() {
-    let Some(x) = Xvfb::start() else { return };
-    let desk = Desk::new(&x.display);
-    let gtk = Observer::new(&x.display, desk.parent);
-    let hook = Running::start(&x.display, desk.video, desk.parent, false);
+    let Some(x) = xvfb() else { return };
+    let desk = Desk::new(&x.name);
+    let gtk = Observer::new(&x.name, desk.parent);
+    let hook = Running::start(&x.name, desk.video, desk.parent, false);
     assert!(hook.installed);
     assert!(desk.keyboard_grabbed());
 
@@ -583,11 +522,36 @@ fn a_held_virtual_key_is_replayed_without_sticking() {
 }
 
 #[test]
-fn a_key_held_when_the_grab_starts_is_released_on_the_remote() {
-    let Some(x) = Xvfb::start() else { return };
-    let desk = Desk::new(&x.display);
+fn a_virtual_key_held_when_the_grab_starts_is_released_on_the_remote() {
+    let Some(x) = xvfb() else { return };
+    let desk = Desk::new(&x.name);
     desk.focus(desk.elsewhere);
-    let hook = Running::start(&x.display, desk.video, desk.parent, true);
+    // Production path: XTEST keys are not captured.
+    let hook = Running::start(&x.name, desk.video, desk.parent, false);
+    assert!(hook.installed);
+
+    // Synergy / VNC / our injector holds Alt while the window is unfocused (in
+    // the app GTK gets it and the remote sees AltLeft down); then the window
+    // is focused, the grab is taken, and Alt's release lands in it.
+    desk.key(ALT_L, true);
+    desk.focus(desk.parent);
+    wait_until("grab on focus-in", || desk.keyboard_grabbed());
+    desk.key(ALT_L, false);
+    assert_eq!(
+        hook.take(1),
+        vec![k("AltLeft", false)],
+        "the owed key-up, and nothing else"
+    );
+    wait_until("grab steps aside", || !desk.keyboard_grabbed());
+    assert!(desk.keys_down().is_empty(), "no key left down");
+}
+
+#[test]
+fn a_key_held_when_the_grab_starts_is_released_on_the_remote() {
+    let Some(x) = xvfb() else { return };
+    let desk = Desk::new(&x.name);
+    desk.focus(desk.elsewhere);
+    let hook = Running::start(&x.name, desk.video, desk.parent, true);
     assert!(hook.installed, "not focused: installed, waiting");
     assert!(!desk.keyboard_grabbed());
 

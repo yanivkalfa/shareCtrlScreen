@@ -403,8 +403,10 @@ to run (TCC). Use `objc2` 0.6-family crates throughout (`objc2-app-kit`,
 * Keys the shared keymap lacks (media, brightness, vendor keys) are dropped while grabbed
   (neither remote nor local).
 * Tests: Xvfb acceptance (WM passive grabs see nothing while grabbed; focus-out, unmap,
-  key held across the grab start, AlreadyGrabbed, XTEST + replay); they start private Xvfbs and use loopback TCP where
-  `/tmp/.X11-unix` is read-only (WSLg), local sockets elsewhere. Wayland test is `#[ignore]`d.
+  real and virtual keys held across the grab start, AlreadyGrabbed, XTEST replay of a tap
+  and of a held key); private Xvfbs (`-noreset`) from L2's shared harness
+  (`tests/support/xserver.rs`), reached through `x11_connect` (abstract socket under
+  WSLg) — the hook connects the same way. Wayland test is `#[ignore]`d.
   CI needs `xvfb` installed (T3). Device pass: [checklists/L7.md](checklists/L7.md).
 ### L8 — Clipboard: arboard + file-list MIME targets + content-hash change counter  (size M) — Acceptance: echo-guard loop test (two mock peers) never ping-pongs; `set_files` is readable by `wl-paste --list-types` / `xclip -t TARGETS`.
 ### L9 — Secret Service store  (size S) — `keyring` with `sync-secret-service`; CI with `gnome-keyring` under `dbus-run-session`. No daemon → `None`.

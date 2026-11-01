@@ -153,6 +153,12 @@ the GPU/VA drivers or the PipeWire daemon, which always come from the host. GStr
 plugins are not bundled (`bundleMediaFramework` is off): the UI plays no media, and video
 is rendered natively. A host that is older than Ubuntu 22.04 cannot run it.
 
+**Remote control backends.** The host picks one at session start and logs it
+(`remote control uses …`): XTest on X11 (no permission); on Wayland the wlroots virtual
+pointer and keyboard on Sway/Hyprland (no permission), else the RemoteDesktop portal with
+libei on GNOME 46+ / KDE Plasma 6 (one consent dialog, remembered through the restore
+token); uinput as the last resort anywhere, only once it has been enabled as below.
+
 **Remote control without the portal (uinput).** On Wayland, input is injected through the
 desktop's RemoteDesktop portal. Where the portal cannot do that, Settings offers
 "Enable uinput access", which asks for your password once (polkit) and runs

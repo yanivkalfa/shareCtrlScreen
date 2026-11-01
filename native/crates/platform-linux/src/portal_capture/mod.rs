@@ -1,7 +1,11 @@
 //! `ScreenCapture` on Wayland: xdg-desktop-portal ScreenCast + PipeWire (plan task L1).
 //!
 //! The portal handshake ([`crate::portal_session`], shared with the L12 consent flow)
-//! restores the stored token, so after the first consent no dialog appears. The portal
+//! restores the stored token, so after the first consent no dialog appears. With a
+//! combined (remote-control) token, or while remote control already holds it, the
+//! capture joins the process's shared combined session ([`crate::portal_shared`]) instead
+//! of starting its own: one dialog, one single-use token, and the session closes when
+//! the last of capture and injector lets go. The portal
 //! hands back a PipeWire node and a remote fd; [`stream`] runs that stream on its own
 //! thread and copies every new buffer into a depth-1 newest-wins [`slot`], which
 //! [`ScreenCapture::acquire`] waits on, so the host keeps the pull model it has on
@@ -56,6 +60,7 @@ use platform_api::{CaptureError, CapturedFrame, CursorUpdate, Frame, Point, Rect
 use tokio::sync::oneshot;
 
 use crate::portal_session::{self, Failure, PortalSession, Scope};
+use crate::portal_shared::{self, SharedError, SharedSession};
 use crate::portal_token::{self, StoredToken};
 
 use slot::{Ended, Picture, Ready, Slot, Wait};
@@ -99,6 +104,8 @@ fn plan(stored: Option<&StoredToken>) -> (Scope, Option<&str>) {
 #[derive(Debug)]
 enum OpenError {
     Portal(Box<Failure>),
+    /// The shared combined session (`portal_shared`) could not start.
+    Shared(SharedError),
     /// `Start` succeeded but granted no stream.
     NoStream,
     /// `OpenPipeWireRemote` failed.
@@ -111,6 +118,8 @@ enum OpenError {
 fn open_error(e: &OpenError) -> CaptureError {
     match e {
         OpenError::Portal(f) => portal_error(f),
+        OpenError::Shared(e) if e.dismissed => CaptureError::PermissionDenied,
+        OpenError::Shared(e) => CaptureError::Backend(e.message.clone()),
         OpenError::NoStream => CaptureError::Backend(
             "the portal granted no screen; choose a monitor in the screen-sharing dialog".into(),
         ),
@@ -162,7 +171,11 @@ fn portal_error(f: &Failure) -> CaptureError {
 /// Whether a failed open is worth retrying. A declined or unanswered dialog is not:
 /// retrying would put the same dialog in front of a user who said no or is not there.
 fn retryable(e: &OpenError) -> bool {
-    !matches!(e, OpenError::Portal(f) if f.is_cancel() || matches!(**f, Failure::TimedOut(_)))
+    match e {
+        OpenError::Portal(f) => !(f.is_cancel() || matches!(**f, Failure::TimedOut(_))),
+        OpenError::Shared(e) => !e.dismissed,
+        _ => true,
+    }
 }
 
 /// Back-off between failed rebuilds: the host's retry loop must not hammer the portal
@@ -183,9 +196,39 @@ struct Live {
     _close: oneshot::Sender<()>,
 }
 
-/// Owns the portal session on the portal runtime: closes the slot when the desktop
-/// ends the session, and closes the session when the capture lets go.
-async fn watch(session: PortalSession, slot: Arc<Slot>, mut close: oneshot::Receiver<()>) {
+/// The capture's hold on its portal session.
+enum Held {
+    /// A screen-only session the capture started and owns.
+    Own(PortalSession),
+    /// The process's shared combined session (`portal_shared`), also held by
+    /// remote control; the last holder closes it.
+    Shared(Arc<SharedSession>),
+}
+
+impl Held {
+    async fn closed(&self) -> Result<(), ashpd::Error> {
+        match self {
+            Held::Own(session) => session.closed().await,
+            Held::Shared(shared) => match shared.granted().await {
+                Ok(granted) => granted.session.closed().await,
+                // Never reached: the capture only holds a granted session.
+                Err(_) => std::future::pending().await,
+            },
+        }
+    }
+
+    async fn release(self) {
+        match self {
+            Held::Own(session) => session.close().await,
+            Held::Shared(shared) => drop(shared),
+        }
+    }
+}
+
+/// Owns the capture's hold on the portal session on the portal runtime: closes the
+/// slot when the desktop ends the session, and lets go of the session when the
+/// capture does (closing it, unless remote control still holds the shared one).
+async fn watch(session: Held, slot: Arc<Slot>, mut close: oneshot::Receiver<()>) {
     let ended_by_desktop = tokio::select! {
         closed = session.closed() => Some(closed),
         // A message or a dropped sender: the capture is done with the session.
@@ -205,7 +248,7 @@ async fn watch(session: PortalSession, slot: Arc<Slot>, mut close: oneshot::Rece
         }
         None => {}
     }
-    session.close().await;
+    session.release().await;
 }
 
 /// The portal half of opening: handshake, store the replacement token, open the
@@ -222,6 +265,12 @@ async fn open_portal(
     let abandon = async {
         let _ = abandon.await;
     };
+    // A combined token, or remote control already holding the shared session:
+    // join that one session (one dialog, one single-use token) rather than
+    // starting a second from the same token.
+    if scope == Scope::ScreenAndInput || portal_shared::live().is_some() {
+        return open_shared(&token_path, slot, close, abandon).await;
+    }
     let granted = portal_session::start(scope, previous, Some(DIALOG_TIMEOUT), abandon)
         .await
         .map_err(|f| OpenError::Portal(Box::new(f)))?;
@@ -249,7 +298,7 @@ async fn open_portal(
         };
     match opened {
         Ok(fd_node) => {
-            tokio::spawn(watch(granted.session, slot, close));
+            tokio::spawn(watch(Held::Own(granted.session), slot, close));
             Ok(fd_node)
         }
         Err(e) => {
@@ -257,6 +306,53 @@ async fn open_portal(
             Err(e)
         }
     }
+}
+
+/// [`open_portal`] through the shared combined session: the stream it granted, the
+/// PipeWire remote, and the capture's hold on the session for [`watch`]. The shared
+/// handshake stores the replacement token itself.
+async fn open_shared(
+    token_path: &Path,
+    slot: Arc<Slot>,
+    close: oneshot::Receiver<()>,
+    abandon: impl std::future::Future<Output = ()>,
+) -> Result<(OwnedFd, u32), OpenError> {
+    let shared = portal_shared::acquire_with_token(token_path);
+    let opened = {
+        let granted = tokio::select! {
+            granted = tokio::time::timeout(DIALOG_TIMEOUT, shared.granted()) => match granted {
+                Ok(Ok(granted)) => granted,
+                Ok(Err(e)) => return Err(OpenError::Shared(e.clone())),
+                Err(_) => {
+                    return Err(OpenError::Portal(Box::new(Failure::TimedOut(DIALOG_TIMEOUT))))
+                }
+            },
+            // Returning drops this hold; with no other holder the shared session
+            // abandons its dialog.
+            () = abandon => return Err(OpenError::Portal(Box::new(Failure::Abandoned))),
+        };
+        match granted.streams.first() {
+            None => Err(OpenError::NoStream),
+            Some(stream) => {
+                tracing::info!(
+                    "portal: shared session node {} ({:?}, compositor size {:?} at {:?})",
+                    stream.pipe_wire_node_id(),
+                    stream.source_type(),
+                    stream.size(),
+                    stream.position(),
+                );
+                let node = stream.pipe_wire_node_id();
+                granted
+                    .open_pipewire_remote()
+                    .await
+                    .map(|fd| (fd, node))
+                    .map_err(|e| OpenError::Remote(Box::new(e)))
+            }
+        }
+    };
+    let fd_node = opened?;
+    tokio::spawn(watch(Held::Shared(shared), slot, close));
+    Ok(fd_node)
 }
 
 /// A failed open: the trait error, and whether trying again can help.

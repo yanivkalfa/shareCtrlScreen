@@ -1,15 +1,19 @@
 //! Permission preflight for the Linux host: what the desktop will let us do, and the
 //! portal flow that asks for it.
 //!
-//! * X11 has no permission concept: capture (XShm) and input (XTest) just work, so
-//!   both report `NotApplicable`.
+//! * X11 has no permission concept: capture (XShm) reports `NotApplicable`, and so
+//!   does input while the server has XTEST; without XTEST input is `Granted` through
+//!   the opt-in uinput device when that is writable, else `Denied` with the fix.
 //! * Wayland routes everything through `xdg-desktop-portal`. The probe asks the portal
 //!   which interfaces it implements (a desktop without `RemoteDesktop`, such as
 //!   Hyprland or Weston/WSLg, can never inject input through it) and whether a restore
-//!   token from an earlier consent is stored. The probe never shows UI.
-//! * [`request`] runs just enough of the ScreenCast (+ RemoteDesktop) handshake for the
-//!   user to answer the consent dialog and for the portal to hand back a restore token,
-//!   stores it for the capture task, and closes the session again.
+//!   token from an earlier consent is stored. The probe never shows UI. Input follows
+//!   the injector's backend choice (`input::select`): wlroots virtual input needs no
+//!   permission, the portal needs consent, uinput needs `/dev/uinput` access.
+//! * [`request`] asks for consent. Screen capture alone runs a ScreenCast handshake
+//!   up to `Start`, stores the restore token and closes the session; remote control
+//!   goes through the process's shared RemoteDesktop session
+//!   ([`crate::portal_shared`]) so the single-use token is never spent twice.
 //!
 //! The decision logic ([`assess`]) is a pure function of a [`Probe`], so it is tested
 //! without D-Bus, a desktop, or any device.
@@ -30,7 +34,9 @@ use std::time::Duration;
 use ashpd::zbus::{self, fdo, names::InterfaceName};
 use platform_api::{OsPermission, PermissionReport, PermissionState};
 
+use crate::input::{self, BackendKind, Capabilities};
 use crate::portal_session::{self, block_on, runtime, Failure, Scope};
+use crate::portal_shared;
 use crate::portal_token::{self, StoredToken};
 use crate::SessionType;
 
@@ -84,7 +90,9 @@ struct Probe {
     session: SessionType,
     portal: Portal,
     token: Option<StoredToken>,
-    uinput_writable: bool,
+    /// The input backends' probes; the portal's version is taken from
+    /// `portal`, so `input.portal_remote_desktop` is ignored.
+    input: Capabilities,
     vaapi: Vaapi,
 }
 
@@ -104,10 +112,22 @@ pub(crate) fn report(session: SessionType, state_dir: &Path) -> PermissionReport
         } else {
             None
         },
-        uinput_writable: wayland && uinput_writable(),
+        input: input::probe_local(session),
         vaapi: probe_vaapi(),
     };
     assess(&probe)
+}
+
+/// The RemoteDesktop interface version, `None` when the portal or the
+/// interface is missing. One bounded round trip.
+pub(crate) fn remote_desktop_version() -> Option<u32> {
+    match block_on(probe_portal(), PROBE_TIMEOUT)? {
+        Portal::Reachable {
+            remote_desktop: Interface::Present { version },
+            ..
+        } => Some(version),
+        _ => None,
+    }
 }
 
 fn assess(probe: &Probe) -> PermissionReport {
@@ -120,13 +140,59 @@ fn assess(probe: &Probe) -> PermissionReport {
         }
         SessionType::Wayland => assess_wayland(probe),
     };
+    report.input_injection = assess_input(probe, &mut report.notes);
     report.notes.push(vaapi_note(probe.vaapi));
     report
 }
 
+/// Remote control: the backend the injector would choose, and whether it
+/// still needs the user's consent.
+fn assess_input(probe: &Probe, notes: &mut Vec<String>) -> PermissionState {
+    let caps = Capabilities {
+        session: probe.session,
+        portal_remote_desktop: match probe.portal {
+            Portal::Reachable {
+                remote_desktop: Interface::Present { version },
+                ..
+            } => Some(version),
+            _ => None,
+        },
+        ..probe.input.clone()
+    };
+    match input::select(&caps).map(|kinds| kinds[0]) {
+        Ok(BackendKind::XTest) => PermissionState::NotApplicable,
+        Ok(BackendKind::Wlroots) => {
+            notes.push(format!(
+                "remote control uses {}; no permission is needed",
+                BackendKind::Wlroots.describe()
+            ));
+            PermissionState::NotApplicable
+        }
+        Ok(BackendKind::Portal) => {
+            if probe.token.as_ref().is_some_and(|t| t.covers_input) {
+                PermissionState::Granted
+            } else {
+                PermissionState::NotDetermined
+            }
+        }
+        // The opt-in uinput device is the only way in here.
+        Ok(BackendKind::Uinput) => {
+            notes.push("remote control uses /dev/uinput (no other route on this desktop)".into());
+            PermissionState::Granted
+        }
+        Err(refusal) => {
+            if probe.session == SessionType::Wayland {
+                notes.push(NO_REMOTE_CONTROL_NOTE.into());
+            }
+            notes.push(refusal.message);
+            PermissionState::Denied
+        }
+    }
+}
+
 fn assess_wayland(probe: &Probe) -> PermissionReport {
     let mut report = PermissionReport::all_not_applicable();
-    let (screencast, remote_desktop) = match probe.portal {
+    let screencast = match probe.portal {
         Portal::Unreachable => {
             report.screen_capture = PermissionState::Denied;
             report.notes.push(
@@ -134,12 +200,9 @@ fn assess_wayland(probe: &Probe) -> PermissionReport {
                  screen sharing on Wayland needs it"
                     .into(),
             );
-            (Interface::Absent, Interface::Absent)
+            Interface::Absent
         }
-        Portal::Reachable {
-            screencast,
-            remote_desktop,
-        } => (screencast, remote_desktop),
+        Portal::Reachable { screencast, .. } => screencast,
     };
 
     if probe.portal != Portal::Unreachable {
@@ -162,26 +225,6 @@ fn assess_wayland(probe: &Probe) -> PermissionReport {
         };
     }
 
-    report.input_injection = match remote_desktop {
-        Interface::Present { .. } => {
-            if probe.token.as_ref().is_some_and(|t| t.covers_input) {
-                PermissionState::Granted
-            } else {
-                PermissionState::NotDetermined
-            }
-        }
-        // No portal route to input: the opt-in uinput device is the only way in.
-        Interface::Absent if probe.uinput_writable => {
-            report
-                .notes
-                .push("remote control uses /dev/uinput (no remote-control portal here)".into());
-            PermissionState::Granted
-        }
-        Interface::Absent => {
-            report.notes.push(NO_REMOTE_CONTROL_NOTE.into());
-            PermissionState::Denied
-        }
-    };
     report
 }
 
@@ -211,52 +254,79 @@ pub(crate) fn request(session: SessionType, state_dir: &Path, p: OsPermission) {
         tracing::debug!("a portal consent request is already open");
         return;
     }
-    let path = portal_token::path_in(state_dir);
+    let state_dir = state_dir.to_owned();
     let Some(rt) = runtime() else {
         IN_FLIGHT.store(false, Ordering::Release);
         return;
     };
     rt.spawn(async move {
-        match run_flow(want_input, &path).await {
+        let outcome = if want_input {
+            input_flow(&state_dir).await
+        } else {
+            screen_flow(&portal_token::path_in(&state_dir))
+                .await
+                .map_err(|e| {
+                    if e.is_cancel() {
+                        FlowError::Dismissed
+                    } else {
+                        FlowError::Failed(e.to_string())
+                    }
+                })
+        };
+        match outcome {
             Ok(()) => {}
-            Err(e) if e.is_cancel() => {
-                tracing::info!("portal consent dismissed by the user");
-            }
-            Err(e) => tracing::warn!("portal consent flow failed: {e}"),
+            Err(FlowError::Dismissed) => tracing::info!("portal consent dismissed by the user"),
+            Err(FlowError::Failed(e)) => tracing::warn!("portal consent flow failed: {e}"),
         }
         IN_FLIGHT.store(false, Ordering::Release);
     });
 }
 
-/// ScreenCast (+ RemoteDesktop when input is wanted) up to `Start`, then store the
-/// restore token and close. The capture session (`portal_capture`) restores it.
-async fn run_flow(want_input: bool, token_path: &Path) -> Result<(), Failure> {
+enum FlowError {
+    Dismissed,
+    Failed(String),
+}
+
+/// Remote control: go through the process's shared portal session, the one
+/// the injector uses. A live session answers at once without touching the
+/// restore token (it is single-use, so starting a second session from it
+/// would spend it twice); otherwise this starts one (the dialog, unless the
+/// token restores it), which stores the new token and is closed again when
+/// this flow lets go of it, unless an injector picked it up meanwhile.
+async fn input_flow(state_dir: &Path) -> Result<(), FlowError> {
+    let session = portal_shared::acquire(state_dir);
+    let result = match session.granted().await {
+        Ok(_) => Ok(()),
+        Err(e) if e.dismissed => Err(FlowError::Dismissed),
+        Err(e) => Err(FlowError::Failed(e.message.clone())),
+    };
+    drop(session);
+    result
+}
+
+/// Screen capture only: ScreenCast up to `Start`, then store the restore token
+/// and close. The capture session (`portal_capture`) restores it.
+async fn screen_flow(token_path: &Path) -> Result<(), Failure> {
     let existing = portal_token::read(token_path);
-    if !want_input && existing.as_ref().is_some_and(|t| t.covers_input) {
+    if existing.as_ref().is_some_and(|t| t.covers_input) {
         // A combined token already restores capture; a screen-only one would
         // overwrite it and silently drop remote control.
         return Ok(());
     }
-    let previous = previous_token(want_input, existing.as_ref());
-    let scope = if want_input {
-        Scope::ScreenAndInput
-    } else {
-        Scope::Screen
-    };
+    let previous = previous_token(false, existing.as_ref());
     // No bound, never abandoned: the settings screen polls in the background while
     // the user decides.
-    let granted = portal_session::start(scope, previous, None, std::future::pending()).await?;
+    let granted =
+        portal_session::start(Scope::Screen, previous, None, std::future::pending()).await?;
     let stored = granted.token.clone();
     granted.session.close().await;
-    // Only a token handed to `Start` is spent; a screen-only token kept back from a
-    // combined request is still valid if the portal returns no replacement.
     portal_token::replace(token_path, previous.is_some(), stored.as_ref());
     Ok(())
 }
 
 /// The stored token to hand back so a still-valid grant is renewed without a dialog.
 /// Only one of the same scope: a screen-only token cannot restore devices.
-fn previous_token(want_input: bool, existing: Option<&StoredToken>) -> Option<&str> {
+pub(crate) fn previous_token(want_input: bool, existing: Option<&StoredToken>) -> Option<&str> {
     existing
         .filter(|t| !want_input || t.covers_input)
         .map(|t| t.token.as_str())
@@ -309,15 +379,6 @@ async fn read_version(connection: &zbus::Connection, name: &'static str) -> fdo:
     u32::try_from(value).map_err(|e| zbus::Error::from(e).into())
 }
 
-/// Opening `/dev/uinput` for writing creates nothing; it only proves the udev rule
-/// (or root) lets this user create virtual input devices.
-fn uinput_writable() -> bool {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/uinput")
-        .is_ok()
-}
-
 fn probe_vaapi() -> Vaapi {
     let render_node = std::fs::read_dir("/dev/dri")
         .map(|dir| {
@@ -334,6 +395,7 @@ fn probe_vaapi() -> Vaapi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::UinputAccess;
 
     const NO_VAAPI: Vaapi = Vaapi {
         render_node: false,
@@ -349,7 +411,13 @@ mod tests {
             session: SessionType::Wayland,
             portal,
             token: None,
-            uinput_writable: false,
+            input: Capabilities {
+                session: SessionType::Wayland,
+                xtest: false,
+                wlr_virtual_input: false,
+                portal_remote_desktop: None,
+                uinput: UinputAccess::Denied("no access".into()),
+            },
             vaapi: NO_VAAPI,
         }
     }
@@ -372,11 +440,49 @@ mod tests {
     fn x11_needs_no_permissions() {
         let mut p = wayland(Portal::Unreachable);
         p.session = SessionType::X11;
+        p.input.xtest = true;
         let r = assess(&p);
         assert_eq!(r.screen_capture, PermissionState::NotApplicable);
         assert_eq!(r.input_injection, PermissionState::NotApplicable);
         assert_eq!(r.input_monitoring, PermissionState::NotApplicable);
         assert!(r.notes.iter().any(|n| n.contains("X11")));
+    }
+
+    #[test]
+    fn x11_without_xtest_needs_the_uinput_fallback() {
+        let mut p = wayland(Portal::Unreachable);
+        p.session = SessionType::X11;
+        let r = assess(&p);
+        assert_eq!(r.input_injection, PermissionState::Denied);
+        assert!(r.notes.iter().any(|n| n.contains("XTEST")), "{r:?}");
+        assert!(!r.notes.contains(&NO_REMOTE_CONTROL_NOTE.to_owned()));
+        p.input.uinput = UinputAccess::Writable;
+        assert_eq!(assess(&p).input_injection, PermissionState::Granted);
+    }
+
+    #[test]
+    fn wlroots_virtual_input_needs_no_permission() {
+        let mut p = wayland(Portal::Reachable {
+            screencast: present(5),
+            remote_desktop: Interface::Absent,
+        });
+        p.input.wlr_virtual_input = true;
+        let r = assess(&p);
+        assert_eq!(r.input_injection, PermissionState::NotApplicable);
+        assert!(r.notes.iter().any(|n| n.contains("wlroots")));
+        assert!(!r.notes.contains(&NO_REMOTE_CONTROL_NOTE.to_owned()));
+    }
+
+    #[test]
+    fn a_version_1_remote_desktop_portal_cannot_carry_libei() {
+        let mut p = wayland(Portal::Reachable {
+            screencast: present(5),
+            remote_desktop: present(1),
+        });
+        p.token = token(true);
+        let r = assess(&p);
+        assert_eq!(r.input_injection, PermissionState::Denied);
+        assert!(r.notes.iter().any(|n| n.contains("version 1")), "{r:?}");
     }
 
     #[test]
@@ -433,7 +539,7 @@ mod tests {
             screencast: present(5),
             remote_desktop: Interface::Absent,
         });
-        p.uinput_writable = true;
+        p.input.uinput = UinputAccess::Writable;
         let r = assess(&p);
         assert_eq!(r.input_injection, PermissionState::Granted);
         assert!(!r.notes.contains(&NO_REMOTE_CONTROL_NOTE.to_owned()));
@@ -442,7 +548,7 @@ mod tests {
     #[test]
     fn writable_uinput_does_not_override_a_working_portal() {
         let mut p = wayland(gnome());
-        p.uinput_writable = true;
+        p.input.uinput = UinputAccess::Writable;
         assert_eq!(assess(&p).input_injection, PermissionState::NotDetermined);
     }
 
@@ -490,7 +596,7 @@ mod tests {
         };
         portal_token::write(&path, &combined).unwrap();
         // Returns before touching D-Bus, so this runs without a portal.
-        runtime().unwrap().block_on(run_flow(false, &path)).unwrap();
+        runtime().unwrap().block_on(screen_flow(&path)).unwrap();
         assert_eq!(portal_token::read(&path), Some(combined));
     }
 

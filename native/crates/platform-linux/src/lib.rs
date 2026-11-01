@@ -8,10 +8,12 @@
 //! permissions preflight (L12), shortcut capture (L7), hardware video encode
 //! (L3) and decode (L4) ([`LinuxCodecs`]), the Cisco OpenH264 fallback (D2),
 //! X11 screen capture with display enumeration (L2, [`X11Capture`]), Wayland
-//! screen capture through the portal and PipeWire (L1) and the video surface +
-//! wgpu presenter (L5: X11 child window, Wayland subsurface) are real; every
-//! other capability fails safely with a clear message until its task lands
-//! (see `plans/05-TASKS.md`, lane L).
+//! screen capture through the portal and PipeWire (L1), the video surface +
+//! wgpu presenter (L5: X11 child window, Wayland subsurface) and remote-control
+//! input injection (L6: XTest, wlroots virtual input, the RemoteDesktop
+//! portal's libei, opt-in uinput) are real; every other capability fails
+//! safely with a clear message until its task lands (see `plans/05-TASKS.md`,
+//! lane L).
 
 #![cfg(target_os = "linux")]
 
@@ -38,16 +40,18 @@ use platform_api::{
 };
 pub use x11_connect::x11_connect;
 
+mod input;
 mod permissions;
 mod portal_capture;
 mod portal_session;
+mod portal_shared;
 mod portal_token;
 mod shortcuts;
 mod surface;
 
-/// Private X servers for the unit tests (clipboard, shortcuts), declared once
-/// here so the shared file is one module (`tests/x11_capture.rs` includes it
-/// separately, as its own crate).
+/// Private X servers for the unit tests (clipboard, shortcuts, input), declared
+/// once here so the shared file is one module (`tests/x11_capture.rs` includes
+/// it separately, as its own crate).
 #[cfg(test)]
 #[path = "../tests/support/xserver.rs"]
 mod test_xserver;
@@ -202,7 +206,7 @@ impl Platform for LinuxPlatform {
     }
 
     fn create_injector(&self) -> Result<Box<dyn InputInjector>, InputError> {
-        Err(InputError::Unavailable(format!("remote control {NOT_YET}")))
+        input::create(self.session, &self.paths().log_dir)
     }
 
     fn create_shortcut_hook(&self) -> Option<Box<dyn ShortcutHook>> {

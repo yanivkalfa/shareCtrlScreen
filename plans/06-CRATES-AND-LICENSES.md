@@ -48,7 +48,9 @@ every crate below.
 | `nvidia-video-codec-sdk` | 0.4.0 | MIT | NVENC/NVDEC bindings (needs SDK headers at build, `cudarc`); alternative: in-tree `dlopen` binding over MIT `nv-codec-headers` |
 | `wayland-client`, `wayland-protocols`, `wayland-protocols-wlr` | 0.31+ | MIT | subsurface, shortcuts-inhibit, fractional-scale, wlr virtual input |
 | `wayland-backend` | 0.3 (already transitive via wayland-client) | MIT | `client_system` feature: libwayland-client backend, needed to join GDK's `wl_display` (`from_foreign_display`; L5, L7) |
-| `input-linux` / `mouse-keyboard-input` | 0.7 / 0.9 | MIT | uinput fallback |
+| `wayland-protocols-misc` | 0.3 (approved for L6, 2026-11-01) | MIT | `zwp_virtual_keyboard_v1` (wlroots virtual keyboard) lives here, not in `-wlr`; same Smithay family |
+| `input-linux` / `mouse-keyboard-input` | 0.7 / 0.9 | MIT | uinput fallback (L6 uses `input-linux`; pulls `nix` 0.29, MIT) |
+| `rustix` | 1 (approved for L6, 2026-11-01) | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | `CLOCK_MONOTONIC` for EI frame timestamps, `memfd_create` for the default keymap; already in the graph through `x11rb` and `reis`, so no new crate |
 | `wl-clipboard-rs` (via arboard) | — | MIT | Wayland clipboard |
 | `gtk`, `gdkx11`, `gdkwayland-sys` (gtk-rs) | 0.18 (the versions tauri 2.11 locks; another minor would load a second gtk-rs type registry) | MIT (bindings; GTK itself is the system's LGPL library, dynamically linked as Tauri already does) | video surface (L5): find the app window's GTK toplevel, follow its layout, take keys from WebKit, XID / `wl_surface` of GDK windows |
 | `wayland-backend` (`client_system`), `wayland-sys` (`client`) | 0.3 / 0.31 (already in the tree via wl-clipboard-rs) | MIT | L5: share GDK's `wl_display` (libwayland guest mode) and create the video `wl_surface` with GDK-safe user data |

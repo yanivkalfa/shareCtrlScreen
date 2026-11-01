@@ -125,6 +125,9 @@ pub(crate) struct Granted {
     pub session: PortalSession,
     /// The ScreenCast proxy `OpenPipeWireRemote` goes through (for both kinds).
     pub screencast: Screencast,
+    /// The RemoteDesktop proxy `ConnectToEIS` goes through; `Some` exactly for a
+    /// combined session.
+    pub remote_desktop: Option<RemoteDesktop>,
     pub streams: Vec<Stream>,
     /// `None` when the portal does not persist (interface version < 4, or the user
     /// unticked "remember" in the dialog).
@@ -146,6 +149,21 @@ impl Granted {
                     .open_pipe_wire_remote(s, Default::default())
                     .await
             }
+        }
+    }
+}
+
+impl Granted {
+    /// The socket to the compositor's EIS server (libei) for a combined session.
+    /// Call it once per session: the connection is the session's one input
+    /// channel (the shared slot's single injector makes the call).
+    pub(crate) async fn connect_to_eis(&self) -> Result<OwnedFd, String> {
+        match (&self.session, &self.remote_desktop) {
+            (PortalSession::Combined(s), Some(rd)) => rd
+                .connect_to_eis(s, Default::default())
+                .await
+                .map_err(|e| format!("the RemoteDesktop portal refused the libei connection: {e}")),
+            _ => Err("this portal session carries no remote control".into()),
         }
     }
 }
@@ -210,6 +228,7 @@ pub(crate) async fn start(
                 Ok((streams, token)) => Ok(Granted {
                     session: PortalSession::Screen(session),
                     screencast,
+                    remote_desktop: None,
                     streams,
                     token,
                 }),
@@ -253,6 +272,7 @@ pub(crate) async fn start(
                 Ok((streams, token)) => Ok(Granted {
                     session: PortalSession::Combined(session),
                     screencast,
+                    remote_desktop: Some(remote_desktop),
                     streams,
                     token,
                 }),

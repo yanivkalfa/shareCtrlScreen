@@ -58,7 +58,8 @@ arboard = { version = "3.6", default-features = false, features = ["wayland-data
 # connection, no libxcb). Capture (task L2) uses MIT-SHM, DAMAGE, XFixes and
 # RandR; `damage` implies `xfixes`, `randr` implies `render`. The shortcut hook
 # (L7) uses the XInput2 keyboard grab (`xinput`) and key replay (`xtest`). The
-# video surface (L5) uses SHAPE for the hover-bar clip.
+# video surface (L5) uses SHAPE for the hover-bar clip; remote control (L6)
+# injects through XTEST and reads the RandR primary monitor.
 x11rb = { version = "0.14", features = ["shm", "damage", "xfixes", "randr", "xinput", "xtest", "shape"] }
 # Wayland selection owner for file lists (data-control protocols).
 wl-clipboard-rs = "0.9"
@@ -92,6 +93,19 @@ raw-window-handle = "0.6"
 gtk = "0.18"
 gdkx11 = "0.18"
 gdkwayland-sys = "0.18"
+# Remote-control input (task L6). `InputMsg`/`Button` are the wire types.
+protocol = { path = "../protocol" }
+# EI protocol client for the RemoteDesktop portal's libei socket (pure Rust).
+reis = "0.7.1"
+# wlroots virtual pointer + keyboard (L6). The virtual keyboard protocol ships
+# in the -misc crate of the same family.
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+# uinput virtual devices (opt-in fallback).
+input-linux = "0.7"
+# CLOCK_MONOTONIC for EI frame timestamps and memfd for the default keymap.
+# Already in the graph through x11rb and reis.
+rustix = { version = "1", features = ["time", "fs"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 tempfile = "3"

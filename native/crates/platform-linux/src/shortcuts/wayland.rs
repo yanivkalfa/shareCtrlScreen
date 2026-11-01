@@ -491,7 +491,7 @@ mod tests {
         }
 
         let display = NonNull::new(conn.backend().display_ptr().cast::<c_void>());
-        let toplevel = surface.id().as_ptr().ok().map(NonNull::cast::<c_void>);
+        let toplevel = NonNull::new(surface.id().as_ptr().cast::<c_void>());
         let (Some(display), Some(toplevel)) = (display, toplevel) else {
             panic!("the system backend exposes its pointers");
         };

@@ -183,15 +183,25 @@ reconnecting — and can end the session.
 
 ## Packaging
 
-Releases are built by the **Release** workflow (`.github/workflows/release.yml`, started by
-hand from Actions). It reads `version` from `native/Cargo.toml` and builds the native Tauri
-app as an NSIS installer plus the Windows service `sharectrl-service.exe`. It publishes both
-to a GitHub Release `v<version>`, and skips the run if that release already exists. To build
-the same on Windows: `cd native && cargo build -p service --release`, then
-`cd app && cargo tauri build --bundles nsis`. The installer lands in
-`native/target/release/bundle/nsis/`. There is no code signing, so SmartScreen warns on first
-run (More info → Run anyway). The legacy Electron app can still be packaged with
-`cd app && npm run dist`.
+Releases are built by the **Release** workflow (`.github/workflows/release.yml`). To cut one,
+set `version` under `[workspace.package]` in `native/Cargo.toml` (the only copy of the
+version), commit, and push the tag `v<version>`. The workflow checks the tag against
+`cargo metadata`, runs the licence gate, builds Windows, macOS and Linux, and publishes a
+GitHub Release with these assets:
+
+| Asset | For |
+|---|---|
+| `ShareCtrlScreen_<version>_x64-setup.exe` | Windows installer (not code-signed: SmartScreen warns, More info → Run anyway) |
+| `sharectrl-service.exe` | Windows service for UAC prompts and the lock screen |
+| `ShareCtrlScreen_<version>_universal.dmg` | macOS 13+, Apple Silicon and Intel |
+| `ShareCtrlScreen_<version>_amd64.deb` / `ShareCtrlScreen-<version>-1.x86_64.rpm` / `ShareCtrlScreen_<version>_amd64.AppImage` | Linux |
+| `THIRD-PARTY-LICENSES-<os>.html` | Licences of the open-source code in that OS's build (also inside each installer) |
+| `SHA256SUMS.txt` | Check downloads with `sha256sum -c SHA256SUMS.txt` |
+
+**Run workflow** in Actions with `dry_run` ticked builds every asset as run artifacts and
+publishes nothing. To build this machine's assets locally the same way, run
+`native/scripts/release-dry-run.sh` (it lists what it needs); the results land in
+`native/dist/`. The legacy Electron app can still be packaged with `cd app && npm run dist`.
 
 ## Known limitations (v1)
 

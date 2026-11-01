@@ -4,6 +4,7 @@
 # grants across updates.
 #
 # Usage: macos-sign.sh path/to/ShareCtrlScreen.app
+#        macos-sign.sh --cleanup     (needs MAC_SIGN_WORKDIR; see below)
 #
 # Environment (both or neither; never passed on the command line):
 #   MAC_SIGN_P12_B64   base64 of the .p12 made by macos-make-signing-cert.sh
@@ -16,6 +17,10 @@
 # Only one   -> error (a half-configured secret pair is a mistake, not a fallback).
 #
 # The certificate is imported into a throw-away keychain that is deleted on exit.
+# MAC_SIGN_WORKDIR (optional) names the directory that keychain lives in, instead of
+# a fresh mktemp one. CI sets it so that a separate `if: always()` step can run
+# `macos-sign.sh --cleanup` and remove the keychain even when this script was killed
+# before its EXIT trap ran (a cancelled job). --cleanup is idempotent.
 # Nothing secret is written to stdout/stderr. (`security import -P` puts the
 # password in argv for the lifetime of that one process; acceptable on an
 # ephemeral CI runner, do not run this on a shared multi-user machine.)
@@ -41,6 +46,32 @@
 
 set -euo pipefail
 
+# cleanup_dir <dir>: undo everything a signing run may have left in <dir>. Safe on a
+# directory that is half set up, already cleaned, or missing.
+cleanup_dir() {
+  local dir="$1"
+  [[ -d "$dir" ]] || return 0
+  # The marker is written only after the certificate was added to the admin trust
+  # store, so this never removes a trust setting it did not add.
+  if [[ -f "$dir/trusted" && -f "$dir/cert.pem" ]]; then
+    sudo -n security remove-trusted-cert -d "$dir/cert.pem" >/dev/null 2>&1 || true
+  fi
+  if [[ -f "$dir/signing.keychain-db" ]]; then
+    security delete-keychain "$dir/signing.keychain-db" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$dir"
+}
+
+if [[ "${1:-}" == "--cleanup" ]]; then
+  if [[ $# -ne 1 || -z "${MAC_SIGN_WORKDIR:-}" ]]; then
+    echo "usage: MAC_SIGN_WORKDIR=dir $0 --cleanup" >&2
+    exit 2
+  fi
+  cleanup_dir "$MAC_SIGN_WORKDIR"
+  echo "signing work directory cleaned"
+  exit 0
+fi
+
 if [[ $# -ne 1 ]]; then
   echo "usage: $0 path/to/App.app" >&2
   exit 2
@@ -62,21 +93,21 @@ if [[ -n "$p12_b64" && -z "$p12_pass" ]] || [[ -z "$p12_b64" && -n "$p12_pass" ]
   exit 1
 fi
 
-work="$(mktemp -d)"
+if [[ -n "${MAC_SIGN_WORKDIR:-}" ]]; then
+  # Must not exist yet: a leftover directory could hold another run's keychain.
+  if [[ -e "$MAC_SIGN_WORKDIR" ]]; then
+    echo "error: MAC_SIGN_WORKDIR '$MAC_SIGN_WORKDIR' already exists" >&2
+    exit 1
+  fi
+  work="$MAC_SIGN_WORKDIR"
+  mkdir -p "$work"
+else
+  work="$(mktemp -d)"
+fi
 chmod 700 "$work"
 keychain="$work/signing.keychain-db"
-trusted_cert=""
 
-cleanup() {
-  if [[ -n "$trusted_cert" ]]; then
-    sudo -n security remove-trusted-cert -d "$trusted_cert" >/dev/null 2>&1 || true
-  fi
-  if [[ -f "$keychain" ]]; then
-    security delete-keychain "$keychain" >/dev/null 2>&1 || true
-  fi
-  rm -rf "$work"
-}
-trap cleanup EXIT
+trap 'cleanup_dir "$work"' EXIT
 
 # codesign refuses bundles carrying resource forks, Finder info or quarantine.
 xattr -cr "$app"
@@ -103,7 +134,7 @@ if [[ -n "$p12_b64" ]]; then
   if sudo -n true >/dev/null 2>&1 &&
     sudo -n security add-trusted-cert -d -r trustRoot -p codeSign \
       -k /Library/Keychains/System.keychain "$work/cert.pem" >/dev/null 2>&1; then
-    trusted_cert="$work/cert.pem"
+    : >"$work/trusted"
   else
     echo "note: certificate not added to the trust store; signing by hash instead"
   fi

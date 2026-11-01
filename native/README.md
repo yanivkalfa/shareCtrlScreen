@@ -102,9 +102,12 @@ macOS 15+ additionally asks about once a month to confirm screen recording; that
 comes from macOS and cannot be turned off by the app.
 
 Maintainers: `scripts/macos-make-signing-cert.sh` creates the certificate (once),
-`scripts/macos-sign.sh` signs a `.app`, `.github/workflows/mac-build.yml` produces the DMG.
-The two repository secrets are `MAC_SIGN_P12_B64` and `MAC_SIGN_P12_PASS`; without them
-the workflow falls back to an ad-hoc signature (permissions are lost on every update).
+`scripts/macos-sign.sh` signs a `.app`, and `scripts/release-assets.sh package macos` builds,
+signs and verifies the DMG (run by `.github/workflows/build-assets.yml`, which both
+`mac-build.yml` and `release.yml` call). The two repository secrets are `MAC_SIGN_P12_B64`
+and `MAC_SIGN_P12_PASS`; without them the build falls back to an ad-hoc signature
+(permissions are lost on every update) and says so in a warning and in the release notes.
+With them, a signature that is not certificate-based fails the build.
 `app/icons/icon.icns` is regenerated with `cargo tauri icon` (command in `../plans/checklists/M10.md`).
 
 ## Linux install
@@ -160,17 +163,27 @@ so enable it only on machines where you accept that.
 Config lives in `~/.config/sharectrl/`.
 
 **Building the packages.** On Ubuntu 22.04: install the packages listed in
-`.github/workflows/linux-build.yml`, then `cargo install tauri-cli --version '^2' --locked`
-and `cd native/app && cargo tauri build --bundles appimage,deb,rpm`. Outputs land in
-`native/target/release/bundle/`. The AppImage step needs FUSE or
-`APPIMAGE_EXTRACT_AND_RUN=1`; it does not work under WSL. The icon PNGs in `app/icons/` are
+`.github/workflows/build-assets.yml` (Linux step), the Tauri CLI and cargo-about at the
+versions pinned there, then run `scripts/release-dry-run.sh linux`. The release assets
+land in `native/dist/`. The AppImage step needs FUSE or `APPIMAGE_EXTRACT_AND_RUN=1` (the
+script sets it); under WSL it is not expected to work, and the script then stops before
+packaging, so build only `deb,rpm` there. The icon PNGs in `app/icons/` are
 regenerated with `python3 app/icons/generate-linux-icons.py`.
 
 ## Licensing (§11 — CI-enforced)
 
 - `deny.toml` — `cargo deny check` allowlist + banned-crate list (AGPL capture crates,
   no-license `hwcodec`, GPL x264/x265). Runs in CI.
-- `about.toml` / `about.hbs` — `cargo about generate` → `third-party-licenses.html`.
+- `about.toml` / `about.hbs` — `cargo about generate`, run per OS by
+  `scripts/release-assets.sh` → `THIRD-PARTY-LICENSES.html` inside each installer and
+  `THIRD-PARTY-LICENSES-<os>.html` on each release. Generated, never committed.
+
+## Releasing
+
+Push the tag `v<version>` matching `[workspace.package] version` (see the root README,
+*Packaging*). The pipeline: `.github/workflows/release.yml` → `build-assets.yml` (one
+reusable workflow per OS) → `scripts/release-assets.sh` (the recipe). Local equivalent:
+`scripts/release-dry-run.sh [--print-build-steps | --skip-build] [windows|macos|linux]`.
 - Clean-room: **zero lines** of RustDesk (AGPL). Every module implemented from
   Microsoft/vendor primary docs.
 

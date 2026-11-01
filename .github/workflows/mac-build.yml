@@ -10,15 +10,15 @@ name: Build macOS DMG
 # app is signed with that certificate, so macOS keeps Screen Recording and
 # Accessibility grants across updates. Without them the app is signed ad-hoc and
 # every build is a new app to macOS (development only). Create the secrets with
-# native/scripts/macos-make-signing-cert.sh. The full release matrix (all OSes,
-# GitHub Release) is a separate workflow; this one only produces the DMG.
+# native/scripts/macos-make-signing-cert.sh.
+#
+# The steps are those of a release, not a copy of them: this calls build-assets.yml,
+# which runs native/scripts/release-assets.sh, exactly as release.yml does. Only the
+# trigger and the artifact name differ.
 #
 # References
+#   - Reusable workflows: https://docs.github.com/en/actions/sharing-automations/reusing-workflows
 #   - Tauri v2 macOS bundle: https://v2.tauri.app/distribute/macos-application-bundle/
-#     and DMG: https://v2.tauri.app/distribute/dmg/
-#   - Runner images (macos-latest is Apple Silicon, Xcode preinstalled):
-#     https://github.com/actions/runner-images/blob/main/README.md#available-images
-#   - Secrets in workflows: https://docs.github.com/en/actions/security-for-github-actions/security-guides/using-secrets-in-github-actions
 
 on:
   workflow_dispatch:
@@ -27,6 +27,7 @@ on:
     paths:
       - "native/**"
       - ".github/workflows/mac-build.yml"
+      - ".github/workflows/build-assets.yml"
 
 # A newer run on the same ref supersedes an in-flight one.
 concurrency:
@@ -38,75 +39,10 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-latest
-    defaults:
-      run:
-        working-directory: native
-    env:
-      BUNDLE_DIR: target/universal-apple-darwin/release/bundle/macos
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: native
-
-      - name: Install Tauri CLI
-        run: cargo install tauri-cli --version "^2.0" --locked
-
-      # `--target universal-apple-darwin` makes the CLI build aarch64-apple-darwin
-      # and x86_64-apple-darwin and `lipo` them into one binary inside one .app.
-      # APPLE_SIGNING_IDENTITY is deliberately unset here, so tauri.conf.json's
-      # ad-hoc "-" applies; the real signature is applied afterwards by
-      # macos-sign.sh so there is exactly one signing code path.
-      - name: Build universal .app
-        run: cargo tauri build --target universal-apple-darwin --bundles app
-
-      - name: Check both architectures are present
-        run: |
-          archs="$(lipo -archs "$BUNDLE_DIR/ShareCtrlScreen.app/Contents/MacOS/sharectrl")"
-          echo "architectures: $archs"
-          [[ "$archs" == *arm64* && "$archs" == *x86_64* ]]
-
-      - name: Sign
-        env:
-          MAC_SIGN_P12_B64: ${{ secrets.MAC_SIGN_P12_B64 }}
-          MAC_SIGN_P12_PASS: ${{ secrets.MAC_SIGN_P12_PASS }}
-        run: |
-          set -o pipefail
-          scripts/macos-sign.sh "$BUNDLE_DIR/ShareCtrlScreen.app" | tee sign.log
-          {
-            echo "### Signature"
-            echo '```'
-            grep -E 'designated|Signing' sign.log
-            echo '```'
-            echo "Two builds signed by the same certificate show the same \`certificate leaf = H\"...\"\` line."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Build DMG
-        run: |
-          stage="$(mktemp -d)"
-          ditto "$BUNDLE_DIR/ShareCtrlScreen.app" "$stage/ShareCtrlScreen.app"
-          ln -s /Applications "$stage/Applications"
-          mkdir -p dist
-          hdiutil create -volname "ShareCtrlScreen" -srcfolder "$stage" \
-            -ov -format UDZO "dist/ShareCtrlScreen-universal-${GITHUB_SHA::7}.dmg"
-
-      - name: Verify the app inside the DMG kept its signature
-        run: |
-          mnt="$(mktemp -d)"
-          hdiutil attach -readonly -nobrowse -mountpoint "$mnt" dist/*.dmg
-          codesign --verify --strict --verbose=2 "$mnt/ShareCtrlScreen.app"
-          hdiutil detach "$mnt"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ShareCtrlScreen-macos-universal
-          path: native/dist/*.dmg
-          if-no-files-found: error
-          retention-days: 14
+    uses: ./.github/workflows/build-assets.yml
+    with:
+      platform: macos
+      artifact-name: ShareCtrlScreen-macos-universal
+    secrets:
+      MAC_SIGN_P12_B64: ${{ secrets.MAC_SIGN_P12_B64 }}
+      MAC_SIGN_P12_PASS: ${{ secrets.MAC_SIGN_P12_PASS }}

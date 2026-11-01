@@ -1,7 +1,14 @@
 # Builds the Linux bundles (AppImage, deb, rpm) on ubuntu-22.04 — the oldest
 # supported distro (glibc 2.35, WebKitGTK 4.1) — and uploads them as artifacts,
-# so the install checklist (plans/checklists/L11.md) can run on real VMs. The full
-# tagged-release matrix lives in release.yml.
+# so the install checklist (plans/checklists/L11.md) can run on real VMs.
+#
+# The steps are those of a release, not a copy of them: this calls build-assets.yml,
+# which runs native/scripts/release-assets.sh, exactly as release.yml does. Only the
+# trigger and the artifact name differ.
+#
+# References
+#   - Reusable workflows: https://docs.github.com/en/actions/sharing-automations/reusing-workflows
+#   - Tauri v2 Linux bundles: https://v2.tauri.app/distribute/
 name: linux-build
 
 on:
@@ -11,45 +18,19 @@ on:
     paths:
       - "native/**"
       - ".github/workflows/linux-build.yml"
+      - ".github/workflows/build-assets.yml"
 
-defaults:
-  run:
-    working-directory: native
+# A newer run on the same ref supersedes an in-flight one.
+concurrency:
+  group: linux-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   bundle:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-      - name: Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config curl wget file libssl-dev libdbus-1-dev \
-            libgtk-3-dev libwebkit2gtk-4.1-dev libxdo-dev \
-            libayatana-appindicator3-dev librsvg2-dev \
-            libpipewire-0.3-dev libva-dev libxkbcommon-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: native
-      - name: Install the Tauri CLI
-        run: cargo install tauri-cli --version '^2' --locked
-      - name: Bundle
-        # APPIMAGE_EXTRACT_AND_RUN: the runner has no FUSE for the AppImage tooling.
-        env:
-          APPIMAGE_EXTRACT_AND_RUN: "1"
-        working-directory: native/app
-        run: cargo tauri build --bundles appimage,deb,rpm
-      - name: Package contents
-        run: |
-          dpkg-deb --info target/release/bundle/deb/*.deb
-          dpkg-deb --contents target/release/bundle/deb/*.deb
-      - uses: actions/upload-artifact@v4
-        with:
-          name: sharectrl-linux
-          if-no-files-found: error
-          path: |
-            native/target/release/bundle/appimage/*.AppImage
-            native/target/release/bundle/deb/*.deb
-            native/target/release/bundle/rpm/*.rpm
+    uses: ./.github/workflows/build-assets.yml
+    with:
+      platform: linux
+      artifact-name: sharectrl-linux

@@ -379,6 +379,43 @@ to run (TCC). Use `objc2` 0.6-family crates throughout (`objc2-app-kit`,
 ### D6 — Per-OS install/usage docs + first-run page  (size S) — README sections per OS; macOS Gatekeeper walkthrough; Linux `vainfo`/udev/portal troubleshooting; "what cannot work" (login screen, Wayland focus).
 
 ### D7 — Release pipeline matrix  (size M) — `release.yml` matrix `{windows-latest, macos-latest (arm64 + x86_64 → universal via `lipo` or two DMGs), ubuntu-22.04}`; assets: NSIS, DMG, AppImage, deb, rpm; `cargo deny check` with the three targets; `cargo about generate` committed as `THIRD-PARTY-LICENSES.html` per OS; version read via `cargo metadata` (not `grep`). Depends on M10, L11.
+* **As built.** One source of truth, three layers:
+  `native/scripts/release-assets.sh` is the recipe (phases `steps` / `build` / `package` /
+  `checksums`; the cargo commands are printed by `steps`, so a build queue runs exactly
+  them); `.github/workflows/build-assets.yml` is a reusable workflow (`workflow_call`) that
+  owns runner setup (packages, rustup, caches, pinned tool versions, signing secrets) and
+  runs the script for one OS; `release.yml`, `mac-build.yml` and `linux-build.yml` only
+  *call* it. M10's and L11's build steps moved into the script and the reusable workflow
+  rather than being duplicated or called as whole workflows (calling them would have made
+  release assets depend on two workflows with their own triggers and naming).
+  `native/scripts/release-dry-run.sh` runs the same recipe on a developer machine.
+* `release.yml`: `v*` tags publish; `workflow_dispatch` with `dry_run` (default on) builds and
+  uploads everything, publishes nothing; publishing from a branch is refused. Version from
+  `cargo metadata --format-version 1` (`scripts/release-version.sh`, jq or python), must equal
+  the tag; `tauri.conf.json` no longer carries a `version` (Tauri takes Cargo's) and the script
+  refuses one. `cargo deny --locked check` once (deny.toml covers all four triples). Assets:
+  NSIS installer + `sharectrl-service.exe`, universal DMG (one, via `--target
+  universal-apple-darwin`, i.e. `lipo`), AppImage, deb, rpm, `THIRD-PARTY-LICENSES-<os>.html`,
+  `SHA256SUMS.txt`. Least-privilege `permissions` (only `publish` writes), concurrency per ref
+  plus one global group for `publish`, actions pinned to commit SHAs.
+* **Deviation from the card (approved by the orchestrator):** the `cargo about` output is
+  **not committed**. A checked-in copy goes stale on every `Cargo.lock` change. Instead each
+  OS build generates it for that OS's triples (`--target`), bundles it into the installer
+  (`app/tauri.release.conf.json` adds it to `bundle.resources`) and attaches it to the
+  release. `about.toml` gained `private = { ignore = true }` (as deny.toml) so `--fail` does
+  not reject our own `Proprietary` crates.
+* **macOS signing policy:** secrets set → the app in the DMG must carry a certificate
+  signature, else the job fails (never an ad-hoc fallback after a failed signing); secrets
+  absent (forks) → ad-hoc with a warning annotation and a line in the release notes. The
+  temporary keychain lives in `$RUNNER_TEMP/mac-sign` and an `always()` step runs
+  `macos-sign.sh --cleanup`.
+* Verified locally: Windows leg end to end (lane D7-03 build + `package` + `sha256sum -c`; the
+  notices file is in the NSIS script); Linux deb + rpm built in WSL (lane D7-04) and the
+  `package linux` phase run on them (notices in both packages; the AppImage slot filled by a
+  placeholder for that run); actionlint + shellcheck clean.
+  **The AppImage is GitHub-only:** linuxdeploy fails in WSL (no FUSE, and the lane cannot set
+  `APPIMAGE_EXTRACT_AND_RUN`). Also verified only by the first GitHub run: the macOS leg
+  (universal build, signing, DMG), artifact merge and `gh release create`.
 
 ---
 

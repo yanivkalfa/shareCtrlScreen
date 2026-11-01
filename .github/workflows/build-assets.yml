@@ -1,0 +1,176 @@
+# Reusable workflow: build the release assets of ONE OS and upload them as an artifact.
+#
+# This is the single CI definition of "how a release asset is made". It is called by
+#   - release.yml      all three OSes, then checksums + GitHub Release
+#   - mac-build.yml    macOS only, on pushes to port/multi-os (tester DMGs)
+#   - linux-build.yml  Linux only, on pushes to port/multi-os (tester packages)
+# and the recipe itself lives in native/scripts/release-assets.sh, which
+# native/scripts/release-dry-run.sh runs on a developer machine. Runner setup (toolchain,
+# system packages, tool versions, caches, signing secrets) is defined here and nowhere else.
+#
+# References
+#   - Reusable workflows (workflow_call inputs/secrets/outputs, permissions of the called
+#     workflow): https://docs.github.com/en/actions/sharing-automations/reusing-workflows
+#   - Runner images (windows-latest, macos-latest = Apple Silicon with Xcode,
+#     ubuntu-22.04; jq, rustup and Git Bash are preinstalled):
+#     https://github.com/actions/runner-images#available-images
+#   - Security hardening: pin actions to a full commit SHA; pass secrets only to the step
+#     that needs them: https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions
+#   - Swatinem/rust-cache (key, workspaces, cache-bin): https://github.com/Swatinem/rust-cache#inputs
+#   - taiki-e/install-action (prebuilt, checksum-verified tool binaries; `tool@version`):
+#     https://github.com/taiki-e/install-action#usage
+#   - actions/upload-artifact v7: https://github.com/actions/upload-artifact#inputs
+#   - Tauri v2 prerequisites for Linux (WebKitGTK 4.1 etc.):
+#     https://v2.tauri.app/start/prerequisites/#linux
+name: build-assets
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        description: "windows | macos | linux"
+        required: true
+        type: string
+      artifact-name:
+        description: Name of the uploaded artifact
+        required: true
+        type: string
+      retention-days:
+        description: Days GitHub keeps the artifact
+        required: false
+        type: number
+        default: 14
+    secrets:
+      # Optional on purpose: without them (forks, or before the owner created the
+      # certificate) the macOS app is signed ad-hoc with a warning. With them, signing
+      # must succeed or the job fails (native/scripts/release-assets.sh, package_macos).
+      MAC_SIGN_P12_B64:
+        required: false
+      MAC_SIGN_P12_PASS:
+        required: false
+    outputs:
+      version:
+        description: Version the assets carry (cargo metadata)
+        value: ${{ jobs.build.outputs.version }}
+      mac-signing:
+        description: "macOS only: certificate | adhoc"
+        value: ${{ jobs.build.outputs.mac-signing }}
+
+permissions:
+  contents: read
+
+env:
+  # Tool versions, pinned so a release is reproducible. Bump deliberately.
+  TAURI_CLI_VERSION: "2.12.3"
+  CARGO_ABOUT_VERSION: "0.9.2"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ inputs.platform }}
+    runs-on: >-
+      ${{ inputs.platform == 'windows' && 'windows-latest'
+      || inputs.platform == 'macos' && 'macos-latest'
+      || 'ubuntu-22.04' }}
+    # Release builds (thin LTO, one codegen unit) take ~20-40 min; this is a hang guard.
+    timeout-minutes: 120
+    env:
+      PLATFORM: ${{ inputs.platform }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      mac-signing: ${{ steps.package.outputs.mac-signing }}
+    defaults:
+      run:
+        # Git Bash on Windows, so one script serves all three runners.
+        shell: bash
+        working-directory: native
+    steps:
+      - name: Check the platform input
+        working-directory: .
+        run: |
+          case "$PLATFORM" in
+            windows | macos | linux) ;;
+            *) echo "::error::platform must be windows, macos or linux (got '$PLATFORM')"; exit 1 ;;
+          esac
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No job step pushes; do not leave the token in .git/config.
+          persist-credentials: false
+
+      # ubuntu-22.04 is the oldest supported distro (glibc 2.35, WebKitGTK 4.1), so
+      # packages built here run on everything newer (plans/00-DECISIONS.md #7).
+      - name: Linux build dependencies
+        if: inputs.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config curl wget file libssl-dev libdbus-1-dev \
+            libgtk-3-dev libwebkit2gtk-4.1-dev libxdo-dev \
+            libayatana-appindicator3-dev librsvg2-dev \
+            libpipewire-0.3-dev libva-dev libxkbcommon-dev
+
+      # rustup is preinstalled on every runner image; using it directly avoids a
+      # third-party action for a two-line job.
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          if [ "$PLATFORM" = macos ]; then
+            rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          fi
+          rustc --version
+
+      # Keyed per platform; rust-cache already folds in Cargo.lock, the rustc version and
+      # the job, and caches ~/.cargo/bin so the tauri-cli install below is a no-op on a
+      # warm cache. A tag run restores only caches of its own ref or the default branch, so a
+      # release never restores a cache made from an arbitrary branch.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: native
+          key: release-${{ inputs.platform }}
+
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-about@${{ env.CARGO_ABOUT_VERSION }}
+
+      # tauri-cli has no prebuilt binary that install-action verifies, so it is built
+      # from crates.io with its own lockfile at an exact version.
+      - name: Install the Tauri CLI
+        run: cargo install tauri-cli --version "=$TAURI_CLI_VERSION" --locked
+
+      - name: Version (cargo metadata)
+        id: version
+        run: |
+          version="$(scripts/release-version.sh)"
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "RELEASE_VERSION=$version" >>"$GITHUB_ENV"
+          echo "::notice::ShareCtrlScreen $version ($PLATFORM)"
+
+      - name: Build (cargo)
+        run: scripts/release-assets.sh build "$PLATFORM"
+
+      # Signing secrets are exposed to this one step only. MAC_SIGN_WORKDIR puts the
+      # temporary keychain where the always() step below can find it.
+      - name: Package (sign, DMG, collect)
+        id: package
+        env:
+          MAC_SIGN_P12_B64: ${{ inputs.platform == 'macos' && secrets.MAC_SIGN_P12_B64 || '' }}
+          MAC_SIGN_P12_PASS: ${{ inputs.platform == 'macos' && secrets.MAC_SIGN_P12_PASS || '' }}
+          MAC_SIGN_WORKDIR: ${{ runner.temp }}/mac-sign
+        run: scripts/release-assets.sh package "$PLATFORM"
+
+      # macos-sign.sh deletes the keychain from its EXIT trap; this covers a run that was
+      # killed before the trap could fire (cancellation, timeout). Idempotent.
+      - name: Delete the temporary signing keychain
+        if: always() && inputs.platform == 'macos'
+        env:
+          MAC_SIGN_WORKDIR: ${{ runner.temp }}/mac-sign
+        run: scripts/macos-sign.sh --cleanup
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: native/dist/*
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention-days }}

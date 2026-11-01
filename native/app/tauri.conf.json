@@ -1,7 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "ShareCtrlScreen",
-  "version": "2.0.0",
   "identifier": "dev.netameta.sharectrl",
   "build": {
     "frontendDist": "ui"

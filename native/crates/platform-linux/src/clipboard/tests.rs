@@ -4,15 +4,27 @@
 //! threads, so every test that touches it holds `exclusive()`. Tests that need a
 //! display, or a helper tool (`xclip`, `wl-paste`), return early with a message
 //! when it is missing: a headless CI runner is not a failure, and the early
-//! return is visible in `--nocapture` output.
+//! return is visible in `--nocapture` output. `SCT_X11_TESTS_REQUIRED=1` turns
+//! a missing Xvfb or xclip into a failure (the X11 tests' shared rule).
+//!
+//! The X11 tests run against a private Xvfb, never the session's display:
+//! under WSLg, `:0` mirrors the Windows clipboard, so anything copying on
+//! Windows (another `cargo test` included) would change what they read.
+
+#[path = "../../tests/support/xserver.rs"]
+mod xserver;
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
+use x11rb::rust_connection::RustConnection;
+use xserver::{installed, XServer};
+
 use super::*;
+use crate::x11_connect::x11_connect;
 
 static CLIPBOARD_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -20,8 +32,50 @@ fn exclusive() -> MutexGuard<'static, ()> {
     lock(&CLIPBOARD_TEST_LOCK)
 }
 
+/// The private X server, alive for the whole test process.
+struct PrivateX {
+    /// Never dropped (it lives in a static); `-terminate` ends the server
+    /// once the last client disconnects, which happens when this process
+    /// exits and closes `_keepalive`.
+    _server: XServer,
+    /// Keeps the client count above zero between tests, so `-terminate` does
+    /// not end the server while an xclip run is the only other client.
+    _keepalive: RustConnection,
+}
+
+static PRIVATE_X: OnceLock<Option<PrivateX>> = OnceLock::new();
+
+/// Whether X servers can create their socket file in `/tmp/.X11-unix`
+/// (WSLg mounts it read-only for its own `:0`).
+fn socket_dir_writable() -> bool {
+    let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
+    !mounts.lines().any(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        f.len() > 3 && f[1] == "/tmp/.X11-unix" && f[3].split(',').any(|o| o == "ro")
+    })
+}
+
+fn start_private_x() -> Option<PrivateX> {
+    // Where the socket file cannot exist, the server is reachable only through
+    // the abstract socket, which `x11_connect` handles but arboard's own x11rb
+    // connection (clipboard text) does not; TCP reaches both.
+    let tcp = !socket_dir_writable();
+    let server = XServer::start("Xvfb", &["-screen", "0", "640x480x24", "-terminate"], None, tcp)?;
+    let (keepalive, _) = x11_connect(&server.name).expect("connect to the private Xvfb");
+    // One display for the whole process, fixed before the first clipboard
+    // use: arboard and the selection owner read `DISPLAY`, and arboard keeps
+    // a process-wide connection. Every test that can touch X11 calls
+    // `x11_available` first, so nothing has read it before this point.
+    std::env::set_var("DISPLAY", &server.name);
+    Some(PrivateX {
+        _server: server,
+        _keepalive: keepalive,
+    })
+}
+
+/// Start (once) the private X server and point `DISPLAY` at it.
 fn x11_available() -> bool {
-    x11rb::connect(None).is_ok()
+    PRIVATE_X.get_or_init(start_private_x).is_some()
 }
 
 fn tool_available(name: &str) -> bool {
@@ -34,8 +88,7 @@ fn tool_available(name: &str) -> bool {
 /// Skips the calling test unless an X11 server and `xclip` are present.
 macro_rules! require_x11 {
     () => {
-        if !x11_available() || !tool_available("xclip") {
-            eprintln!("skipped: needs an X11 display and xclip");
+        if !x11_available() || !installed("xclip") {
             return;
         }
     };
@@ -270,6 +323,8 @@ fn x11_a_second_file_list_replaces_the_first() {
 
 #[test]
 fn wayland_file_list_is_listed_by_wl_paste() {
+    // Pin DISPLAY to the private server before anything can fall back to X11.
+    x11_available();
     if std::env::var_os("WAYLAND_DISPLAY").is_none() || !tool_available("wl-paste") {
         eprintln!("skipped: needs a Wayland session and wl-paste");
         return;
@@ -318,6 +373,8 @@ fn wayland_file_list_is_listed_by_wl_paste() {
 
 #[test]
 fn wayland_set_files_through_the_clipboard_reports_the_count() {
+    // Pin DISPLAY to the private server: file lists fall back to X11 here.
+    x11_available();
     if std::env::var_os("WAYLAND_DISPLAY").is_none() {
         eprintln!("skipped: needs a Wayland session");
         return;

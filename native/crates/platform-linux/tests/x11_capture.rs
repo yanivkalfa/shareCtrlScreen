@@ -1,8 +1,8 @@
 //! X11 capture against real X servers (task L2 acceptance).
 //!
 //! Each test starts its own `Xvfb` (and, for the resize test, an `Xephyr`
-//! nested in it) on its own display number (see [`XServer::start`]), so
-//! tests run in parallel and never touch the developer's desktop.
+//! nested in it) on its own display number (`support/xserver.rs`), so tests
+//! run in parallel and never touch the developer's desktop.
 //!
 //! A test whose server binary (or `xterm`, `xrandr`) is missing prints why
 //! and passes, so a developer box without X tools stays green. Set
@@ -19,9 +19,10 @@
 
 #![cfg(target_os = "linux")]
 
-use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+#[path = "support/xserver.rs"]
+mod xserver;
+
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use platform_api::{CaptureError, CapturedFrame, FrameData, PixelFormat, Rect, ScreenCapture};
@@ -33,98 +34,26 @@ use x11rb::protocol::xproto::{
 };
 use x11rb::rust_connection::RustConnection;
 use x11rb::{COPY_DEPTH_FROM_PARENT, COPY_FROM_PARENT, NONE};
+use xserver::{installed, XServer};
 
 const RED: [u8; 4] = [0, 0, 255, 255];
 
-/// Report a missing prerequisite: a skip normally, a failure when
-/// `SCT_X11_TESTS_REQUIRED=1` says this run must exercise everything.
-fn skip(why: &str) {
-    if std::env::var_os("SCT_X11_TESTS_REQUIRED").is_some_and(|v| v == "1") {
-        panic!("{why}, and SCT_X11_TESTS_REQUIRED=1");
-    }
-    eprintln!("skipping: {why}");
+/// Capture tests never give their servers TCP: TCP cannot pass the MIT-SHM
+/// fd, and Unix sockets (file or abstract) always reach the server.
+const TCP: bool = false;
+
+/// An `Xvfb` with one screen of `size` (`WxHxDepth`).
+fn xvfb(size: &str) -> Option<XServer> {
+    XServer::start("Xvfb", &["-screen", "0", size], None, TCP)
 }
 
-/// An X server child process, killed on drop.
-struct XServer {
-    child: Child,
-    name: String,
+/// What these tests do with a test server.
+trait TestServer {
+    fn client(&self) -> (RustConnection, Window);
+    fn capture(&self, monitor: Option<&str>) -> X11Capture;
 }
 
-/// Next display number to try. Starts high and per process, so parallel
-/// tests and parallel test binaries do not collide with each other or with a
-/// desktop's `:0`/`:1`.
-static NEXT_DISPLAY: AtomicU32 = AtomicU32::new(0);
-
-fn next_display() -> u32 {
-    let base = 200 + (std::process::id() % 400) * 16;
-    base + NEXT_DISPLAY.fetch_add(1, Ordering::SeqCst)
-}
-
-/// Whether display `n` looks taken: its socket file, lock file or abstract
-/// socket exists.
-fn display_taken(n: u32) -> bool {
-    let abstract_name = format!("@/tmp/.X11-unix/X{n}");
-    std::path::Path::new(&format!("/tmp/.X11-unix/X{n}")).exists()
-        || std::path::Path::new(&format!("/tmp/.X{n}-lock")).exists()
-        || std::fs::read_to_string("/proc/net/unix")
-            .is_ok_and(|t| t.lines().any(|l| l.ends_with(&abstract_name)))
-}
-
-impl XServer {
-    /// Start `program` on a free display with `args`. `-displayfd 1` makes
-    /// the server print the display number on stdout once it accepts
-    /// connections, which is the readiness signal. The number is chosen here
-    /// rather than left to `-displayfd`'s own search: that search gives up
-    /// fatally when a low display's socket exists without its lock file
-    /// (WSLg's `/tmp/.X11-unix/X0`). A number someone else took is retried
-    /// with the next one. `None` when the program is not installed.
-    fn start(program: &str, args: &[&str], parent: Option<&str>) -> Option<Self> {
-        for _ in 0..8 {
-            let n = next_display();
-            if display_taken(n) {
-                continue;
-            }
-            let mut cmd = Command::new(program);
-            cmd.arg(format!(":{n}"))
-                .args(args)
-                .args(["-displayfd", "1", "-nolisten", "tcp"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null());
-            if let Some(d) = parent {
-                cmd.env("DISPLAY", d);
-            }
-            let mut child = match cmd.spawn() {
-                Ok(c) => c,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    skip(&format!("{program} is not installed"));
-                    return None;
-                }
-                Err(e) => panic!("cannot start {program}: {e}"),
-            };
-            let stdout = child.stdout.take().expect("piped stdout");
-            let mut line = String::new();
-            BufReader::new(stdout)
-                .read_line(&mut line)
-                .expect("read the display number");
-            if line.trim().is_empty() {
-                // Exited without becoming ready: the number was taken.
-                let _ = child.wait();
-                continue;
-            }
-            return Some(Self {
-                child,
-                name: format!(":{}", line.trim()),
-            });
-        }
-        panic!("{program} did not start on any of 8 display numbers");
-    }
-
-    fn xvfb(size: &str) -> Option<Self> {
-        Self::start("Xvfb", &["-screen", "0", size], None)
-    }
-
+impl TestServer for XServer {
     fn client(&self) -> (RustConnection, Window) {
         let (conn, screen) = x11_connect(&self.name).expect("connect to the test server");
         let root = conn.setup().roots[screen].root;
@@ -134,33 +63,10 @@ impl XServer {
     /// Capture `monitor` of this server, checked to be on the MIT-SHM path.
     fn capture(&self, monitor: Option<&str>) -> X11Capture {
         let cap = X11Capture::open(Some(&self.name), monitor).expect("open capture");
-        eprintln!(
-            "{}: capture open, MIT-SHM {}",
-            self.name,
-            cap.uses_mit_shm()
-        );
+        eprintln!("{}: capture open, MIT-SHM {}", self.name, cap.uses_mit_shm());
         assert!(cap.uses_mit_shm(), "a Unix-socket server must give MIT-SHM");
         cap
     }
-}
-
-impl Drop for XServer {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn installed(program: &str) -> bool {
-    let found = Command::new("sh")
-        .args(["-c", &format!("command -v {program}")])
-        .stdout(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if !found {
-        skip(&format!("{program} is not installed"));
-    }
-    found
 }
 
 /// A mapped window filled with `pixel` (its background), drawn by the server.
@@ -236,7 +142,7 @@ fn drain_first(cap: &mut X11Capture) {
 
 #[test]
 fn first_frame_is_the_whole_screen_then_a_static_screen_is_idle() {
-    let Some(x) = XServer::xvfb("1920x1080x24") else {
+    let Some(x) = xvfb("1920x1080x24") else {
         return;
     };
     let mut cap = x.capture(None);
@@ -277,7 +183,7 @@ fn first_frame_is_the_whole_screen_then_a_static_screen_is_idle() {
 
 #[test]
 fn drawing_produces_dirty_rects_with_the_new_pixels() {
-    let Some(x) = XServer::xvfb("1280x720x24") else {
+    let Some(x) = xvfb("1280x720x24") else {
         return;
     };
     let mut cap = x.capture(None);
@@ -319,7 +225,7 @@ fn a_running_xterm_produces_dirty_rects() {
     if !installed("xterm") {
         return;
     }
-    let Some(x) = XServer::xvfb("1920x1080x24") else {
+    let Some(x) = xvfb("1920x1080x24") else {
         return;
     };
     let mut cap = x.capture(None);
@@ -387,7 +293,7 @@ fn a_running_xterm_produces_dirty_rects() {
 
 #[test]
 fn pointer_moves_are_cursor_only_frames() {
-    let Some(x) = XServer::xvfb("1280x720x24") else {
+    let Some(x) = xvfb("1280x720x24") else {
         return;
     };
     let mut cap = x.capture(None);
@@ -419,10 +325,15 @@ fn randr_resize_is_lost_then_reinit_has_the_new_size() {
     if !installed("xrandr") {
         return;
     }
-    let Some(host) = XServer::xvfb("1920x1080x24") else {
+    let Some(host) = xvfb("1920x1080x24") else {
         return;
     };
-    let Some(x) = XServer::start("Xephyr", &["-screen", "1280x1024x24"], Some(&host.name)) else {
+    let Some(x) = XServer::start(
+        "Xephyr",
+        &["-screen", "1280x1024x24"],
+        Some(&host.name),
+        TCP,
+    ) else {
         return;
     };
     let mut cap = x.capture(None);
@@ -463,7 +374,7 @@ fn randr_resize_is_lost_then_reinit_has_the_new_size() {
 
 #[test]
 fn server_gone_is_lost_and_reinit_says_why() {
-    let Some(x) = XServer::xvfb("640x480x24") else {
+    let Some(x) = xvfb("640x480x24") else {
         return;
     };
     let mut cap = x.capture(None);
@@ -497,7 +408,7 @@ fn server_gone_is_lost_and_reinit_says_why() {
 
 #[test]
 fn displays_list_the_monitors_with_ids_capture_accepts() {
-    let Some(x) = XServer::xvfb("1920x1080x24") else {
+    let Some(x) = xvfb("1920x1080x24") else {
         return;
     };
     let displays = x11_displays(Some(&x.name)).expect("list displays");
@@ -522,7 +433,7 @@ fn displays_list_the_monitors_with_ids_capture_accepts() {
 
 #[test]
 fn a_second_monitor_is_captured_as_its_own_rectangle() {
-    let Some(x) = XServer::xvfb("1920x1080x24") else {
+    let Some(x) = xvfb("1920x1080x24") else {
         return;
     };
     let (conn, root) = x.client();

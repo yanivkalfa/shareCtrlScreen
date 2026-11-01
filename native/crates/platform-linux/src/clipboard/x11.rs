@@ -26,6 +26,7 @@ use x11rb::wrapper::ConnectionExt as _;
 use x11rb::{COPY_DEPTH_FROM_PARENT, NONE};
 
 use super::offer::FileOffer;
+use crate::x11_connect::x11_connect;
 
 /// Request header plus slack; a `ChangeProperty` must fit in one request.
 const REQUEST_OVERHEAD: usize = 64;
@@ -58,8 +59,14 @@ impl X11Owner {
     /// the log) when there is no X server, the payload cannot be served, or
     /// another client wins the race for the selection.
     pub(super) fn acquire(offer: &FileOffer) -> Result<Self, String> {
+        // Through `x11_connect`, so a server reachable only through the
+        // abstract socket (WSLg, some sandboxes) still gets our file list.
+        let display = std::env::var("DISPLAY")
+            .ok()
+            .filter(|d| !d.is_empty())
+            .ok_or("cannot connect to X11: DISPLAY is not set")?;
         let (conn, screen) =
-            RustConnection::connect(None).map_err(|e| format!("cannot connect to X11: {e}"))?;
+            x11_connect(&display).map_err(|e| format!("cannot connect to X11: {e}"))?;
         let conn = Arc::new(conn);
         let io = |e: x11rb::errors::ReplyOrIdError| format!("X11 request failed: {e}");
         let max_payload = conn

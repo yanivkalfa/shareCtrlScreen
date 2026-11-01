@@ -12,8 +12,9 @@
 //! uses, so it reaches every server libxcb reaches. Abstract sockets are Unix
 //! sockets: file descriptors pass over them, so MIT-SHM works.
 //!
-//! Used by the capture; the clipboard's selection owner (task L8) still calls
-//! x11rb directly and adopts this in a follow-up.
+//! Used by the capture and by the clipboard's file-list selection owner.
+//! Clipboard *text* goes through `arboard`, which connects with x11rb itself
+//! and so still needs the socket file (or `DISPLAY` over TCP).
 //!
 //! ## References
 //! * x11rb 0.14 `RustConnection::connect` (socket path, then TCP) and

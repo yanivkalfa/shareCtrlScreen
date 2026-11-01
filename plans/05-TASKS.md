@@ -35,7 +35,8 @@
 | L11 Linux packaging | **done** `8e15a11` (Sonnet) | deb/rpm/AppImage targets + deps, desktop template, hicolor icons, `uinput_access` (pkexec installer), `linux-build.yml`. deb built and inspected in WSL; AppImage/VM installs CI/device-pending (checklists/L11.md). **Owner TODO:** 1024×1024 icon |
 | advisories | **clean** `e92735f` | tokio → 1.54.1; `cargo deny check` passes on all four triples |
 | M2, M3, L1, L2, L4, M6, L7 | queued (Opus cap) | start in wave 2, warm caches |
-| W2, W3, M5, L6, L5, D7, T2, T3, T4 | blocked on dependencies | W3/M5/L6 unblocked by D3; W2 by D2; D7 by M10 (+L11); L5 by the spike |
+| W3 keymap switch | **done** `e2d6b1c` (Sonnet, Opus-reviewed) | `input::scancode` is an adapter over the generated keymap; NumLock is E0 45 (plain 45 is Pause). Device check: NumLock LED toggles, Pause does nothing |
+| W2, M5, L6, L5, D7, T2, T3, T4 | in wave 2 | see rows above/below as they land |
 | everything else | open | as below. |
 
 Interfaces the remaining tasks must use: `Platform::create_capture / create_surface / create_injector / create_shortcut_hook / create_clipboard` (call on the thread that uses the object), `Engine::start(platform, decider)`, `Engine::attach_surface`, `IcePolicy::LoopbackOnly` for tests, mocks in `platform_api::mock`.

@@ -5,7 +5,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, TryLockError};
 
 use platform_api::FileDrop;
 
@@ -115,6 +115,17 @@ impl SurfaceState {
         lock(&self.input)
     }
 
+    /// The input state if it is free right now, `None` if another thread
+    /// holds it. For callers that must never wait (an OS input callback);
+    /// a poisoned lock is recovered as in [`input`](Self::input).
+    pub fn try_input(&self) -> Option<MutexGuard<'_, InputState>> {
+        match self.input.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        }
+    }
+
     pub fn set_drop_sink(&self, sink: Option<Sender<FileDrop>>) {
         *lock(&self.drops) = sink;
     }
@@ -174,6 +185,17 @@ mod tests {
         assert!(s.has_key_focus());
         s.set_key_focus(false);
         assert!(!s.has_key_focus());
+    }
+
+    #[test]
+    fn try_input_never_waits_for_a_holder() {
+        let s = SurfaceState::new();
+        s.input().key("MetaLeft", true);
+        assert!(s.try_input().is_some_and(|i| i.is_key_held("MetaLeft")));
+        let held = s.input();
+        assert!(s.try_input().is_none());
+        std::mem::drop(held);
+        assert!(s.try_input().is_some());
     }
 
     #[test]

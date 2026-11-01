@@ -37,7 +37,7 @@
 | advisories | **clean** `e92735f` | tokio → 1.54.1; `cargo deny check` passes on all four triples |
 | M2 VideoToolbox encode | **done** `096a90f` (Opus, Opus-reviewed; type-checked for aarch64-apple-darwin, device-pending) | H.264 + HEVC, hardware only (OpenH264 fallback via `WithSoftwareH264`). Low-latency rate control first (Apple: High profiles only → H.264 Constrained High, auto level); classic Main session with L3's level rule on `-12902`/`-12908`. Burst cap = WebRTC's 1.5 × target over 1 s (a one-frame hard cap would drop keyframes); max QP 32; live bitrate; sticky forced keyframes; lost sessions rebuilt with backoff. **Acceptance device-pending** (checklists/M2.md): `tests/vt_encode.rs` is all `#[ignore]` and CI's `cargo test --workspace` runs none of it; the GitHub macOS-runner step is added by T2 (after M2 + M3) |
 | M3 VideoToolbox decoder | **done** `a90ddfb` (Opus, Opus-reviewed; type-checked for aarch64-apple-darwin, device-pending) | H.264/HEVC/AV1 → IOSurface `420v` `CvPixelBufferFrame`; format changes keep or rebuild the session; synthetic I_PCM streams test it bit-exact on CI; encode→decode PSNR test is `#[ignore]`d until T2 runs it on a Mac. **Device-pending** (checklists/M3.md) |
-| M6 shortcut tap | **done** (Opus) | session `CGEventTap` on the hook thread; Cmd+Tab/Cmd+\`/Cmd+Space/Ctrl+arrows while the video view has the keyboard (focus published by the view into `SurfaceState::key_focus`); Cmd+Q left to the view's key monitor; macOS `input_monitoring` now needs Input Monitoring **and** Accessibility. **Device-pending** (checklists/M6.md) |
+| M6 shortcut tap | **done** (Opus) | session `CGEventTap` on the hook thread; Cmd+Tab/Cmd+\`/Cmd+Space/Ctrl+arrows while the video view has the keyboard (focus published by the view into `SurfaceState::key_focus`); Cmd+Q left to the view's key monitor; macOS `input_monitoring` now needs Input Monitoring **and** Accessibility. **Device-pending** (checklists/M6.md); the Cmd+Tab acceptance is **blocked** on the owner's host-modifier-mapping decision |
 | L1, L2, L4, L7 | queued (Opus cap) | start in wave 2, warm caches |
 | W3 keymap switch | **done** `e2d6b1c` (Sonnet, Opus-reviewed) | `input::scancode` is an adapter over the generated keymap; NumLock is E0 45 (plain 45 is Pause). Device check: NumLock LED toggles, Pause does nothing |
 | W2 software codec selection | **done** (Sonnet, Opus-reviewed) | H.264 policy on Windows: hardware → MF software decoder → OpenH264 (only while `useOpenH264` is on); `h264_problem()` gives an actionable report when Media Foundation has no H.264 MFTs (N editions without the Media Feature Pack fail at launch — documented). Machine-B check: ignored test + log line "no hardware H264 decoder — using software decode" |
@@ -239,15 +239,19 @@ to run (TCC). Use `objc2` 0.6-family crates throughout (`objc2-app-kit`,
   key (`NSApp.keyWindow`); forward DOM codes; re-enable on `kCGEventTapDisabledByTimeout`;
   ignore events carrying our sentinel; detect `IsSecureEventInputEnabled()` and report.
 * Acceptance (real Mac): Cmd+Tab while focused switches apps on the Windows host, not
-  locally; clicking another window restores local Cmd+Tab instantly.
+  locally — **BLOCKED** on the owner's host-modifier-mapping decision (Cmd arrives as the
+  Win key, so the host gets Win+Tab; see "Open" below); clicking another window restores
+  local Cmd+Tab instantly.
 * As built: Cmd+Q is **not** taken by the tap — it is an app menu shortcut that the video
   view's key monitor (M4) already sends to the remote. Force Quit and screenshots are never
   taken. An active tap needs **Accessibility** (Input Monitoring covers listen-only taps),
   so on macOS `PermissionReport.input_monitoring` — the row the viewer preflight asks for
   when shortcut capture is on — is `Granted` only with Input Monitoring **and**
   Accessibility, and requesting it asks for whichever is missing first (`permissions.rs`).
-  Open: Cmd travels as `MetaLeft`, so a Windows host sees Win+Tab (Task View), not Alt+Tab;
-  mapping Mac modifiers to the host OS's meaning is not part of any task yet.
+  Secure Input does not stop `install`: capture pauses while it is on and resumes by itself.
+  Open (escalated to the owner): Cmd travels as `MetaLeft`, so a Windows host sees Win+Tab
+  (Task View), not Alt+Tab; mapping Mac modifiers to the host OS's meaning is not part of
+  any task yet.
 
 ### M7 — NSPasteboard clipboard  (size S)
 * `impl Clipboard`: `changeCount`, string get/set, `set_files` via `writeObjects([NSURL])`.

@@ -23,9 +23,8 @@
 //! be dropped on another thread by mistake.
 //!
 //! ## Never block the input path
-//! The callback reads one atomic (the view's keyboard focus), may take the
-//! surface's input mutex (held by the UI thread only for bookkeeping and a
-//! channel send, never across AppKit or I/O) and calls the forwarder (a
+//! The callback reads one atomic (the view's keyboard focus), may *try* the
+//! surface's input mutex (never waiting for it) and calls the forwarder (a
 //! channel send). macOS disables a tap whose callback is slow
 //! (`kCGEventTapDisabledByTimeout`); the callback re-enables it at once, and a
 //! once-a-second health check in `run` catches a tap disabled without notice
@@ -40,16 +39,18 @@
 //!   before the next key event arrives.
 //! * Force Quit (Cmd+Option+Esc) is never taken, even if our main thread
 //!   hangs with the flag still set.
-//! * Accessibility revoked while the tap runs: macOS may then block input
-//!   until the tap goes away, and `AXIsProcessTrusted` keeps answering `true`.
-//!   The health check therefore probes by creating a throwaway active tap
-//!   (`NULL` = no longer permitted) and removes ours at once.
+//! * Accessibility revoked while the tap runs: macOS may then block input,
+//!   and `AXIsProcessTrusted` keeps answering `true`. The health check
+//!   therefore probes by creating a throwaway active tap (`NULL` = no longer
+//!   permitted) and removes ours at once — the best an app can do; whether
+//!   that alone unblocks input is checked on a device (checklist M6 §5.4).
 //!
 //! ## Permission and Secure Input
 //! An active keyboard tap needs **Accessibility** (Input Monitoring covers
-//! listen-only taps). `install` checks it, and Secure Input, up front and
-//! returns `false` with the reason in the log instead of creating a tap that
-//! could never see a key.
+//! listen-only taps). `install` checks it up front and returns `false` with
+//! the reason in the log. Secure Input does not stop `install`: a tap created
+//! under it simply sees no keys until it ends, and `run` logs the pause and
+//! the resume.
 //!
 //! ## References
 //! * `CGEventTapCreate`: <https://developer.apple.com/documentation/coregraphics/cgevent/tapcreate(tap:place:options:eventsofinterest:callback:userinfo:)>
@@ -76,9 +77,10 @@
 //! * `IsSecureEventInputEnabled`, `AXIsProcessTrustedWithOptions`: see
 //!   `permissions.rs`.
 //! * Active taps need Accessibility, listen-only taps Input Monitoring; a
-//!   revoked grant blocks input until the tap is removed, and probing with a
-//!   throwaway tap is the reliable detector (`AXIsProcessTrusted` stays
-//!   `true`): Apple Developer Forums thread 735204,
+//!   grant revoked under a running active tap may block input (the thread
+//!   reports it lasting until a restart), and probing with a throwaway tap
+//!   is the reliable detector (`AXIsProcessTrusted` stays `true`): Apple
+//!   Developer Forums thread 735204,
 //!   <https://developer.apple.com/forums/thread/735204>
 //! * Taps silently disabled after re-signing; health-check and re-enable:
 //!   <https://danielraffel.me/til/2026/02/19/cgevent-taps-and-code-signing-the-silent-disable-race/>
@@ -116,9 +118,9 @@ const HEALTH_EVERY: Duration = Duration::from_secs(1);
 const REASON_ACCESSIBILITY: &str = "shortcut capture is off: ShareCtrlScreen does not have the \
     Accessibility permission. Turn it on in System Settings → Privacy & Security → \
     Accessibility, then reconnect.";
-const REASON_SECURE_INPUT: &str = "shortcut capture is off: Secure Input is active (a password \
+const PAUSED_SECURE_INPUT: &str = "shortcut capture paused: Secure Input is active (a password \
     field, or a terminal's \"Secure Keyboard Entry\", has the keyboard), so macOS hides every key \
-    from other apps. Close that field or turn the option off, then reconnect.";
+    from other apps. It resumes by itself when that field closes or the option is turned off.";
 const REASON_TAP_REFUSED: &str = "shortcut capture is off: macOS refused the keyboard tap. In \
     System Settings → Privacy & Security, make sure ShareCtrlScreen is on under both \
     Accessibility and Input Monitoring; if it already is, switch each off and on again (an app \
@@ -167,8 +169,16 @@ impl TapContext {
     }
 
     /// Whether the video view already sent this key's down to the host.
+    ///
+    /// Never waits: if the UI thread holds the input lock right now, answer
+    /// "not held". The worst case is a duplicate modifier-down on the host
+    /// (a harmless repeat); waiting inside the OS input callback is not.
     fn surface_holds(&self, key: u16) -> bool {
-        keymap::dom_code(key).is_some_and(|code| self.state.input().is_key_held(code))
+        keymap::dom_code(key).is_some_and(|code| {
+            self.state
+                .try_input()
+                .is_some_and(|input| input.is_key_held(code))
+        })
     }
 
     /// Send every release still owed (the tap missed, or will miss, them).
@@ -323,7 +333,7 @@ impl EventTapHook {
                 // The tap sees no keys from now on, so it would miss the
                 // releases of anything held.
                 tap.ctx.release_owed();
-                tracing::info!("shortcut capture paused: Secure Input is active");
+                tracing::info!("{PAUSED_SECURE_INPUT}");
             } else {
                 tracing::info!("shortcut capture resumed: Secure Input ended");
             }
@@ -347,12 +357,8 @@ impl ShortcutHook for EventTapHook {
             tracing::warn!("shortcut capture is off: the video surface is not the macOS view");
             return false;
         };
-        // Checked before creating anything: either would leave a tap that
-        // exists but never sees a key, with nothing telling the user why.
-        if permissions::secure_input_active() {
-            tracing::warn!("{REASON_SECURE_INPUT}");
-            return false;
-        }
+        // Checked before creating anything: without it macOS refuses the tap,
+        // and this message says why where a NULL tap could not.
         if !permissions::accessibility_trusted(false) {
             tracing::warn!("{REASON_ACCESSIBILITY}");
             return false;
@@ -390,10 +396,19 @@ impl ShortcutHook for EventTapHook {
         run_loop.add_source(Some(&source), Some(mode));
         CGEvent::tap_enable(port, true);
         tracing::info!("shortcut capture on: Cmd+Tab, Cmd+`, Cmd+Space and Ctrl+arrows go to the remote while its window has the keyboard");
+        // WHY install anyway under Secure Input: it is often on only briefly
+        // (a password manager, a background Terminal with Secure Keyboard
+        // Entry). The tap exists but sees no keys until it ends, and the
+        // health check logs the resume — refusing here would lose capture for
+        // the whole session.
+        let secure_input = permissions::secure_input_active();
+        if secure_input {
+            tracing::info!("{PAUSED_SECURE_INPUT}");
+        }
         self.tap = Some(InstalledTap {
             source,
             ctx,
-            secure_input: Cell::new(false),
+            secure_input: Cell::new(secure_input),
         });
         true
     }

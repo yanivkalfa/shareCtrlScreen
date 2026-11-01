@@ -62,8 +62,6 @@ pub use uinput_access::{
     UinputInstallPlan, UINPUT_GROUP, UINPUT_MODULES_LOAD_PATH, UINPUT_RULE_PATH,
 };
 
-const NOT_YET: &str = "not available on Linux in this version";
-
 /// The display server this session runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionType {

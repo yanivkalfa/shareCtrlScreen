@@ -33,7 +33,10 @@ drop_workspace_artifacts() {
     # script's OUT_DIR under target/, which is not ours to drop), in the base
     # checkout OR any worktree: a shared inode rewritten by another worktree's
     # build names that worktree's sources.
-    if grep -qE 'shareCtrlScreen[\\/](native|\.claude[\\/]worktrees[\\/][^\\/ ]+[\\/]native)[\\/](crates|app|tools|service|spikes)[\\/]' "$d"; then
+    # Cargo writes workspace sources either absolute or relative to the
+    # workspace root ("crates\engine\tests\loopback.rs"); registry sources are
+    # always absolute under ~/.cargo.
+    if grep -qE '(^|[: ])(crates|app|tools|service|spikes)[\\/]|shareCtrlScreen[\\/](native|\.claude[\\/]worktrees[\\/][^\\/ ]+[\\/]native)[\\/](crates|app|tools|service|spikes)[\\/]' "$d"; then
       stem="$(basename "$d" .d)"; hash="${stem##*-}"
       rm -f "$dest"/deps/"$stem" "$dest"/deps/"$stem".* "$dest"/deps/lib"$stem".*
       rm -rf "$dest"/.fingerprint/*-"$hash" "$dest"/build/*-"$hash"
@@ -49,8 +52,13 @@ seed_profile() {
   [ -d "$base/deps" ] || { echo "  no cache at $base, skipping"; return 0; }
   if [ -d "$dest/deps" ]; then echo "  $dest already seeded"; return 0; fi
   mkdir -p "$dest"
-  for d in deps build .fingerprint; do
-    [ -d "$base/$d" ] && cp -al "$base/$d" "$dest/$d"
+  # deps/ is linked (the bulk, and never rewritten while fingerprints are
+  # consistent). build/ and .fingerprint/ are COPIED: cargo rewrites fingerprint
+  # JSONs and build-script outputs in place, and a shared inode there made one
+  # worktree's rebuild invalidate every sibling (wave 2 cascade).
+  [ -d "$base/deps" ] && cp -al "$base/deps" "$dest/deps"
+  for d in build .fingerprint; do
+    [ -d "$base/$d" ] && cp -a "$base/$d" "$dest/$d"
   done
   # Drop our own crates' entries (both name spellings: hyphen and underscore),
   # then everything else built from this repository (tests, examples, bins).
@@ -78,6 +86,29 @@ if [ "${1:-}" = "--prune" ]; then
   fi
   exit 0
 fi
+# --reseed <TASK> <worktree-root>: throw away a worktree's deps/build/.fingerprint
+# (Windows + WSL) and seed again from the base. Only while that worktree's lane
+# is idle.
+if [ "${1:-}" = "--reseed" ]; then
+  task="${2:?task id}"; root="${3:?worktree root}"
+  for triple in "" aarch64-apple-darwin x86_64-apple-darwin; do
+    d="$root/native/target/${triple:+$triple/}debug"
+    [ -d "$d" ] || continue
+    rm -rf "$d/deps" "$d/build" "$d/.fingerprint"
+  done
+  main="$(git -C "$root" worktree list --porcelain | head -1 | sed 's/^worktree //')"
+  base="$main/native/target"
+  for triple in "" aarch64-apple-darwin x86_64-apple-darwin; do
+    seed_profile "$base/${triple:+$triple/}debug" "$root/native/target/${triple:+$triple/}debug"
+  done
+  if command -v wsl.exe >/dev/null 2>&1; then
+    script_win="$(cygpath -m "$(realpath "$0")")"
+    drive="$(echo "${script_win:0:1}" | tr 'A-Z' 'a-z')"
+    wsl.exe -e bash -lc "rm -rf \$HOME/sct/$task/debug/deps \$HOME/sct/$task/debug/build \$HOME/sct/$task/debug/.fingerprint; bash '/mnt/$drive/${script_win:3}' --wsl '$task'"
+  fi
+  exit 0
+fi
+
 # --prune-base: the base caches themselves. Their workspace artifacts were
 # shared with worktrees through hard links and may hold another tree's output
 # while the base's own fingerprints still say "fresh"; drop them so the next

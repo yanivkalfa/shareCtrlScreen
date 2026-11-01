@@ -61,6 +61,8 @@ while ($true) {
             }
         }
 
+        # A `pause` file stops new claims (running jobs finish); the orchestrator uses it for cache maintenance.
+        if (Test-Path -LiteralPath (Join-Path $Lane 'pause')) { Start-Sleep -Seconds 5; continue }
         $inFlight = @(Get-ChildItem -LiteralPath $Running -Filter '*.request' -ErrorAction SilentlyContinue).Count
         $max = Slots
         if ($inFlight -lt $max) {

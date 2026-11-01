@@ -6,7 +6,8 @@
 //! and `size` (compositor logical coordinates, the space xdg-output and EI
 //! regions use) and, from ScreenCast version 5, its `mapping_id`, which EIS
 //! implementations attach to the matching EI region. The capture publishes it
-//! on every successful open; the injector reads it when it has no target.
+//! on every successful open and clears it when it lets go of the session; the
+//! injector reads it when it has no target.
 //!
 //! ## References
 //! * ScreenCast `Start` stream properties `position`, `size`, `mapping_id`:
@@ -50,7 +51,13 @@ pub(crate) fn publish(monitor: Monitor) {
     *CURRENT.lock().unwrap_or_else(PoisonError::into_inner) = Some(monitor);
 }
 
-/// The monitor the capture last opened, if any.
+/// Forget the monitor: the capture let go of its session, so a later
+/// injector must not aim at a monitor from a session that is over.
+pub(crate) fn clear() {
+    *CURRENT.lock().unwrap_or_else(PoisonError::into_inner) = None;
+}
+
+/// The monitor of the capture's live session, if any.
 pub(crate) fn current() -> Option<Monitor> {
     CURRENT
         .lock()

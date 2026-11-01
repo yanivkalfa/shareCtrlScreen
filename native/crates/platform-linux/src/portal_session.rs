@@ -132,6 +132,9 @@ pub(crate) struct Granted {
     /// `None` when the portal does not persist (interface version < 4, or the user
     /// unticked "remember" in the dialog).
     pub token: Option<StoredToken>,
+    /// The user granted both keyboard and pointer (a combined session only;
+    /// known whether or not the portal returned a token).
+    pub covers_input: bool,
 }
 
 impl Granted {
@@ -222,15 +225,16 @@ pub(crate) async fn start(
                     token: token.to_owned(),
                     covers_input: false,
                 });
-                Ok((started.streams().to_vec(), token))
+                Ok((started.streams().to_vec(), token, false))
             };
             match bounded(handshake, bound, abandon).await {
-                Ok((streams, token)) => Ok(Granted {
+                Ok((streams, token, covers_input)) => Ok(Granted {
                     session: PortalSession::Screen(session),
                     screencast,
                     remote_desktop: None,
                     streams,
                     token,
+                    covers_input,
                 }),
                 Err(e) => {
                     PortalSession::Screen(session).close().await;
@@ -266,15 +270,16 @@ pub(crate) async fn start(
                     token: token.to_owned(),
                     covers_input,
                 });
-                Ok((started.streams().to_vec(), token))
+                Ok((started.streams().to_vec(), token, covers_input))
             };
             match bounded(handshake, bound, abandon).await {
-                Ok((streams, token)) => Ok(Granted {
+                Ok((streams, token, covers_input)) => Ok(Granted {
                     session: PortalSession::Combined(session),
                     screencast,
                     remote_desktop: Some(remote_desktop),
                     streams,
                     token,
+                    covers_input,
                 }),
                 Err(e) => {
                     PortalSession::Combined(session).close().await;

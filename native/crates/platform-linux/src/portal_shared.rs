@@ -259,7 +259,7 @@ async fn portal_handshake(
         Ok(granted) => {
             // A token handed to `Start` is spent whatever happens next.
             portal_token::replace(&token_path, previous.is_some(), granted.token.as_ref());
-            if !granted.token.as_ref().is_none_or(|t| t.covers_input) {
+            if !granted.covers_input {
                 tracing::warn!(
                     "portal: remote control was granted without both {:?} and {:?}; input \
                      will not reach the desktop. Allow both keyboard and pointer when asked",
@@ -272,9 +272,7 @@ async fn portal_handshake(
         // Nobody is waiting; L1's start closed the session.
         Err(Failure::Abandoned) => None,
         Err(f) => {
-            // `Start` consumed the token it was handed even though it failed:
-            // a spent token must not be offered again (L12's rule).
-            if previous.is_some() {
+            if previous.is_some() && token_spent_by(&f) {
                 portal_token::replace(&token_path, true, None);
             }
             Some(Err(SharedError {
@@ -283,6 +281,17 @@ async fn portal_handshake(
             }))
         }
     }
+}
+
+/// Whether a failed handshake spent the token it was handed (L12's rule:
+/// spent = handed to that `Start`). Only a dismissed dialog proves it: the
+/// dialog appeared, so `Start` saw the token and it did not restore. Every
+/// other failure may have happened before `Start` (the portal not up yet at
+/// an autostart login, a portal restart, `CreateSession` or `Select*`
+/// refused), and deleting a still-valid grant would make the next
+/// connection to an unattended host need someone at it.
+fn token_spent_by(f: &Failure) -> bool {
+    f.is_cancel()
 }
 
 fn describe(f: &Failure) -> String {
@@ -436,6 +445,23 @@ mod tests {
             0,
             "a refusal closes nothing"
         );
+    }
+
+    #[test]
+    fn only_a_dismissed_dialog_spends_the_stored_token() {
+        use ashpd::desktop::ResponseError;
+        assert!(token_spent_by(&Failure::Refused(ashpd::Error::Response(
+            ResponseError::Cancelled
+        ))));
+        // Possibly before `Start`: a transient failure keeps a valid grant.
+        assert!(!token_spent_by(&Failure::Unreachable(
+            ashpd::Error::NoResponse
+        )));
+        assert!(!token_spent_by(&Failure::Refused(ashpd::Error::Response(
+            ResponseError::Other
+        ))));
+        assert!(!token_spent_by(&Failure::Refused(ashpd::Error::NoResponse)));
+        assert!(!token_spent_by(&Failure::TimedOut(Duration::from_secs(1))));
     }
 
     #[test]

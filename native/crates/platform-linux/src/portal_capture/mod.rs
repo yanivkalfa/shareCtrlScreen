@@ -218,6 +218,8 @@ impl Held {
     }
 
     async fn release(self) {
+        // The monitor the capture published belongs to this session.
+        crate::portal_monitor::clear();
         match self {
             Held::Own(session) => session.close().await,
             Held::Shared(shared) => drop(shared),

@@ -8,7 +8,8 @@
 //!   stream of a codec it builds, every frame's NV12 SHA-256 against
 //!   FFmpeg's.
 //! * [`shape`] — the encoder-output conformance check (Annex-B, in-band
-//!   parameter sets on every IDR, IDR first, no B slices, no reordering),
+//!   parameter sets on every IDR, IDR first, no reordering — low-delay B
+//!   accepted — and no SP/SI slices),
 //!   run on every committed golden and on each encoder that can run.
 //! * [`session`] — the scripted host session (forced keyframe, live bitrate
 //!   drop) every encoder records, and the writer for new goldens.

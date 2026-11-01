@@ -33,9 +33,12 @@ jobs:
         # (SCT_CODEC_TESTS_REQUIRED, comma list of backend names).
         # * windows-latest: OpenH264 (Cisco download; runners have network).
         #   The Media Foundation rows (MF H.264 decoder, MF encoder shape)
-        #   run too but probe and skip: no run has yet proven the runner
-        #   image has Microsoft's H.264 MFTs (Windows Server ships them only
-        #   with the Media Foundation feature). Once a run's log shows
+        #   skip when the MFTs are absent and run (and must pass) when
+        #   present; they are not required yet because no run has proven the
+        #   runner image has Microsoft's H.264 MFTs (Windows Server ships them
+        #   only with the Media Foundation feature). On a GPU-less runner they
+        #   use a WARP D3D11 device, a path machine A (which has a GPU) never
+        #   exercised; the first pushed run checks it. Once a run's log shows
         #   `matrix: media-foundation × … PASS`, make this
         #   `openh264,media-foundation` (plans/checklists/I5.md).
         # * ubuntu-22.04: OpenH264. No GPU, so NVENC/NVDEC print SKIP and the

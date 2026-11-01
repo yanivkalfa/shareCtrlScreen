@@ -298,27 +298,26 @@ fn session_config(codec: Codec, width: u32, height: u32) -> EncoderConfig {
     }
 }
 
-/// Record the scripted session on a Media Foundation encoder.
-fn mf_session(
+/// Record the scripted session on a built Media Foundation encoder. Any
+/// failure here is the encoder breaking mid-session, never an absent one.
+fn record_mf_session(
     dev: &D3d11Device,
-    codec: Codec,
+    enc: &mut MfEncoder,
     width: u32,
     height: u32,
-) -> Result<(Session, bool), CodecError> {
-    let mut enc = mf_encoder(dev, session_config(codec, width, height))?;
-    let hardware = enc.is_hardware();
-    let s = session::record(&mut enc, width, height, FRAMES, |e, f| {
+) -> Result<Session, CodecError> {
+    session::record(enc, width, height, FRAMES, |e, f| {
         encode_on_gpu(&dev.0, e, f)
-    })?;
-    Ok((s, hardware))
+    })
 }
 
 /// Encoder-output conformance (task I5) for Media Foundation: the scripted
 /// session (forced keyframe, live bitrate drop) has the engine's shape —
 /// H.264 on whatever encoder MF builds (hardware MFT, else Microsoft's
 /// software one), HEVC where a hardware HEVC MFT exists. Prints `SKIP
-/// media-foundation-encoder` when there is no device with video support or
-/// no encoder.
+/// media-foundation-encoder` only when there is no device or the encoder
+/// cannot be built (no MFT, no video support on the device); once an
+/// encoder exists, any failure during the session fails the test.
 #[test]
 fn media_foundation_output_has_the_engine_shape() {
     logs();
@@ -331,8 +330,8 @@ fn media_foundation_output_has_the_engine_shape() {
         codecs.push(Codec::Hevc);
     }
     for c in codecs {
-        let (s, hardware) = match mf_session(&dev, c, 640, 360) {
-            Ok(r) => r,
+        let mut enc = match mf_encoder(&dev, session_config(c, 640, 360)) {
+            Ok(e) => e,
             Err(e) => {
                 skip::skip(
                     "media-foundation-encoder",
@@ -341,7 +340,13 @@ fn media_foundation_output_has_the_engine_shape() {
                 continue;
             }
         };
-        let which = if hardware { "hardware" } else { "software" };
+        let which = if enc.is_hardware() {
+            "hardware"
+        } else {
+            "software"
+        };
+        let s = record_mf_session(&dev, &mut enc, 640, 360)
+            .unwrap_or_else(|e| panic!("Media Foundation {c:?} ({which}) session: {e}"));
         match shape::check_session(c, &s) {
             Ok(shape) => eprintln!("Media Foundation {c:?} ({which}): {shape:?}"),
             Err(e) => panic!("Media Foundation {c:?} ({which}): {e}"),
@@ -381,12 +386,14 @@ fn regenerate_media_foundation_goldens() {
         eprintln!("no hardware HEVC MFT here: no mf-hevc golden");
     }
     for (name, c, w, h) in streams {
-        let (s, hardware) = mf_session(&dev, c, w, h).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let mut enc =
+            mf_encoder(&dev, session_config(c, w, h)).unwrap_or_else(|e| panic!("{name}: {e}"));
         assert!(
-            hardware,
+            enc.is_hardware(),
             "{name}: Media Foundation fell back to the software encoder; \
              a golden named mf-* must come from the hardware MFT"
         );
+        let s = record_mf_session(&dev, &mut enc, w, h).unwrap_or_else(|e| panic!("{name}: {e}"));
         if let Err(e) = shape::check_session(c, &s) {
             panic!("{name}: {e}");
         }

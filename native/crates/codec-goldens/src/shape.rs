@@ -155,9 +155,14 @@ pub fn check_units(codec: Codec, units: &[EncodedUnit]) -> Result<Shape, String>
 }
 
 /// [`check`] plus the session script: one access unit per frame, keyframes
-/// exactly on frame 0 and on the forced frame. Unit `n` is frame `n`
-/// because encoders never reorder or drop frames in this recipe (no B
-/// frames, frame skipping off), whatever their pipeline delay.
+/// exactly on frame 0 and on the forced frame (unit `n` is frame `n`:
+/// encoders in this recipe neither reorder nor skip frames).
+///
+/// Deliberately stricter than `platform_api::VideoEncoder`, which allows
+/// zero units while an encoder warms up: here every frame must come out of
+/// its own `encode` call, because a frame held back is a frame of latency
+/// on the wire. A failure of this rule on a device is therefore a latency
+/// finding about that encoder, not a broken stream.
 pub fn check_session(codec: Codec, session: &Session) -> Result<Shape, String> {
     let shape = check_units(codec, &session.units)?;
     if session.units.len() != session.frames {

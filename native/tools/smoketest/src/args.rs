@@ -74,7 +74,7 @@ fn parse_size(v: &str) -> Result<(u32, u32), String> {
     let w: u32 = w.parse().map_err(|_| bad())?;
     let h: u32 = h.parse().map_err(|_| bad())?;
     // Odd sides cannot be encoded as 4:2:0.
-    if w == 0 || h == 0 || w % 2 != 0 || h % 2 != 0 {
+    if w == 0 || h == 0 || !w.is_multiple_of(2) || !h.is_multiple_of(2) {
         return Err(bad());
     }
     Ok((w, h))

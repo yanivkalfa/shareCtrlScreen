@@ -273,7 +273,7 @@ pub(crate) fn host_media_loop(
                             // produced — with a QP floor this can exceed the CBR
                             // target, and paying for it in frames is the point.
                             debt_bytes += u.data.len() as i64;
-                            if sent == 1 || sent % 120 == 0 {
+                            if sent == 1 || sent.is_multiple_of(120) {
                                 tracing::info!(
                                     "host: encoded+sent AU #{sent} ({} bytes, keyframe={}, bitrate={}kbps)",
                                     u.data.len(),

@@ -132,7 +132,7 @@ pub(crate) fn viewer_media_loop(
                         Ok(Some(frame)) => {
                             undecoded_streak = 0;
                             rendered += 1;
-                            if rendered == 1 || rendered % 120 == 0 {
+                            if rendered == 1 || rendered.is_multiple_of(120) {
                                 tracing::info!(
                                     "viewer: decoded frame #{rendered} (skipped {skipped} total)"
                                 );
@@ -149,7 +149,7 @@ pub(crate) fn viewer_media_loop(
                             // place a black screen hid (decode fine, render dead).
                             if let Err(e) = presenter.present(&frame, cursor) {
                                 render_errors += 1;
-                                if render_errors <= 10 || render_errors % 120 == 0 {
+                                if render_errors <= 10 || render_errors.is_multiple_of(120) {
                                     tracing::warn!("render error #{render_errors}: {e}");
                                 }
                             }

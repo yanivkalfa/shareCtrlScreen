@@ -270,7 +270,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn unhex(s: &[u8]) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let digit = |c: u8| match c {

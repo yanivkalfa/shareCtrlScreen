@@ -318,7 +318,7 @@ impl MsgBuilder {
             .extend_from_slice(&(val.len() as u16).to_be_bytes());
         self.buf.extend_from_slice(val);
         // Pad to 4.
-        while self.buf.len() % 4 != 0 {
+        while !self.buf.len().is_multiple_of(4) {
             self.buf.push(0);
         }
     }

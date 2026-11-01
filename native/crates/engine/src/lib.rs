@@ -24,8 +24,14 @@ use platform_api::{Codec, Platform, VideoSurface};
 use protocol::{Config, ControlMsg, Mode, Permission, SignalData, SignalMsg};
 use signaling::{Event as SigEvent, SignalingClient};
 use std::sync::Arc;
+use std::time::Duration;
 
 pub use handshake::{ApprovalDecision, Decider};
+
+/// How long auto-login waits for the OS secret store to open a saved password
+/// before asking the user instead. Long enough to answer a keyring unlock
+/// prompt, short enough that a wedged store does not leave the connect hanging.
+const SECRET_PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Which side of a session this instance is currently playing. A machine
 /// supports one active session at a time (contract §1 v1 simplification).
@@ -470,9 +476,7 @@ impl Engine {
         let stale = self.auto_attempted.lock().as_deref() == Some(from.as_str());
         if stale {
             *self.auto_attempted.lock() = None;
-            self.update_config(|c| {
-                c.saved_logins.remove(&from);
-            });
+            self.forget_saved_login(&from);
             let _ = self
                 .ui
                 .send(UiEvent::Toast("Saved password no longer works".into()));
@@ -481,7 +485,7 @@ impl Engine {
         }
 
         // Auto-login: replay a password this host has already accepted.
-        if let Some(plain) = self.saved_login(&from) {
+        if let Some(plain) = self.saved_login(&from).await {
             *self.auto_attempted.lock() = Some(from.clone());
             tracing::info!("auto-login: submitting saved password for {from}");
             self.submit_password(from, plain, false);
@@ -491,14 +495,105 @@ impl Engine {
     }
 
     /// The stored password for `host`, if auto-login is on and we can decrypt it.
-    fn saved_login(&self, host: &str) -> Option<String> {
-        let cfg = self.config.lock();
-        if !cfg.auto_login {
-            return None;
+    ///
+    /// `open` runs off the runtime and is bounded: a locked OS keyring shows an
+    /// unlock prompt and waits for the user, and this is called from the
+    /// signaling loop, which must keep serving (the host side of this same
+    /// process, TURN, further requests). No answer in time means "no saved
+    /// password" and the user is asked normally.
+    async fn saved_login(&self, host: &str) -> Option<String> {
+        let sealed = {
+            let cfg = self.config.lock();
+            if !cfg.auto_login {
+                return None;
+            }
+            cfg.saved_logins.get(host)?.clone()
+        };
+        let store = self.platform.secrets();
+        let open = tokio::task::spawn_blocking(move || store.open(&sealed));
+        match tokio::time::timeout(SECRET_PROMPT_TIMEOUT, open).await {
+            Ok(Ok(plain)) => plain,
+            Ok(Err(e)) => {
+                tracing::warn!("auto-login: secret store failed while opening: {e}");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "auto-login: the secret store gave no answer in {}s (an OS unlock prompt?) \
+                     — asking for the password instead",
+                    SECRET_PROMPT_TIMEOUT.as_secs()
+                );
+                None
+            }
         }
-        let sealed = cfg.saved_logins.get(host)?.clone();
-        drop(cfg);
-        self.platform.secrets().open(&sealed)
+    }
+
+    /// Remove `host`'s saved password and let the OS store drop its copy.
+    fn forget_saved_login(&self, host: &str) {
+        let mut removed = None;
+        self.update_config(|c| removed = c.saved_logins.remove(host));
+        self.forget_sealed(removed.into_iter().collect());
+    }
+
+    /// Hand sealed values whose config entries are gone to the store's `forget`,
+    /// off the runtime (a keyring may prompt); nothing waits for it.
+    fn forget_sealed(&self, sealed: Vec<String>) {
+        if sealed.is_empty() {
+            return;
+        }
+        let store = self.platform.secrets();
+        tokio::task::spawn_blocking(move || {
+            for s in &sealed {
+                store.forget(s);
+            }
+        });
+    }
+
+    /// Seal `plaintext` and save it for `host`, detached from the caller: the
+    /// host has just accepted the password, and `seal` may sit behind an OS
+    /// unlock prompt that must not stall the signaling loop. Reported through
+    /// the log and a toast, as before.
+    fn save_login(&self, host: String, plaintext: String) {
+        let store = self.platform.secrets();
+        let config = Arc::clone(&self.config);
+        let config_path = self.config_path.clone();
+        let ui = self.ui.clone();
+        tokio::spawn(async move {
+            let seal = {
+                let store = Arc::clone(&store);
+                tokio::task::spawn_blocking(move || store.seal(&plaintext))
+            };
+            let sealed = match seal.await {
+                Ok(Some(sealed)) => sealed,
+                Ok(None) => {
+                    tracing::warn!("auto-login: could not encrypt password — not saving");
+                    let _ = ui.send(UiEvent::Toast(
+                        "Could not save the password securely".into(),
+                    ));
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!("auto-login: secret store failed while sealing: {e}");
+                    let _ = ui.send(UiEvent::Toast(
+                        "Could not save the password securely".into(),
+                    ));
+                    return;
+                }
+            };
+            let replaced = {
+                let mut cfg = config.lock();
+                cfg.auto_login = true;
+                let old = cfg.saved_logins.insert(host.clone(), sealed);
+                let _ = cfg.persist(&config_path);
+                old
+            };
+            tracing::info!("auto-login: saved password for {host}");
+            // The previous entry for this host is unreachable now; let the OS
+            // store release it too.
+            if let Some(old) = replaced {
+                tokio::task::spawn_blocking(move || store.forget(&old));
+            }
+        });
     }
 
     /// UI action: answer a `password-required` prompt (viewer side). `remember`
@@ -519,7 +614,11 @@ impl Engine {
 
     /// UI action: forget every saved auto-login password.
     pub fn clear_saved_logins(&self) {
-        self.update_config(|c| c.saved_logins.clear());
+        let mut all = Vec::new();
+        self.update_config(|c| {
+            all = std::mem::take(&mut c.saved_logins).into_values().collect();
+        });
+        self.forget_sealed(all);
     }
 
     async fn on_connect_response(
@@ -549,9 +648,7 @@ impl Engine {
             // replaying a password the host no longer accepts and the prompt
             // would never reappear: a permanent lockout from that host.
             if r == "bad-password" && auto.as_deref() == Some(from.as_str()) {
-                self.update_config(|c| {
-                    c.saved_logins.remove(&from);
-                });
+                self.forget_saved_login(&from);
                 let _ = self.ui.send(UiEvent::Toast(
                     "Saved password was rejected — forgotten, please connect again".into(),
                 ));
@@ -564,23 +661,12 @@ impl Engine {
         // is the only point at which it's worth saving. Sealed by the platform's
         // secret store; if that fails we simply don't save (never plaintext).
         *self.auto_attempted.lock() = None;
-        if let Some((host, plaintext, remember)) = self.pending_login.lock().take() {
+        // Taken into a local first: the lock must not be held across the save
+        // (`submit_password` on the UI thread takes it too).
+        let pending = self.pending_login.lock().take();
+        if let Some((host, plaintext, remember)) = pending {
             if remember && host == from {
-                match self.platform.secrets().seal(&plaintext) {
-                    Some(sealed) => {
-                        self.update_config(|c| {
-                            c.auto_login = true;
-                            c.saved_logins.insert(host, sealed);
-                        });
-                        tracing::info!("auto-login: saved password for {from}");
-                    }
-                    None => {
-                        tracing::warn!("auto-login: could not encrypt password — not saving");
-                        let _ = self.ui.send(UiEvent::Toast(
-                            "Could not save the password securely".into(),
-                        ));
-                    }
-                }
+                self.save_login(host, plaintext);
             }
         }
         // The host told us which codec it will stream; decode with the same (§3).

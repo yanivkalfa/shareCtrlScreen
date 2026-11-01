@@ -31,10 +31,23 @@ pub const MAX_TEXT_BYTES: usize = 256 * 1024;
 /// Failure is `None`, and the caller then does **not** save — never fall back to
 /// plaintext. Protects against file exposure, not against code running as the
 /// same user.
+///
+/// `seal` and `open` may block on an OS prompt with no timeout of their own (a
+/// locked Keychain or Secret Service keyring asks the user to unlock it), so
+/// callers on an async runtime run them in `spawn_blocking` and bound the wait.
 pub trait SecretStore: Send + Sync {
     fn seal(&self, plain: &str) -> Option<String>;
     /// `None` for foreign, corrupt or garbage input; never panics.
     fn open(&self, sealed: &str) -> Option<String>;
+    /// Drop whatever the OS keeps for `sealed`; called once its config entry is
+    /// gone. A store whose sealed string is self-contained (DPAPI) has nothing
+    /// to do, which is the default. A store that keeps the secret in an OS
+    /// keyring (Keychain, Secret Service) deletes that item. Foreign, corrupt
+    /// or already-deleted input is not an error; a failure is logged by the
+    /// store, never returned.
+    fn forget(&self, sealed: &str) {
+        let _ = sealed;
+    }
 }
 
 /// Start the app at user sign-in (not boot). The registered command is the

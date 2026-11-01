@@ -54,8 +54,6 @@ use wayland_backend::client::{Backend, ObjectId};
 use wayland_client::globals::{registry_queue_init, GlobalList};
 use wayland_client::protocol::wl_buffer::WlBuffer;
 use wayland_client::protocol::wl_compositor::{self, WlCompositor};
-use wayland_client::protocol::wl_data_device::WlDataDevice;
-use wayland_client::protocol::wl_data_device_manager::WlDataDeviceManager;
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::protocol::wl_shm::{self, WlShm};
 use wayland_client::protocol::wl_subcompositor::WlSubcompositor;
@@ -134,9 +132,6 @@ pub(crate) struct Created {
     pub(crate) objects: WlObjects,
     pub(crate) queue: EventQueue<Dispatcher>,
     pub(crate) seat: WlSeat,
-    /// Our own data device on the seat, for file drops on the video (`None`
-    /// when the compositor has no `wl_data_device_manager`).
-    pub(crate) data_device: Option<WlDataDevice>,
 }
 
 /// Build the surface tree (not yet attached to any parent).
@@ -175,11 +170,6 @@ pub(crate) unsafe fn create(
     // v5 adds wl_pointer.frame/axis_discrete, v8 axis_value120. v1 still
     // works (no frames: wheel is flushed per event).
     let seat: WlSeat = bind(&globals, &qh, "wl_seat", 1, 8)?;
-    // v3: drag actions and `finish`, which v3 sources require.
-    let data_device = globals
-        .bind::<WlDataDeviceManager, _, _>(&qh, 1..=3, ())
-        .ok()
-        .map(|m| m.get_data_device(&seat, &qh, ()));
     // A fractional scale is only usable with a viewport (the surface size is
     // the viewport destination, not buffer / buffer_scale).
     let fractional_manager: Option<WpFractionalScaleManagerV1> = viewporter
@@ -250,7 +240,6 @@ pub(crate) unsafe fn create(
         },
         queue,
         seat,
-        data_device,
     })
 }
 

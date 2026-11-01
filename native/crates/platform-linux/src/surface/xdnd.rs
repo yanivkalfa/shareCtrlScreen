@@ -85,6 +85,12 @@ pub(crate) struct Xdnd {
     proxied: Mutex<bool>,
 }
 
+/// Whether `(x, y)` (video window px) is on the visible video: inside the
+/// window and below the revealed strip.
+fn over_video((x, y): (f64, f64), size: (u32, u32), top_inset: f64) -> bool {
+    x >= 0.0 && y >= top_inset && x < f64::from(size.0) && y < f64::from(size.1)
+}
+
 fn x_err(e: impl std::fmt::Display) -> SurfaceError {
     SurfaceError::Backend(format!("X11 drag-and-drop setup failed: {e}"))
 }
@@ -194,12 +200,14 @@ impl Xdnd {
         }
     }
 
-    /// Handle an XDND event; `false` when it was not one.
+    /// Handle an XDND event; `false` when it was not one. `top_inset`: the
+    /// physical px currently cut from the video's top (the revealed toolbar).
     pub(crate) fn handle(
         &self,
         conn: &RustConnection,
         event: &Event,
         state: &SurfaceState,
+        top_inset: f64,
     ) -> bool {
         match event {
             Event::ClientMessage(m) if m.format == 32 => {
@@ -208,7 +216,7 @@ impl Xdnd {
                 if t == self.atoms.enter {
                     self.on_enter(conn, m.window, d);
                 } else if t == self.atoms.position {
-                    self.on_position(conn, d, state);
+                    self.on_position(conn, d, state, top_inset);
                 } else if t == self.atoms.leave {
                     *lock(&self.drag) = None;
                 } else if t == self.atoms.drop {
@@ -248,23 +256,34 @@ impl Xdnd {
         });
     }
 
-    fn on_position(&self, conn: &RustConnection, d: [u32; 5], state: &SurfaceState) {
+    fn on_position(
+        &self,
+        conn: &RustConnection,
+        d: [u32; 5],
+        state: &SurfaceState,
+        top_inset: f64,
+    ) {
         let mut guard = lock(&self.drag);
         let Some(drag) = guard.as_mut().filter(|g| g.source == d[0]) else {
             return;
         };
         // data.l[2] = root x << 16 | root y.
         let (rx, ry) = ((d[2] >> 16) as i16, (d[2] & 0xffff) as i16);
-        if let Some(r) = conn
+        let point = conn
             .translate_coordinates(self.root, self.window, rx, ry)
             .ok()
             .and_then(|c| c.reply().ok())
-        {
+            .map(|r| (f64::from(r.dst_x), f64::from(r.dst_y)));
+        // The proxy brings drags over the whole app window; like the Windows
+        // child window, only the visible video takes them — not the header
+        // bar, nor the revealed toolbar strip, which belong to the page.
+        let on_video = point.is_some_and(|p| over_video(p, state.size(), top_inset));
+        if let Some((x, y)) = point {
             // Where the user lets go is where the host pastes (the same as
             // the Windows surface).
-            drag.pos = state.normalize(f64::from(r.dst_x), f64::from(r.dst_y));
+            drag.pos = state.normalize(x, y);
         }
-        drag.accepted = drag.offers_uri_list && state.accepts_drops();
+        drag.accepted = drag.offers_uri_list && on_video && state.accepts_drops();
         // Bit 0: accept; bit 1: keep sending positions (no "quiet" rectangle).
         let flags = if drag.accepted { 0b11 } else { 0b10 };
         let action = if drag.accepted {
@@ -362,5 +381,25 @@ impl Xdnd {
         {
             tracing::debug!("video surface: XDND reply failed: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_visible_video_takes_drops() {
+        let size = (1280, 720);
+        assert!(over_video((640.0, 360.0), size, 0.0));
+        assert!(over_video((0.0, 0.0), size, 0.0));
+        // The revealed toolbar strip is the page's.
+        assert!(!over_video((640.0, 20.0), size, 40.0));
+        assert!(over_video((640.0, 40.0), size, 40.0));
+        // Outside the window (the header bar, another monitor).
+        assert!(!over_video((-1.0, 100.0), size, 0.0));
+        assert!(!over_video((640.0, -5.0), size, 0.0));
+        assert!(!over_video((1280.0, 100.0), size, 0.0));
+        assert!(!over_video((100.0, 720.0), size, 0.0));
     }
 }

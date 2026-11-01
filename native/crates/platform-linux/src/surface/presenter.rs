@@ -71,10 +71,13 @@ pub(crate) trait Repaint: Send + Sync {
 #[derive(Debug)]
 struct DisplayHolder(RawDisplayHandle);
 
-// SAFETY: the handle is a libwayland `wl_display` or Xlib `Display` pointer
-// that lives for the whole process (GDK never closes its display while the app
-// runs; tao's Xlib display is never closed), and it is only handed to EGL and
-// Vulkan, which are thread-safe for display use.
+// SAFETY: the handle lives for the whole process and its users are
+// serialized: on X11 it is tao's private Xlib `Display` (never closed, used by
+// nobody but this presenter, whose draws run under the `Core` mutex — so EGL /
+// Vulkan WSI never use it from two threads at once, which libX11 < 1.8 without
+// `XInitThreads` would not survive); on Wayland it is GDK's `wl_display`,
+// which libwayland makes thread-safe (one mutex per display) and GDK never
+// closes while the app runs.
 unsafe impl Send for DisplayHolder {}
 // SAFETY: as above.
 unsafe impl Sync for DisplayHolder {}

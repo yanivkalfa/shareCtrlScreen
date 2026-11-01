@@ -40,6 +40,7 @@
 //!   (gtk/gtkmain.c, "if (!event_widget)"):
 //!   <https://gitlab.gnome.org/GNOME/gtk/-/blob/gtk-3-24/gtk/gtkmain.c>
 
+mod gdk_drop;
 mod geometry;
 mod input;
 mod wl;
@@ -70,7 +71,7 @@ use wayland_client::{Proxy, QueueHandle};
 use self::geometry::{buffer_scale_for, Geometry, VideoLayout, SCALE_DENOMINATOR};
 use self::input::Dispatcher;
 use self::wl::{BuildError, WlObjects};
-use super::gtk_host::{self, HostEvents, HostLink, Toplevel};
+use super::gtk_host::{self, HostEvents, HostLink, MainBound, Toplevel};
 use super::presenter::{Target, WgpuPresenter};
 use super::{lock, KeptHandles};
 
@@ -417,6 +418,9 @@ pub(crate) struct WaylandSurface {
     shared: Arc<Shared>,
     input: Option<JoinHandle<()>>,
     host: Option<HostLink>,
+    /// Routes drags on the sink window to the drop sink while it lives
+    /// (removed on the main thread when the surface drops).
+    _drops: MainBound<gdk_drop::RouteToken>,
     /// Handles for window-level hooks (in-window layout only).
     handles: Option<KeptHandles>,
 }
@@ -434,13 +438,15 @@ fn wl_surface_of(window: &gdk::Window) -> Option<NonNull<c_void>> {
 ///
 /// It is stored on the toplevel, so it lives exactly as long as the toplevel
 /// object, which outlives every surface it parents.
-fn create_sink(toplevel: &gtk::Window) -> Result<NonNull<c_void>, SurfaceError> {
+fn create_sink(toplevel: &gtk::Window) -> Result<(gdk::Window, NonNull<c_void>), SurfaceError> {
     let attrs = gdk::WindowAttr {
         window_type: gdk::WindowType::Toplevel,
         wclass: gdk::WindowWindowClass::InputOnly,
         width: 1,
         height: 1,
-        // No events selected: GDK filters everything aimed at it before GTK.
+        // No input events selected: pointer/key events aimed at it are
+        // filtered by GDK. Drag-and-drop events are not masked; `gdk_drop`
+        // takes those.
         event_mask: gdk::EventMask::empty(),
         ..gdk::WindowAttr::default()
     };
@@ -451,8 +457,8 @@ fn create_sink(toplevel: &gtk::Window) -> Result<NonNull<c_void>, SurfaceError> 
     // SAFETY: the value type matches every later access (none — it is only
     // kept alive); glib drops it when the toplevel is finalized. The object,
     // and so `ptr`, stays valid until then.
-    unsafe { toplevel.set_data(SINK_KEY, sink) };
-    Ok(ptr.cast::<c_void>())
+    unsafe { toplevel.set_data(SINK_KEY, sink.clone()) };
+    Ok((sink, ptr.cast::<c_void>()))
 }
 
 /// The decision-#3 window: undecorated, transient for the app window, black
@@ -506,11 +512,11 @@ pub(crate) fn create(
         tracing::info!("video surface: {WINDOW_ENV}=separate, using the separate window");
         None
     } else {
-        let sink = create_sink(&app.window)?;
+        let (sink, sink_ptr) = create_sink(&app.window)?;
         // SAFETY: GDK's live connection; the sink is owned by the app
         // toplevel, which outlives the surfaces it parents.
-        match unsafe { wl::create(wl_display, sink, true) } {
-            Ok(created) => Some(created),
+        match unsafe { wl::create(wl_display, sink_ptr, true) } {
+            Ok(created) => Some((created, sink)),
             Err(BuildError::NoViewporter) => {
                 tracing::warn!(
                     "video surface: the compositor has no wp_viewporter; showing the remote \
@@ -521,16 +527,16 @@ pub(crate) fn create(
             Err(BuildError::Failed(e)) => return Err(e),
         }
     };
-    let (mode, top, created) = match in_window {
-        Some(created) => (Mode::InWindow, app, created),
+    let (mode, top, created, sink) = match in_window {
+        Some((created, sink)) => (Mode::InWindow, app, created, sink),
         None => {
             let top = separate_window(&app);
-            let sink = create_sink(&top.window)?;
+            let (sink, sink_ptr) = create_sink(&top.window)?;
             // SAFETY: as above; this sink is owned by the separate window,
             // which outlives the surfaces it parents (it is destroyed with the
             // host link, after the tree is detached by its unmap).
-            let created = unsafe { wl::create(wl_display, sink, false) }?;
-            (Mode::Separate, top, created)
+            let created = unsafe { wl::create(wl_display, sink_ptr, false) }?;
+            (Mode::Separate, top, created, sink)
         }
     };
     let viewport = created.objects.video_viewport.is_some();
@@ -549,13 +555,9 @@ pub(crate) fn create(
         stop: AtomicBool::new(false),
         qh: created.queue.handle(),
     });
-    let input = input::spawn(
-        shared.clone(),
-        created.queue,
-        &created.seat,
-        created.data_device,
-    )
-    .map_err(|e| SurfaceError::Backend(format!("cannot start the video input thread: {e}")))?;
+    let input = input::spawn(shared.clone(), created.queue, &created.seat)
+        .map_err(|e| SurfaceError::Backend(format!("cannot start the video input thread: {e}")))?;
+    let drops = MainBound::new(gdk_drop::route(&sink, Arc::downgrade(&shared)));
     let host = gtk_host::connect(&top, shared.clone(), mode == Mode::Separate);
     if mode == Mode::InWindow {
         // Already mapped: no `map` signal will come for this mapping.
@@ -574,6 +576,7 @@ pub(crate) fn create(
         shared,
         input: Some(input),
         host: Some(host),
+        _drops: drops,
         handles,
     }))
 }
@@ -637,8 +640,8 @@ impl VideoSurface for WaylandSurface {
         self.shared.state.input().set_sink(sink);
     }
 
-    /// Drops on the video arrive on our own `wl_data_device` (GDK sees them
-    /// on the widget-less sink window and ignores them); see `input`.
+    /// Drops on the video arrive through GDK's own data device on the sink
+    /// window, taken there by `gdk_drop` before GTK would drop them.
     fn set_drop_sink(&self, sink: Option<Sender<FileDrop>>) {
         self.shared.state.set_drop_sink(sink);
     }

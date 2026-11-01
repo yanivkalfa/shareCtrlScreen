@@ -6,7 +6,10 @@
 //! own keymaps (spike finding 4), and the key path is shared with X11, whose
 //! test scripts real keycodes.
 //!
-//! Skips (exit 0) when `sway` is not installed.
+//! Skips (exit 0) when `sway` is not installed, unless
+//! `SCT_WAYLAND_TESTS_REQUIRED=1` (the T4 job) makes that a failure. File
+//! drops are not scripted: a drag needs a real drag source with an implicit
+//! grab, which no headless tool provides (device checklist L5 §6).
 
 #[cfg(not(target_os = "linux"))]
 fn main() {}
@@ -134,6 +137,17 @@ mod wayland {
         }
     }
 
+    /// A missing prerequisite: a skip normally, a failure when
+    /// `SCT_WAYLAND_TESTS_REQUIRED=1` says this run must exercise everything
+    /// (the Wayland CI job, T4) — the rule of `tests/support/xserver.rs`.
+    fn skip(why: &str) -> Outcome {
+        if std::env::var_os("SCT_WAYLAND_TESTS_REQUIRED").is_some_and(|v| v == "1") {
+            return Err(format!("{why}, and SCT_WAYLAND_TESTS_REQUIRED=1"));
+        }
+        println!("wayland_surface: SKIPPED ({why})");
+        Ok(())
+    }
+
     fn start_sway(runtime: &Path) -> Result<Option<(Server, String)>, String> {
         let Some(sway) = common::find_program("sway") else {
             return Ok(None);
@@ -205,8 +219,7 @@ mod wayland {
         std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700))
             .map_err(|e| format!("runtime dir: {e}"))?;
         let Some((_sway, socket)) = start_sway(runtime.path())? else {
-            println!("wayland_surface: SKIPPED (sway is not installed)");
-            return Ok(());
+            return skip("sway is not installed");
         };
         // Before GTK (or anything else) reads the environment.
         std::env::set_var("XDG_RUNTIME_DIR", runtime.path());

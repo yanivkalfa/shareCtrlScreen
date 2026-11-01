@@ -105,6 +105,9 @@ hex.workspace = true
 # Scripted input for the headless Wayland video-surface test: the wlroots
 # virtual pointer under headless sway.
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+# The X11 video-surface test opens its own Xlib display, as tao does for the
+# app (already in the tree through gdkx11/tao; MIT).
+x11 = { version = "2.21", features = ["xlib"] }
 
 # The video-surface tests drive GTK, which must own the process' main thread,
 # so they bring their own `main` (libtest runs tests on worker threads). Both

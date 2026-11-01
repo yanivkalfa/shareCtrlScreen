@@ -172,15 +172,28 @@ impl<T: 'static> Drop for MainBound<T> {
             return;
         }
         // Asynchronous on purpose: at process exit the main loop may already
-        // be gone, and a synchronous hop would hang the exit.
-        glib::MainContext::default().invoke(move || {
+        // be gone, and a synchronous hop would hang the exit. The closure
+        // drops `Leaky` wherever it ends up: on the main thread (queued and
+        // run) the value is dropped normally; inline on this thread (nobody
+        // owns the context) or freed unrun when the context is torn down, it
+        // is leaked instead of panicking.
+        let leaky = Leaky(Some(guard));
+        glib::MainContext::default().invoke(move || drop(leaky));
+    }
+}
+
+/// A `ThreadGuard` that is dropped on its own thread and leaked anywhere
+/// else (dropping a `ThreadGuard` off its thread panics).
+struct Leaky<T>(Option<ThreadGuard<T>>);
+
+impl<T> Drop for Leaky<T> {
+    fn drop(&mut self) {
+        if let Some(guard) = self.0.take() {
             if !guard.is_owner() {
-                // Run inline on this non-main thread because nobody owns the
-                // main context (the GTK loop is gone: process exit). The value
-                // cannot be touched — or even dropped — here; leak it.
+                // Process exit: the value cannot be touched here; leak it.
                 std::mem::forget(guard);
             }
-        });
+        }
     }
 }
 
@@ -311,7 +324,17 @@ pub(crate) fn connect(top: &Toplevel, events: Arc<dyn HostEvents>, owned: bool) 
             glib::Propagation::Proceed
         })
     };
-    handlers.push((window_obj, focus));
+    handlers.push((window_obj.clone(), focus));
+    if owned {
+        // Alt+F4 or the compositor's close would destroy our window, and the
+        // remote screen could never be shown again in this session. Its life
+        // is the surface's: refuse the close (the session's own Disconnect
+        // ends it).
+        let close = top
+            .window
+            .connect_delete_event(|_, _| glib::Propagation::Stop);
+        handlers.push((window_obj, close));
+    }
 
     relayout(&*events, top);
     HostLink {

@@ -4,8 +4,12 @@
 //! scripted XTest pointer, wheel and key events into `VideoInput`. Also checks
 //! the `native_handles` / hide-unmaps invariants the L7 shortcut hook needs.
 //!
-//! Skips (exit 0) when `Xvfb` is not installed. Software rendering: lavapipe
-//! (Vulkan) or llvmpipe (GL, `LIBGL_ALWAYS_SOFTWARE=1`).
+//! Skips (exit 0) when `Xvfb` is not installed (a failure under
+//! `SCT_X11_TESTS_REQUIRED=1`). The scenario runs twice: with the default
+//! backend choice (lavapipe Vulkan when installed) and again in a child
+//! process with `WGPU_BACKEND=gl` + `LIBGL_ALWAYS_SOFTWARE=1`, where only the
+//! GL/EGL backend exists — so the GL fallback (llvmpipe) passes the same
+//! checks or the test fails.
 
 #[cfg(not(target_os = "linux"))]
 fn main() {}
@@ -18,12 +22,32 @@ mod common;
 #[path = "support/xserver.rs"]
 mod xserver;
 
+/// Set in the child process that repeats the scenario on the GL backend.
+#[cfg(target_os = "linux")]
+const GL_PASS: &str = "SCT_L5_GL_PASS";
+
 #[cfg(target_os = "linux")]
 fn main() -> std::process::ExitCode {
-    match x11::run() {
+    let gl_pass = std::env::var_os(GL_PASS).is_some();
+    let pass = if gl_pass { "gl" } else { "default backend" };
+    let result = x11::run(pass).and_then(|ran| {
+        // The child only repeats; the parent starts it once its own run
+        // passed (and was not skipped).
+        if gl_pass || !ran {
+            return Ok(());
+        }
+        let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+        let status = std::process::Command::new(exe)
+            .env(GL_PASS, "1")
+            .env("WGPU_BACKEND", "gl")
+            .status()
+            .map_err(|e| format!("cannot start the GL pass: {e}"))?;
+        common::check(status.success(), format!("the GL pass failed ({status})"))
+    });
+    match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("x11_surface: FAILED: {e}");
+            eprintln!("x11_surface ({pass}): FAILED: {e}");
             std::process::ExitCode::FAILURE
         }
     }
@@ -31,8 +55,13 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(target_os = "linux")]
 mod x11 {
+    use std::ffi::{c_void, CString};
+    use std::ptr::NonNull;
     use std::sync::mpsc::channel;
     use std::time::{Duration, Instant};
+
+    // `::x11`: the Xlib crate, not this test module.
+    use ::x11::xlib;
 
     use gtk::prelude::*;
     use platform_api::{Platform, RawDisplayHandle, RawWindowHandle, VideoInput};
@@ -263,13 +292,14 @@ mod x11 {
         }
     }
 
-    pub fn run() -> Outcome {
+    /// The whole scenario. `Ok(false)` = skipped (no Xvfb).
+    pub fn run(pass: &str) -> Result<bool, String> {
         // The shared private-Xvfb harness: a skip when Xvfb is missing, a
         // failure under SCT_X11_TESTS_REQUIRED=1 (the CI Linux job).
         let Some(xvfb) = XServer::start("Xvfb", &["-screen", "0", "1280x800x24"], None, false)
         else {
             println!("x11_surface: SKIPPED (Xvfb is not installed)");
-            return Ok(());
+            return Ok(false);
         };
         let name = xvfb.name.clone();
         // Before GTK (or anything else) reads the environment.
@@ -286,9 +316,24 @@ mod x11 {
             .ok_or("not an X11 window")?
             .xid() as u32;
         let parent = RawWindowHandle::Xlib(XlibWindowHandle::new(toplevel.into()));
-        // No display pointer: the backend must fall back to GDK's own.
-        let display = RawDisplayHandle::Xlib(XlibDisplayHandle::new(None, 0));
         let platform = LinuxPlatform::new();
+        // A handle without a display of its own is refused: GDK's display
+        // must never reach wgpu (it is not thread-safe on libX11 < 1.8).
+        let refused = platform.create_surface(
+            parent,
+            RawDisplayHandle::Xlib(XlibDisplayHandle::new(None, 0)),
+        );
+        check(
+            refused.is_err(),
+            "a handle without an Xlib display was accepted",
+        )?;
+        // What tao does: a private Xlib connection for the handle, never closed.
+        let cname = CString::new(name.clone()).map_err(|e| e.to_string())?;
+        // SAFETY: a valid NUL-terminated display name; the Display is never
+        // closed, so the pointer stays valid for the process.
+        let xdisplay = unsafe { xlib::XOpenDisplay(cname.as_ptr()) };
+        let xdisplay = NonNull::new(xdisplay.cast::<c_void>()).ok_or("XOpenDisplay failed")?;
+        let display = RawDisplayHandle::Xlib(XlibDisplayHandle::new(Some(xdisplay), 0));
         let surface = platform
             .create_surface(parent, display)
             .map_err(|e| format!("create_surface: {e}"))?;
@@ -502,7 +547,7 @@ mod x11 {
 
         drop(surface);
         common::pump_for(Duration::from_millis(100));
-        println!("x11_surface: ok (100 frames, readback, input, clip, drop, hide/show)");
-        Ok(())
+        println!("x11_surface ({pass}): ok (100 frames, readback, input, clip, drop, hide/show)");
+        Ok(true)
     }
 }

@@ -37,7 +37,7 @@
 //!   <https://www.x.org/releases/current/doc/inputproto/XI2proto.txt>
 //! * X cursor font glyphs (`XC_left_ptr` = 68): `X11/cursorfont.h`.
 //! * x11rb 0.14: <https://docs.rs/x11rb/0.14.0/x11rb/>
-//! * `gdk_x11_window_get_xid`, `gdk_x11_display_get_xdisplay`:
+//! * `gdk_x11_window_get_xid`:
 //!   <https://docs.gtk.org/gdk3-x11/>
 
 use std::any::Any;
@@ -48,7 +48,6 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 
-use gtk::glib::translate::ToGlibPtr;
 use gtk::prelude::*;
 use platform_api::{
     FileDrop, Presenter, RawDisplayHandle, RawWindowHandle, SurfaceError, SurfaceHandles,
@@ -136,6 +135,16 @@ fn revealed_rect(size: (u16, u16), scale: f64) -> Rectangle {
     }
 }
 
+/// The opaque black pixel for a window of `depth`: alpha set on a 32-bit
+/// (ARGB) visual, the screen's black pixel otherwise.
+fn opaque_black(depth: u8, screen_black: u32) -> u32 {
+    if depth == 32 {
+        0xff00_0000
+    } else {
+        screen_black
+    }
+}
+
 /// Visibility, serialized against presents: once `hide` returns no frame
 /// reaches the window (the UI paints a modal right after).
 struct Gate {
@@ -165,11 +174,14 @@ pub(crate) struct Shared {
     stop: AtomicBool,
 }
 
-// SAFETY: `xdisplay` is an Xlib `Display*` that lives for the process (tao's,
-// which is never closed, or GDK's own) and is only handed to wgpu, which uses
-// it through thread-safe EGL/Vulkan entry points; every other field is Send.
+// SAFETY: `xdisplay` is the Xlib `Display*` from the window handle — tao's
+// own connection, opened for that handle and never closed, used by nobody but
+// the presenter (see `xlib_display`; GDK's display is refused). It is never
+// dereferenced here: only wgpu (Vulkan WSI / EGL) uses it, from the media
+// thread and the X11 event thread's repaints, which the presenter serializes
+// under its own mutex. Every other field is Send + Sync.
 unsafe impl Send for Shared {}
-// SAFETY: as above; the pointer is never dereferenced here.
+// SAFETY: as above.
 unsafe impl Sync for Shared {}
 
 fn x_err(what: &str) -> impl Fn(x11rb::errors::ConnectionError) -> SurfaceError + '_ {
@@ -285,7 +297,8 @@ impl Shared {
             if self.stop.load(Ordering::SeqCst) {
                 return;
             }
-            if self.xdnd.handle(&self.conn, &event, &self.state) {
+            let inset = lock(&self.reveal).inset_px(self.state.scale());
+            if self.xdnd.handle(&self.conn, &event, &self.state, inset) {
                 continue;
             }
             match event {
@@ -391,23 +404,28 @@ pub(crate) struct X11Surface {
     handles: KeptHandles,
 }
 
-/// The Xlib display wgpu draws through: the handle's (tao opens one per
-/// handle and never closes it), else GDK's own.
+/// The Xlib display wgpu draws through: the one in the handle. tao opens a
+/// fresh `Display` for every display handle it hands out and never closes
+/// it, so nothing else in the process uses it.
+///
+/// WHY not fall back to GDK's own display: GDK's main thread uses it all the
+/// time, while Vulkan WSI / EGL would use it from the media and X11 event
+/// threads. libX11 before 1.8 (Ubuntu 22.04) is not thread-safe unless
+/// `XInitThreads` ran first, and Mesa's xcb traffic on an Xlib-owned socket
+/// would then corrupt GDK's connection.
 fn xlib_display(display: RawDisplayHandle) -> Result<(NonNull<c_void>, i32), SurfaceError> {
-    if let RawDisplayHandle::Xlib(h) = display {
-        if let Some(d) = h.display {
-            return Ok((d, h.screen));
-        }
+    match display {
+        RawDisplayHandle::Xlib(XlibDisplayHandle {
+            display: Some(d),
+            screen,
+            ..
+        }) => Ok((d, screen)),
+        _ => Err(SurfaceError::Backend(
+            "the X11 window handle carries no Xlib display of its own; create the video \
+             surface from the app window's display handle (Tauri/tao provide one)"
+                .into(),
+        )),
     }
-    let gdk_display = gtk::gdk::Display::default()
-        .ok_or_else(|| SurfaceError::Backend("GTK has no display".into()))?;
-    let raw: *mut gtk::gdk::ffi::GdkDisplay = gdk_display.to_glib_none().0;
-    // SAFETY: a live GdkDisplay of the X11 backend (the toplevel was found
-    // through gdkx11 on it); the Xlib display it returns lives as long as GDK.
-    let xdisplay = unsafe { gdkx11::ffi::gdk_x11_display_get_xdisplay(raw.cast()) };
-    let xdisplay = NonNull::new(xdisplay.cast::<c_void>())
-        .ok_or_else(|| SurfaceError::Backend("GDK has no Xlib display".into()))?;
-    Ok((xdisplay, 0))
 }
 
 impl X11Surface {
@@ -447,7 +465,19 @@ impl X11Surface {
                 version.major_version, version.minor_version
             )));
         }
-        let black = conn.setup().roots[screen].black_pixel;
+        // The child copies the toplevel's depth and visual. GTK gives CSD
+        // toplevels a 32-bit ARGB visual under a compositor, where pixel 0
+        // (the root's "black") is fully transparent: the desktop would show
+        // through before the first frame and after every Expose.
+        let parent_depth = conn
+            .get_geometry(parent)
+            .map_err(x_err("GetGeometry"))?
+            .reply()
+            .map_err(|e| {
+                SurfaceError::Backend(format!("the app window {parent:#x} is not usable: {e}"))
+            })?
+            .depth;
+        let black = opaque_black(parent_depth, conn.setup().roots[screen].black_pixel);
         let id = |e: x11rb::errors::ReplyOrIdError| {
             SurfaceError::Backend(format!("X11 id allocation failed: {e}"))
         };
@@ -700,6 +730,12 @@ mod tests {
             child_geometry((40_000, -40_000), (40_000, 10), 1),
             (i16::MAX, i16::MIN, i16::MAX as u16, 10)
         );
+    }
+
+    #[test]
+    fn black_is_opaque_on_argb_visuals() {
+        assert_eq!(opaque_black(32, 0), 0xff00_0000);
+        assert_eq!(opaque_black(24, 0), 0);
     }
 
     #[test]

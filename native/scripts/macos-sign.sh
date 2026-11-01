@@ -51,10 +51,24 @@ set -euo pipefail
 cleanup_dir() {
   local dir="$1"
   [[ -d "$dir" ]] || return 0
+  # Put the user keychain search list back the way it was before the temporary
+  # keychain was prepended (see the signing branch below).
+  if [[ -f "$dir/keychains.txt" ]]; then
+    local -a restore=()
+    while IFS= read -r line; do [[ -n "$line" ]] && restore+=("$line"); done <"$dir/keychains.txt"
+    if [[ ${#restore[@]} -gt 0 ]]; then
+      security list-keychains -d user -s "${restore[@]}" >/dev/null 2>&1 || true
+    fi
+  fi
   # The marker is written only after the certificate was added to the admin trust
-  # store, so this never removes a trust setting it did not add.
+  # store, so this never removes a trust setting it did not add. Bounded by an
+  # alarm: on recent macOS the admin-domain trust change can raise an authorization
+  # dialog, and a headless runner would wait on it forever (release run #7 of
+  # 2.1.1 hung 24 min in exactly this trap). The runner is ephemeral; a trust
+  # setting left behind costs nothing there.
   if [[ -f "$dir/trusted" && -f "$dir/cert.pem" ]]; then
-    sudo -n security remove-trusted-cert -d "$dir/cert.pem" >/dev/null 2>&1 || true
+    perl -e 'alarm shift; exec @ARGV' 30 \
+      sudo -n security remove-trusted-cert -d "$dir/cert.pem" >/dev/null 2>&1 || true
   fi
   if [[ -f "$dir/signing.keychain-db" ]]; then
     security delete-keychain "$dir/signing.keychain-db" >/dev/null 2>&1 || true
@@ -126,6 +140,16 @@ if [[ -n "$p12_b64" ]]; then
   # Lets codesign use the key without a GUI "allow access" prompt.
   security set-key-partition-list -S apple-tool:,apple: -s \
     -k "$keychain_pass" "$keychain" >/dev/null
+  # codesign resolves `-s <hash>` through the user keychain SEARCH LIST; the
+  # --keychain flag alone does not put a fresh keychain there. Without this,
+  # codesign answers "<hash>: no identity found" even though find-identity on
+  # the keychain lists it (release run #7 of 2.1.1). Both the GitHub recipe and
+  # Tauri's prepend the temporary keychain; the previous list is saved so the
+  # cleanup can restore it.
+  security list-keychains -d user | sed -e 's/^[[:space:]]*"//' -e 's/"$//' >"$work/keychains.txt"
+  original_keychains=()
+  while IFS= read -r line; do [[ -n "$line" ]] && original_keychains+=("$line"); done <"$work/keychains.txt"
+  security list-keychains -d user -s "$keychain" "${original_keychains[@]}"
 
   # Without a trust setting `find-identity -v` hides a self-signed certificate.
   # The admin-domain trust needs passwordless sudo, which CI runners have and a

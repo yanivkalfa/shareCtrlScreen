@@ -333,6 +333,7 @@ fn fetch(url: &str) -> Result<Vec<u8>, OpenH264Error> {
     };
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(DOWNLOAD_TIMEOUT))
+        .tls_config(tls_config())
         .build()
         .into();
     let mut response = agent.get(url).call().map_err(|e| fail(e.to_string()))?;
@@ -342,6 +343,24 @@ fn fetch(url: &str) -> Result<Vec<u8>, OpenH264Error> {
         .limit(MAX_ARCHIVE_BYTES)
         .read_to_vec()
         .map_err(|e| fail(e.to_string()))
+}
+
+/// rustls with Mozilla's roots everywhere but macOS (see Cargo.toml).
+#[cfg(not(target_os = "macos"))]
+fn tls_config() -> ureq::tls::TlsConfig {
+    ureq::tls::TlsConfig::builder()
+        .provider(ureq::tls::TlsProvider::Rustls)
+        .root_certs(ureq::tls::RootCerts::WebPki)
+        .build()
+}
+
+/// macOS: Security.framework and the user's trust store (see Cargo.toml).
+#[cfg(target_os = "macos")]
+fn tls_config() -> ureq::tls::TlsConfig {
+    ureq::tls::TlsConfig::builder()
+        .provider(ureq::tls::TlsProvider::NativeTls)
+        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+        .build()
 }
 
 fn decompress(archive: &[u8]) -> Result<Vec<u8>, String> {

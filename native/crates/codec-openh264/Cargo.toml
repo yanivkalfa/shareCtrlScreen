@@ -23,12 +23,21 @@ thiserror.workspace = true
 tracing.workspace = true
 sha2.workspace = true
 hex.workspace = true
-# Blocking HTTPS for the one-off download (rustls + webpki roots, already in the
-# tree via tokio-tungstenite); no gzip — the payload is already bzip2.
-ureq = { version = "3.5", default-features = false, features = ["rustls"] }
 # Pure-Rust bzip2 *decoder* (Cisco serves `.bz2`); avoids the C libbz2 and its
 # non-SPDX-standard licence.
 bzip2-rs = "0.1.2"
+
+# Blocking HTTPS for the one-off download; no gzip (the payload is already
+# bzip2). Windows/Linux: rustls + webpki roots, already in the tree via
+# tokio-tungstenite. macOS: the system TLS (Security.framework through
+# native-tls) and the system trust store — no C build step, so the macOS
+# backend still cross-checks from Windows, and corporate roots configured in
+# Keychain are honoured.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+ureq = { version = "3.5", default-features = false, features = ["rustls"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ureq = { version = "3.5", default-features = false, features = ["native-tls-no-default"] }
 
 [dev-dependencies]
 platform-api = { path = "../platform-api", features = ["mock"] }

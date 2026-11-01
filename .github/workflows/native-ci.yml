@@ -158,13 +158,13 @@ jobs:
           workspaces: native
       # Each step uses --nocapture so the harness's "private Xvfb on :N" and
       # "skipping:" lines reach the log.
-      - name: X11 capture (L2: Xvfb, Xephyr for the resize test)
+      - name: "X11 capture (L2: Xvfb, Xephyr for the resize test)"
         run: cargo test -p platform-linux --test x11_capture -- --nocapture
-      - name: X11 video surface (L5: Xvfb, software GL, GL pass re-run)
+      - name: "X11 video surface (L5: Xvfb, software GL, GL pass re-run)"
         run: cargo test -p platform-linux --test x11_surface -- --nocapture
-      - name: Clipboard (L8: private Xvfb, xclip)
+      - name: "Clipboard (L8: private Xvfb, xclip)"
         run: cargo test -p platform-linux --lib clipboard::tests -- --nocapture
-      - name: Shortcut hook (L7: private Xvfb, XI2 grab, XTEST keys)
+      - name: "Shortcut hook (L7: private Xvfb, XI2 grab, XTEST keys)"
         run: cargo test -p platform-linux --lib shortcuts::xvfb_tests -- --nocapture
       # L6 (plan 05): the XTest injector against a private Xvfb, then the uinput
       # read-back. Two filters, not `input::tests`: that module also holds the
@@ -204,7 +204,7 @@ jobs:
           sudo setfacl -m "u:$(id -un):rw" /dev/uinput
           ls -l /dev/uinput
           getfacl /dev/uinput
-      - name: XTest injector (L6: private Xvfb)
+      - name: "XTest injector (L6: private Xvfb)"
         run: cargo test -p platform-linux --lib input::tests::xtest -- --nocapture
       - name: uinput read-back through evdev (L6)
         run: cargo test -p platform-linux --lib input::tests::uinput -- --nocapture

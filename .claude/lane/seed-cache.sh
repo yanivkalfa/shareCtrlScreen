@@ -59,7 +59,7 @@ done
 
 # WSL half: same script, Linux paths.
 if command -v wsl.exe >/dev/null 2>&1; then
-  script_win="$(cygpath -m "$0")"
+  script_win="$(cygpath -m "$(realpath "$0")")"
   drive="$(echo "${script_win:0:1}" | tr 'A-Z' 'a-z')"
   script_wsl="/mnt/$drive/${script_win:3}"
   wsl.exe -e bash -lc "bash '$script_wsl' --wsl '$task'"

@@ -61,7 +61,10 @@ impl Xvfb {
             let server = format!(":{n}");
             let spawned = Command::new("Xvfb")
                 .args([server.as_str(), listen[0], listen[1]])
-                .args(["-screen", "0", "640x480x24"])
+                // -noreset: an X server resets when its last client leaves,
+                // and drops whoever connects mid-reset; the readiness probe
+                // below is such a last client.
+                .args(["-noreset", "-screen", "0", "640x480x24"])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())

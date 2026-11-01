@@ -11,10 +11,12 @@ on:
     paths:
       - "native/**"
       - ".github/workflows/native-ci.yml"
+      - ".github/wayland/**"
   pull_request:
     paths:
       - "native/**"
       - ".github/workflows/native-ci.yml"
+      - ".github/wayland/**"
 
 defaults:
   run:
@@ -206,6 +208,150 @@ jobs:
         run: cargo test -p platform-linux --lib input::tests::xtest -- --nocapture
       - name: uinput read-back through evdev (L6)
         run: cargo test -p platform-linux --lib input::tests::uinput -- --nocapture
+
+  # ---------------------------------------------------------------------------
+  # Wayland jobs (plan task T4). NEW AND NEVER RUN: this branch is not pushed
+  # yet, so neither job has a green run on record. They run the Wayland tests
+  # that cannot run on a plain Linux runner: L1's real portal ScreenCast +
+  # PipeWire capture (tests/portal_capture.rs, ignored) and L5's Wayland video
+  # surface (tests/wayland_surface.rs, which starts its own headless sway), and
+  # L6's wlroots and in-process EIS input tests (src/input/tests.rs; the GNOME
+  # libei test is not run in CI, see wayland-gnome), in a private D-Bus session
+  # (`dbus-run-session`) per job. The session scripts
+  # live in .github/wayland/ and document each setting they use.
+  #
+  # Runner choice: ubuntu-24.04 for both. Its archive carries sway 1.9 and
+  # xdg-desktop-portal-wlr 0.7 (the wlr ScreenCast restore-token path needs a
+  # recent wlr), and it is the only Ubuntu LTS with GNOME 46 (mutter 46 with
+  # RemoteDesktop ConnectToEIS, which job (b) needs; ubuntu-22.04 has GNOME 42
+  # and no libei). The shipped Linux floor stays ubuntu-22.04 (build-test); this
+  # is a test-runner choice only. Runner image: actions/runner-images
+  # ubuntu-24.04 README (apt sources are Ubuntu noble).
+  #
+  # Who runs which input test (L6, src/input/tests.rs): wayland-sway runs the
+  # wlroots and EIS tests and filters out uinput_frames_reach_evdev and the
+  # xtest_* tests; T3's x11-tests job runs uinput (sudo, modprobe uinput) and
+  # the xtest_* tests (Xvfb). wayland-gnome runs no input or capture tests: the
+  # libei portal test and portal_capture need an answered consent dialog on
+  # GNOME, which a headless run cannot give (see .github/wayland/gnome-session.sh).
+  wayland-sway:
+    # sway --unsupported-gpu with WLR_BACKENDS=headless WLR_RENDERER=pixman
+    # (sway(5) and the sway wiki's headless notes). The portal stack is
+    # xdg-desktop-portal + xdg-desktop-portal-wlr (portals.conf selects wlr for
+    # ScreenCast; wlr's `[screencast] output_name=HEADLESS-1 chooser_type=none`
+    # skips the chooser). XDG_CURRENT_DESKTOP=sway is exported to the bus.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # A missing sway, pipewire or portal fails the job instead of skipping.
+      SCT_WAYLAND_TESTS_REQUIRED: "1"
+      SCT_LINUX_INPUT_TESTS_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux build and Wayland test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev libdbus-1-dev libgtk-3-dev \
+            libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev \
+            libpipewire-0.3-dev libspa-0.2-dev libclang-dev \
+            mesa-vulkan-drivers
+          # The compositor and its portal stack (all in noble's main archive):
+          #   sway: the headless compositor; weston: weston-simple-shm, the
+          #   animated client the screencast needs (portal_capture waits for
+          #   motion); pipewire, pipewire-bin (pw-cli), wireplumber: the
+          #   PipeWire graph; xdg-desktop-portal + xdg-desktop-portal-wlr: the
+          #   portal frontend and the wlr backend; dbus (dbus-run-session),
+          #   dbus-bin (dbus-update-activation-environment on 24.04),
+          #   dbus-user-session. busctl comes from systemd, which the runner
+          #   image already has; pw-cli comes from pipewire-bin.
+          sudo apt-get install -y --no-install-recommends \
+            sway weston pipewire pipewire-bin wireplumber \
+            xdg-desktop-portal xdg-desktop-portal-wlr \
+            dbus dbus-bin dbus-user-session
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+      - name: Wayland session and tests (sway, portal stack)
+        # dbus-run-session gives the script a private session bus. The script
+        # starts sway, PipeWire, WirePlumber and both portals, then runs
+        # wayland_surface (L5), portal_capture (L1, ignored, real portal), and
+        # input::tests (L6: the wlroots and in-process EIS tests; the uinput and
+        # xtest_* tests are filtered out, see the comment in sway-session.sh).
+        run: dbus-run-session -- bash "$GITHUB_WORKSPACE/.github/wayland/sway-session.sh"
+      - name: Upload Wayland logs (failure)
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wayland-sway-logs
+          path: ${{ runner.temp }}/wayland-logs
+          if-no-files-found: warn
+      - name: Print Wayland logs (failure)
+        if: failure()
+        run: |
+          for f in "$RUNNER_TEMP"/wayland-logs/*.log; do
+            echo "::group::$(basename "$f")"
+            tail -n 200 "$f" || true
+            echo "::endgroup::"
+          done
+
+  wayland-gnome:
+    # mutter --headless --virtual-monitor 1920x1080 --wayland --no-x11 with
+    # xdg-desktop-portal-gnome (mutter 46 exposes org.gnome.Mutter.ScreenCast
+    # and org.gnome.Mutter.RemoteDesktop on the bus, which the GNOME portal
+    # backend drives). XDG_CURRENT_DESKTOP=GNOME. Mutter's --headless and
+    # --virtual-monitor flags: `mutter --help` (GNOME 46) and
+    # https://gitlab.gnome.org/GNOME/mutter.
+    #
+    # THE GAP: this job proves the stack comes up (mutter's ScreenCast and
+    # RemoteDesktop services on the bus, the RemoteDesktop portal and the GNOME
+    # backend registered) and runs no test. The libei test (L6, portal_libei) and
+    # the L1 portal capture need the RemoteDesktop/ScreenCast consent dialog
+    # answered. The portal gives no headless pre-authorization, and the tests do
+    # not reuse a seeded token, so running them here would be a fake pass.
+    # portal_libei also asserts nothing about the pointer. Making them run
+    # headlessly is a follow-up test-harness task; until then they are
+    # device-pass items (checklists/L6.md, checklists/L1.md).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux build and GNOME test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev libdbus-1-dev libgtk-3-dev \
+            libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev \
+            libpipewire-0.3-dev libspa-0.2-dev libclang-dev \
+            mesa-vulkan-drivers
+          # mutter (the headless compositor), xdg-desktop-portal-gnome (the
+          # RemoteDesktop/ScreenCast backend), pipewire + pipewire-bin +
+          # wireplumber, the portal frontend, and dbus. libegl-mesa0 and
+          # libgl1-mesa-dri are listed explicitly: --no-install-recommends would
+          # otherwise leave mutter without its EGL and DRI software renderer.
+          sudo apt-get install -y --no-install-recommends \
+            mutter xdg-desktop-portal xdg-desktop-portal-gnome \
+            pipewire pipewire-bin wireplumber \
+            dbus dbus-bin dbus-user-session \
+            libegl-mesa0 libgl1-mesa-dri
+      - name: GNOME session and portal stack
+        run: dbus-run-session -- bash "$GITHUB_WORKSPACE/.github/wayland/gnome-session.sh"
+      - name: Upload GNOME logs (failure)
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wayland-gnome-logs
+          path: ${{ runner.temp }}/wayland-logs
+          if-no-files-found: warn
+      - name: Print GNOME logs (failure)
+        if: failure()
+        run: |
+          for f in "$RUNNER_TEMP"/wayland-logs/*.log; do
+            echo "::group::$(basename "$f")"
+            tail -n 200 "$f" || true
+            echo "::endgroup::"
+          done
 
   release-build:
     # The optimized Windows build the dev/test pipelines ship.

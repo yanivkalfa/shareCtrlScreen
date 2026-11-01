@@ -10,13 +10,28 @@
 | W1 Windows backend | **done** `f1b961c` | `platform-windows` (adapters.rs, displays.rs, gpu.rs). App verified live: surface created, signaling registered. Display selection (`shareDisplayId` = `dxgi:<n>`) is now wired. |
 | D1 loopback harness | **done** `7f91371` | `engine/tests/loopback.rs` — ~4 s, all OSes, security assertions mutation-checked. |
 | T1 CI matrix | **done** `dc47c95` | Windows / macOS / Ubuntu 22.04 + license gate on all 4 triples. **The macOS job is unverified until the branch is pushed.** |
-| platform-macos / platform-linux | **scaffold** `f1b961c` | Real paths (+ Linux session-type detection); every other capability fails safely. Lanes M and L replace these stubs in place. |
-| L5-spike, M4, D2, M1, L3 | **in progress** (Opus) | branches `task/<ID>`, started 2026-11-01 |
-| D3, D4, D5, M7, M10, M11, L8, L11, L12, T5 | **in progress** (Sonnet) | branches `task/<ID>` |
-| D6 docs | **done** `c4c55d4` (Haiku, Opus-reviewed: 10 findings fixed) | root README install/what-works-where + docs/FIRST-RUN.md |
-| M8, M9, L9, L10 | **in progress** (Haiku → Opus review) | branches `task/<ID>` |
-| M2, M3, L1, L2, L4, M6, L7 | queued (Opus cap) | start as Opus slots free |
-| W2, W3, M5, L6, L5, D7, T2, T3, T4 | blocked on dependencies | see graph |
+| platform-macos / platform-linux | **scaffold → filling in** | Real paths (+ Linux session-type detection); lanes M and L replace the stubs in place (see rows below). Crate-level `#![cfg(target_os = …)]` is the convention; pure-logic tests run on that OS's CI job. |
+| D6 docs | **done** `c4c55d4` (Haiku, Opus-reviewed) | root README install/what-works-where + docs/FIRST-RUN.md |
+| D5 permissions modal | **done** `1f3b607` (Sonnet) | host preflight: screenCapture + inputInjection; viewer preflight only with captureShortcuts on |
+| L10 XDG autostart | **done** `136dbd9` (Haiku, Opus-reviewed) | `~/.config/autostart/sharectrl.desktop` |
+| D3 keymap | **done** (Sonnet) | `platform_api::keymap` generated from Chromium `dom_code_data.inc` (`tools/gen-keymap`); NumLock parity override kept (W3 decides); Power/edit keys excluded |
+| M7 clipboard | **done** `8d2dea6` (Sonnet) | NSPasteboard text + change count + file URLs; `set_files` refuses relative paths |
+| M9 autostart | **done** `2a7aa03` (Haiku, Opus-reviewed) | per-user LaunchAgent, no launchctl |
+| L12 permissions | **done** `2f5c0b4` (Sonnet) | portal preflight + consent flow, restore-token store (`portal_token.rs`) |
+| M11 permissions | **done** `969e6aa` (Sonnet) | TCC preflight/request: Screen Recording, Accessibility, Input Monitoring, Secure Input note; Settings deep links. **Device-pending** (checklists/M11.md) |
+| M8 Keychain store | **done** `410663c` + M8b `forget` (Haiku, Opus-reviewed) | keyring 4.2 / apple-native store; legacy SecKeychain ACL by design (no Team ID). **Device-pending** (checklists/M8.md) |
+| M10 bundle + signing | **done** (Sonnet) | `.app`/DMG universal build, self-signed cert scripts (`scripts/macos-*.sh`), `mac-build.yml`, first-run docs. **Owner TODO:** run `macos-make-signing-cert.sh`, add the two secrets, supply a 1024×1024 icon. |
+| T5 latency smoketest | **done** `b657f43` (Sonnet) | `tools/smoketest` on the traits (`--mock`, `--software`, `--display`, `--size`); real-hardware verdict still needs an idle machine |
+| D4 platform info UI | **done** `fd7a128` (Sonnet) | `get_platform_info`, OS-neutral settings copy, monitor list |
+| M1 ScreenCaptureKit capture | **done** `2a53a47` (Opus) | SCStream → newest-wins slot, cursor out-of-band, stable display ids. **Device-pending** (checklists/M1.md) |
+| L8 clipboard | **done** `01d438b` (Sonnet) | arboard text; X11/Wayland file-list selection owners; content-derived change count. Real GNOME/KDE paste unverified |
+| engine secret-store hardening | **done** `62e14ca` (orchestrator) | `SecretStore::forget`; seal/open off the signaling loop (spawn_blocking, 60 s bound on open); MSRV 1.88 |
+| L5-spike | **done** `de9f354` (Opus) | Wayland subsurface works on sway/Weston; GNOME/KDE device pass pending; L5 builds option 1 (see plans/spikes) |
+| D2 OpenH264 | **done** `0dd75a1` (Opus) | Cisco binary downloaded at runtime (SHA-256 pinned), licence toggle + notice in Settings → Advanced, `WithSoftwareH264` adapter on all three platforms, D3D11 readback + CPU-NV12 upload on Windows. 1080p encode budget to be measured on an idle machine |
+| M4, L9, M8b | **gated, merging** | NSView + wgpu/Metal surface (`surface-wgpu` shared crate); Secret Service store; Keychain `forget` |
+| L3, L11 | **fix round** | NVENC + VA-API dlopen encoders (reviewer APPROVE with should-fix items); deb/rpm/AppImage + uinput installer |
+| M2, M3, L1, L2, L4, M6, L7 | queued (Opus cap) | start in wave 2, warm caches |
+| W2, W3, M5, L6, L5, D7, T2, T3, T4 | blocked on dependencies | W3/M5/L6 unblocked by D3; W2 by D2; D7 by M10 (+L11); L5 by the spike |
 | everything else | open | as below. |
 
 Interfaces the remaining tasks must use: `Platform::create_capture / create_surface / create_injector / create_shortcut_hook / create_clipboard` (call on the thread that uses the object), `Engine::start(platform, decider)`, `Engine::attach_surface`, `IcePolicy::LoopbackOnly` for tests, mocks in `platform_api::mock`.

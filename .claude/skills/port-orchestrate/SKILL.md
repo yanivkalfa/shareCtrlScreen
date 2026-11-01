@@ -136,9 +136,13 @@ macOS code cannot run here; type-check with
 
 Before you finish, run and paste VERBATIM:
   cargo fmt --all --check
+  cargo check --workspace
   cargo clippy --workspace --all-targets -- -D warnings
   cargo test --workspace
 on Windows and (for anything touching shared or Linux code) in WSL.
+`cargo check --workspace` (no `--all-targets`) is not redundant: it builds
+without dev-dependencies, which is what ships; a feature a dev-dependency
+turns on can hide a production build that does not compile (L9 did this).
 `cargo test -p engine --test loopback` must still pass.
 
 If an acceptance test fails twice for the same reason, stop and report what
@@ -174,9 +178,17 @@ APPROVE.
    scrap, hwcodec); a dependency not in 06-CRATES; a behaviour change not in
    the task.
 4. Run the gate yourself in the worktree, on Windows **and** WSL:
-   `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+   `cargo fmt --all --check`, `cargo check --workspace` (no dev-deps — see §3),
+   `cargo clippy --workspace --all-targets -- -D warnings`,
    `cargo test --workspace`, `cargo deny check`, and
-   `cargo test -p engine --test loopback` three times.
+   `cargo test -p engine --test loopback` three times. A branch that touches
+   `platform-macos` also gets `cargo check`/`clippy -p platform-macos
+   --target aarch64-apple-darwin --all-targets -- -D warnings` from Windows.
+   A conflict that is only `native/Cargo.lock` is resolved by the orchestrator
+   (`git checkout --ours native/Cargo.lock`, regenerate with
+   `cargo check --workspace`, continue); any other conflict goes to the builder.
+   WSL note: a `wsl` command only progresses while a foreground `wsl` process
+   is running; runs that look hung are usually a stalled WSL clock.
 5. If Windows behaviour changed: `cargo build -p app`, run
    `native\target\debug\sharectrl.exe` ~8 s, read `%APPDATA%\ShareCtrlScreen\app.log`
    (platform line, "native video child window created", "registered with
@@ -190,7 +202,11 @@ APPROVE.
    `git branch -d task/<ID> worktree-agent-<id>`, and in WSL
    `rm -rf /tmp/sct-<ID>`. At session end, `git worktree prune`, check
    `.claude/worktrees` holds only live tasks, and `wsl -e bash -lc 'du -sh /tmp/sct-*'`
-   for strays.
+   for strays. A worktree whose removal fails with "Permission denied" (a
+   finished agent still holds a file) is `rm -rf`'d once the agent is idle,
+   then `git worktree prune`. The owner's expectation: when the orchestration
+   is complete, no worktree and no per-task cache remains — only the main
+   checkout, `native/target` and `/tmp/sct-base`.
 
 Findings always go to the original builder. After two rejected rounds on the
 same point, escalate the task one tier up with the full history attached.

@@ -36,6 +36,9 @@ cargo build --workspace --release
 cargo test  --workspace          # all unit tests; runs on Windows, macOS and Linux
 ```
 
+On Linux the shortcut-hook tests start private `Xvfb` servers (`apt-get install xvfb`)
+and skip when it is missing.
+
 Two shippable binaries: `sharectrl.exe` (the Tauri app/engine) and
 `sharectrl-service.exe` (the SYSTEM service).
 
@@ -169,6 +172,18 @@ sudo usermod -aG input "$USER" && sudo modprobe uinput && sudo udevadm control -
 
 Membership of `input` also allows reading every input device (keystrokes) of the machine,
 so enable it only on machines where you accept that.
+
+**System shortcuts on the remote (viewer).** With "Capture shortcuts" on, Super, Alt+Tab
+and friends act on the remote while the session window is focused and the remote screen
+is shown. On X11 the app grabs the keyboard (XInput2) for exactly that time; clicking
+another window gives the keyboard back at once. On Wayland it asks the compositor to
+inhibit its shortcuts: GNOME asks you once (re-allow it under Settings → Apps →
+ShareCtrlScreen → "Inhibit system keyboard shortcuts"); KDE Plasma and Sway allow it, and
+every compositor keeps an escape combination of its own. Desktops without the
+keyboard-shortcuts-inhibit protocol keep their shortcuts; the log says why
+(`shortcut capture is off: …`). Keys typed through a virtual (XTEST) keyboard, such as
+Synergy or a VNC server driving this machine, pause the X11 capture until the window is
+focused again.
 
 **Logs.** `~/.local/state/sharectrl/app.log` (`$XDG_STATE_HOME/sharectrl/app.log`).
 Config lives in `~/.config/sharectrl/`.

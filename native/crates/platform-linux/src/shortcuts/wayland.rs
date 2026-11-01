@@ -431,3 +431,81 @@ impl Dispatch<WlCallback, ()> for State {
         // The wake-up sync from `shutdown`: the dispatch loop re-checks its flag.
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use wayland_client::globals::GlobalList;
+    use wayland_client::protocol::wl_compositor::WlCompositor;
+    use wayland_client::{delegate_noop, Connection};
+
+    use super::*;
+
+    /// The test's own client: just a surface to inhibit on.
+    struct Client;
+
+    impl Dispatch<WlRegistry, GlobalListContents> for Client {
+        fn event(
+            _: &mut Self,
+            _: &WlRegistry,
+            _: <WlRegistry as Proxy>::Event,
+            _: &GlobalListContents,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+    delegate_noop!(Client: ignore WlCompositor);
+    delegate_noop!(Client: ignore WlSurface);
+
+    fn advertises_inhibit(globals: &GlobalList) -> bool {
+        globals.contents().with_list(|list| {
+            list.iter()
+                .any(|g| g.interface == ZwpKeyboardShortcutsInhibitManagerV1::interface().name)
+        })
+    }
+
+    /// Install on a real compositor, over a connection the test owns (standing
+    /// in for GDK's): `install` succeeds exactly when the compositor offers
+    /// the inhibit manager, and the unfocused surface leaves it waiting rather
+    /// than refused. Run the ignored tests inside sway, GNOME or KDE (WSLg's
+    /// Weston does not offer the protocol, so there `install` must refuse).
+    #[test]
+    #[ignore = "needs a Wayland compositor (WAYLAND_DISPLAY)"]
+    fn install_matches_what_the_compositor_offers() {
+        let conn = match Connection::connect_to_env() {
+            Ok(c) => c,
+            Err(e) => panic!("no Wayland compositor: {e}"),
+        };
+        let (globals, mut queue) = match registry_queue_init::<Client>(&conn) {
+            Ok(g) => g,
+            Err(e) => panic!("registry: {e}"),
+        };
+        let qh = queue.handle();
+        let compositor: WlCompositor = match globals.bind(&qh, 1..=4, ()) {
+            Ok(c) => c,
+            Err(e) => panic!("wl_compositor: {e}"),
+        };
+        let surface = compositor.create_surface(&qh, ());
+        if let Err(e) = queue.roundtrip(&mut Client) {
+            panic!("roundtrip: {e}");
+        }
+
+        let display = NonNull::new(conn.backend().display_ptr().cast::<c_void>());
+        let toplevel = surface.id().as_ptr().ok().map(NonNull::cast::<c_void>);
+        let (Some(display), Some(toplevel)) = (display, toplevel) else {
+            panic!("the system backend exposes its pointers");
+        };
+        // SAFETY: both live on `conn`, which outlives the inhibitor below.
+        let result = unsafe { Inhibitor::install(display, toplevel) };
+        assert_eq!(
+            result.is_ok(),
+            advertises_inhibit(&globals),
+            "install result: {:?}",
+            result.as_ref().err()
+        );
+        if let Ok(mut inhibitor) = result {
+            inhibitor.shutdown();
+        }
+        surface.destroy();
+    }
+}

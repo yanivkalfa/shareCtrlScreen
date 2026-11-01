@@ -39,7 +39,7 @@
 | M3 VideoToolbox decoder | **done** `a90ddfb` (Opus, Opus-reviewed; type-checked for aarch64-apple-darwin, device-pending) | H.264/HEVC/AV1 → IOSurface `420v` `CvPixelBufferFrame`; format changes keep or rebuild the session; synthetic I_PCM streams test it bit-exact on CI; encode→decode PSNR test is `#[ignore]`d until T2 runs it on a Mac. **Device-pending** (checklists/M3.md) |
 | M6 shortcut tap | **done** (Opus) | session `CGEventTap` on the hook thread; Cmd+Tab/Cmd+\`/Cmd+Space/Ctrl+arrows while the video view has the keyboard (focus published by the view into `SurfaceState::key_focus`); Cmd+Q left to the view's key monitor; macOS `input_monitoring` now needs Input Monitoring **and** Accessibility. **Device-pending** (checklists/M6.md); the Cmd+Tab acceptance is **blocked** on the owner's host-modifier-mapping decision |
 | L2 X11 capture | **done** (Opus) | `platform_linux::X11Capture`: Damage `NonEmpty` → `DamageSubtract`/`FetchRegion` dirty rects (≤ 16, disjoint), MIT-SHM 1.2 segment read via its fd (core `GetImage` fallback), cursor out of band (`QueryPointer` + XFixes), RandR monitors as `x11:<name>` ids in `Platform::displays()`, refuses Xwayland; abstract-socket connect fallback (`x11_connect`). Xvfb/Xephyr tests in `tests/x11_capture.rs`. **Device-pending** (checklists/L2.md) |
-| L7 | queued (Opus cap) | start in wave 2, warm caches |
+| L7 shortcut capture | **in review** on `task/L7` (Opus) | XI2 keyboard grab (X11, deviation from `XGrabKeyboard` recorded on the card) + shortcuts inhibitor (Wayland); Xvfb acceptance green. **Device-pending** (checklists/L7.md) |
 | L4 VA-API + NVDEC decode | **done** (Opus) | in-tree H.264 header parser + reference model (POC, MMCO, LTR, list modification, frame-num gaps) for stateless VA-API VLD; NVDEC through the driver parser (H.264/HEVC per caps; AV1 built but not advertised until the device check, `ADVERTISE_AV1_DECODE`); CPU NV12 out; golden streams + FFmpeg hashes in `native/testdata/golden`. NVDEC bit-exact vs FFmpeg on the GTX 1080 Ti; **VA-API device-pending** (checklists/L4.md). MF (W1) and macOS (M2) goldens → I5 |
 | W3 keymap switch | **done** `e2d6b1c` (Sonnet, Opus-reviewed) | `input::scancode` is an adapter over the generated keymap; NumLock is E0 45 (plain 45 is Pause). Device check: NumLock LED toggles, Pause does nothing |
 | W2 software codec selection | **done** (Sonnet, Opus-reviewed) | H.264 policy on Windows: hardware → MF software decoder → OpenH264 (only while `useOpenH264` is on); `h264_problem()` gives an actionable report when Media Foundation has no H.264 MFTs (N editions without the Media Feature Pack fail at launch — documented). Machine-B check: ignored test + log line "no hardware H264 decoder — using software decode" |
@@ -373,6 +373,21 @@ to run (TCC). Use `objc2` 0.6-family crates throughout (`objc2-app-kit`,
   in the mutter job) moves the pointer (verify with `wayland-info`/a test client).
 
 ### L7 — Shortcut capture: XGrabKeyboard / keyboard-shortcuts-inhibit  (size S) — report `install == false` when refused. Acceptance: Xvfb test shows Super/Alt+Tab delivered to our window while grabbed.
+* Built (`platform-linux/src/shortcuts/`), on the `SurfaceHandles` / `native_handles()` seam
+  added to platform-api for it (backend chosen from the handles, not the session type).
+* **Deviation (approved): `XIGrabDevice`, not the core `XGrabKeyboard`.** Same semantics and
+  refusals, but XI2 events carry the source device, so keys from XTEST devices (our own
+  injector, L6) are not forwarded — a core grab cannot tell them apart and two machines
+  viewing each other would loop keys forever. Such input makes the grab step aside until
+  focus leaves or the video is hidden (a grab cannot pass a key through).
+* X11 grab held only while the app window has the input focus **and** the video window is
+  viewable (relies on L5 unmapping it on `hide`), so modals can be typed into. Wayland:
+  inhibitor on the **toplevel** over GDK's `wl_display`; it never calls `forward` (the keys
+  arrive through GTK like any other).
+* Tests: Xvfb acceptance (WM passive grabs see nothing while grabbed; focus-out, unmap,
+  AlreadyGrabbed, XTEST); they start private Xvfbs and use loopback TCP where
+  `/tmp/.X11-unix` is read-only (WSLg), local sockets elsewhere. Wayland test is `#[ignore]`d.
+  CI needs `xvfb` installed (T3). Device pass: [checklists/L7.md](checklists/L7.md).
 ### L8 — Clipboard: arboard + file-list MIME targets + content-hash change counter  (size M) — Acceptance: echo-guard loop test (two mock peers) never ping-pongs; `set_files` is readable by `wl-paste --list-types` / `xclip -t TARGETS`.
 ### L9 — Secret Service store  (size S) — `keyring` with `sync-secret-service`; CI with `gnome-keyring` under `dbus-run-session`. No daemon → `None`.
 ### L10 — XDG autostart  (size S) — `auto-launch`. Acceptance: `.desktop` has `Exec="<abs path>" --autostart`; `reconcile` rewrites.

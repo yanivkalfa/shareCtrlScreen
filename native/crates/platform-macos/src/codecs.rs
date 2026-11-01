@@ -97,12 +97,20 @@ impl CodecFactory for VtCodecs {
         width: u32,
         height: u32,
     ) -> Result<Box<dyn VideoDecoder>, CodecError> {
-        // HEVC/AV1 are only negotiated when advertised, i.e. when the
-        // hardware decodes them; refuse here rather than at the first
-        // keyframe so the session ends with a clear reason. H.264 always has
-        // VideoToolbox's software decoder behind the hardware one.
-        if codec != Codec::H264 && !decode::hardware_decodes(codec) {
-            return Err(CodecError::NoDecoder(codec));
+        match codec {
+            // VideoToolbox has a software H.264 decoder behind the hardware
+            // one, but the decoder builds its session only at the first
+            // keyframe: open (and drop) a probe session now, so a Mac where
+            // VideoToolbox refuses H.264 fails here and `WithSoftwareH264`
+            // decodes with Cisco OpenH264 instead.
+            Codec::H264 => decode::probe_h264()?,
+            // HEVC/AV1 are only negotiated when advertised, i.e. when the
+            // hardware decodes them; refuse here rather than at the first
+            // keyframe so the session ends with a clear reason.
+            Codec::Hevc | Codec::Av1 if !decode::hardware_decodes(codec) => {
+                return Err(CodecError::NoDecoder(codec));
+            }
+            Codec::Hevc | Codec::Av1 => {}
         }
         Ok(Box::new(VtDecoder::new(codec, width, height)))
     }

@@ -131,6 +131,7 @@ objc2-video-toolbox = { version = "0.3.2", default-features = false, features = 
     "VTErrors",
     "VTPixelTransferProperties",
     "VTSession",
+    "VTUtilities",
     "objc2-core-media",
     "objc2-core-video",
 ] }

@@ -22,11 +22,16 @@
 //!   `VTDecompressionSessionCanAcceptFormatDescription`,
 //!   `VTDecompressionSessionInvalidate`:
 //!   <https://developer.apple.com/documentation/videotoolbox/vtdecompressionsession>
-//! * `VTDecodeFrameFlags` ("with the kVTDecodeFrame_EnableAsynchronousDecompression
-//!   bit clear, the video decoder is compelled to emit every frame before it
-//!   returns") and `VTDecodeInfoFlags`:
+//! * `VTDecompressionSessionDecodeFrame` ("If both flags are clear, the
+//!   decompression completes and your output callback function will be called
+//!   before VTDecompressionSessionDecodeFrame returns"):
+//!   <https://developer.apple.com/documentation/videotoolbox/vtdecompressionsessiondecodeframe(_:samplebuffer:flags:framerefcon:infoflagsout:)>
+//! * `VTDecodeFrameFlags`, `VTDecodeInfoFlags`:
 //!   <https://developer.apple.com/documentation/videotoolbox/vtdecodeframeflags>,
 //!   <https://developer.apple.com/documentation/videotoolbox/vtdecodeinfoflags>
+//! * `VTRegisterSupplementalVideoDecoderIfAvailable` ("Call this function to
+//!   find and register video decoders that aren't registered by default."):
+//!   <https://developer.apple.com/documentation/videotoolbox/vtregistersupplementalvideodecoderifavailable(_:)>
 //! * `kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder`,
 //!   `kVTDecompressionPropertyKey_RealTime`,
 //!   `kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder`:
@@ -71,13 +76,17 @@ mod synth;
 #[cfg(test)]
 mod tests;
 
+use std::sync::Once;
+
 use objc2_core_foundation::CFRetained;
 use objc2_core_media::{
     kCMVideoCodecType_AV1, kCMVideoCodecType_H264, kCMVideoCodecType_HEVC, CMFormatDescription,
     CMVideoCodecType,
 };
 use objc2_core_video::kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
-use objc2_video_toolbox::VTIsHardwareDecodeSupported;
+use objc2_video_toolbox::{
+    VTIsHardwareDecodeSupported, VTRegisterSupplementalVideoDecoderIfAvailable,
+};
 use platform_api::{Codec, CodecError, Frame, FrameData, VideoDecoder};
 
 use crate::gpu::{fourcc, CvPixelBufferFrame};
@@ -98,8 +107,61 @@ fn codec_type(codec: Codec) -> CMVideoCodecType {
 /// silicon and later; HEVC: every supported Mac with a T2 or Apple silicon,
 /// most Intel ones.
 pub(crate) fn hardware_decodes(codec: Codec) -> bool {
+    register_supplemental(codec);
     // SAFETY: a pure capability query with a valid codec type.
     unsafe { VTIsHardwareDecodeSupported(codec_type(codec)) }
+}
+
+/// Asks VideoToolbox to register the system's AV1 decoder, once per process,
+/// before anything queries or opens one. WHY: Apple ships some decoders as
+/// supplemental ones that are not registered by default; an unregistered
+/// decoder makes the capability query say "no" and session creation fail
+/// with `kVTCouldNotFindVideoDecoderErr`. Where AV1 is already registered,
+/// or absent, the call does nothing. H.264 and HEVC are always registered.
+fn register_supplemental(codec: Codec) {
+    static AV1: Once = Once::new();
+    if codec == Codec::Av1 {
+        // SAFETY: takes a codec type by value and touches no caller memory.
+        AV1.call_once(|| unsafe {
+            VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_AV1);
+        });
+    }
+}
+
+/// The probe's H.264 sequence parameter set: Constrained Baseline
+/// (profile_idc 66, constraint_set0/1), level 4.0, 120 × 68 macroblocks
+/// cropped by 8 rows to 1920 × 1080, POC type 2, one reference frame, no VUI
+/// (ITU-T H.264 §7.3.2.1.1). NAL header included; it contains no
+/// `00 00 0x` run, so no emulation-prevention byte is needed.
+const PROBE_SPS: [u8; 10] = [0x67, 0x42, 0xc0, 0x28, 0xda, 0x01, 0xe0, 0x08, 0x9f, 0x95];
+
+/// The probe's picture parameter set: ids 0, CAVLC, one slice group, QP 26,
+/// deblocking control present (ITU-T H.264 §7.3.2.2).
+const PROBE_PPS: [u8; 4] = [0x68, 0xce, 0x3c, 0x80];
+
+/// Proves that VideoToolbox opens an H.264 decoder session on this Mac by
+/// creating one for a 1080p Baseline stream and dropping it.
+///
+/// WHY: [`VtDecoder`] builds its session only at the first keyframe, so
+/// without this a Mac whose VideoToolbox refuses H.264 would accept the
+/// decoder and then fail every keyframe. Refusing here instead is what lets
+/// `WithSoftwareH264` fall back to Cisco OpenH264 for decoding.
+pub(crate) fn probe_h264() -> Result<(), CodecError> {
+    let fail = |failure: Failure| failure.into_error(Codec::H264);
+    let format =
+        format::from_parameter_sets(Codec::H264, &[&PROBE_SPS, &PROBE_PPS]).map_err(fail)?;
+    let session = Session::new(&format).map_err(fail)?;
+    tracing::debug!(
+        "videotoolbox: H264 decoder probe ok ({})",
+        if session.hardware() {
+            "hardware"
+        } else {
+            "software"
+        }
+    );
+    // Dropping the session invalidates it; the real one is built at the
+    // stream's first keyframe from the host's parameter sets.
+    Ok(())
 }
 
 /// What the viewer advertises: AV1 and HEVC only where the hardware decodes
@@ -240,6 +302,7 @@ impl VtDecoder {
         let session = match self.session.take() {
             Some(session) => session,
             None => {
+                register_supplemental(self.codec);
                 let session = Session::new(format)?;
                 tracing::info!(
                     "videotoolbox: {:?} decoder session ready ({})",
@@ -322,7 +385,10 @@ impl VideoDecoder for VtDecoder {
         let frame = CvPixelBufferFrame::new(buffer);
         if frame.pixel_format_type() != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange {
             // The session was asked for '420v'; anything else would be drawn
-            // wrongly by the presenter, so it is refused here, loudly.
+            // wrongly by the presenter, so it is refused here, loudly. Deltas
+            // then wait for the next keyframe (giving `Ok(None)`) instead of
+            // each repeating this error.
+            self.awaiting_keyframe = true;
             return Err(CodecError::Backend(format!(
                 "VideoToolbox {:?} decoder returned '{}' pixels instead of '420v'; \
                  please report this with the log",

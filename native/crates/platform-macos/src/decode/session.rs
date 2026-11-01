@@ -60,9 +60,9 @@ struct OutputSlot(Mutex<Option<Delivery>>);
 /// `VTDecompressionOutputCallback`.
 ///
 /// # Safety
-/// `refcon` is the `OutputSlot` the owning [`Session`] boxed; the session
-/// invalidates the VideoToolbox session (which stops all callbacks) before
-/// that box is freed.
+/// `refcon` is the `OutputSlot` of the owning [`Session`]'s [`OwnedSlot`];
+/// the session invalidates the VideoToolbox session (which stops all
+/// callbacks) before that slot is freed.
 unsafe extern "C-unwind" fn on_output(
     refcon: *mut c_void,
     frame_refcon: *mut c_void,
@@ -88,11 +88,46 @@ unsafe extern "C-unwind" fn on_output(
     });
 }
 
+/// Owns the heap [`OutputSlot`] whose address is the callback's refcon.
+/// Held as the raw pointer from `Box::into_raw` (not a `Box`), so no unique
+/// Rust reference to the slot exists while VideoToolbox uses that pointer;
+/// only shared references are ever made from it.
+struct OwnedSlot(NonNull<OutputSlot>);
+
+impl OwnedSlot {
+    fn new() -> Self {
+        let raw = Box::into_raw(Box::new(OutputSlot(Mutex::new(None))));
+        // SAFETY: `Box::into_raw` never returns null.
+        Self(unsafe { NonNull::new_unchecked(raw) })
+    }
+
+    fn get(&self) -> &OutputSlot {
+        // SAFETY: the allocation lives until `drop`, and only shared
+        // references to it are created (here and in `on_output`).
+        unsafe { self.0.as_ref() }
+    }
+
+    fn refcon(&self) -> *mut c_void {
+        self.0.as_ptr().cast()
+    }
+}
+
+impl Drop for OwnedSlot {
+    fn drop(&mut self) {
+        // SAFETY: the pointer came from `Box::into_raw` and is freed once. A
+        // `Session` invalidates its VideoToolbox session in its own `Drop`,
+        // which runs before its fields drop, so no callback can still be
+        // using the slot; a slot whose session was never created was never
+        // handed to VideoToolbox.
+        drop(unsafe { Box::from_raw(self.0.as_ptr()) });
+    }
+}
+
 /// A decompression session and the slot its callback writes to.
 pub(crate) struct Session {
+    /// Declared before `slot`: fields drop in order, after `Drop::drop`.
     session: CFRetained<VTDecompressionSession>,
-    /// Boxed: its address is the callback's refcon, so it must not move.
-    slot: Box<OutputSlot>,
+    slot: OwnedSlot,
     /// Tag of the next frame. Starts at 1 so a stray callback with a null
     /// refcon can never match.
     next_tag: usize,
@@ -151,12 +186,12 @@ impl Session {
             &values,
         );
 
-        let slot = Box::new(OutputSlot(Mutex::new(None)));
+        let slot = OwnedSlot::new();
         // VideoToolbox copies the record; the refcon must stay valid for the
         // session's lifetime, which `Drop` guarantees.
         let record = VTDecompressionOutputCallbackRecord {
             decompressionOutputCallback: Some(on_output),
-            decompressionOutputRefCon: std::ptr::from_ref::<OutputSlot>(&slot).cast_mut().cast(),
+            decompressionOutputRefCon: slot.refcon(),
         };
         let mut raw: *mut VTDecompressionSession = std::ptr::null_mut();
         // SAFETY: valid format description and dictionaries (CFString keys,
@@ -222,14 +257,19 @@ impl Session {
     ) -> Result<Option<CFRetained<CVPixelBuffer>>, Failure> {
         let tag = self.next_tag;
         self.next_tag = self.next_tag.wrapping_add(1).max(1);
-        *self.slot.0.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        *self
+            .slot
+            .get()
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
 
         let mut info = VTDecodeInfoFlags(0);
         // Flags 0: neither asynchronous decompression nor temporal processing.
-        // VTDecodeFrameFlags: "With the kVTDecodeFrame_EnableAsynchronousDecompression
-        // bit clear, the video decoder is compelled to emit every frame before
-        // it returns", and without temporal processing no frame is held back
-        // — so the slot holds this sample's picture when the call returns.
+        // VTDecompressionSessionDecodeFrame: "If both flags are clear, the
+        // decompression completes and your output callback function will be
+        // called before VTDecompressionSessionDecodeFrame returns" — so the
+        // slot holds this sample's picture when the call returns.
         // That is what lets `VideoDecoder::decode` return the picture of the
         // access unit it was given (no reorder buffer: the encoder never
         // reorders).
@@ -245,6 +285,7 @@ impl Session {
         };
         let delivery = self
             .slot
+            .get()
             .0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

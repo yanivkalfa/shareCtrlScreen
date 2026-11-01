@@ -126,6 +126,14 @@ fn pcm_keyframe_and_skipped_deltas_decode_bit_exact() {
 }
 
 #[test]
+fn h264_probe_describes_1080p_and_opens_a_session() {
+    let format = format::from_parameter_sets(Codec::H264, &[&PROBE_SPS, &PROBE_PPS])
+        .unwrap_or_else(|f| panic!("{f:?}"));
+    assert_eq!(format::dimensions(&format), (1920, 1080));
+    probe_h264().unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
 fn deltas_before_the_first_keyframe_give_no_picture() {
     let mut synth = H264Synth::new(320, 240, 5);
     let mut dec = VtDecoder::new(Codec::H264, 640, 480);

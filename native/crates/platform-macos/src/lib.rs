@@ -53,7 +53,8 @@ mod secret;
 
 pub struct MacPlatform {
     /// VideoToolbox encode (M2) and decode (M3); Cisco OpenH264 for H.264
-    /// wherever VideoToolbox refuses it.
+    /// wherever VideoToolbox refuses it — for decoding, when
+    /// `VtCodecs::new_decoder`'s probe session cannot be created.
     codecs: WithSoftwareH264<VtCodecs>,
 }
 

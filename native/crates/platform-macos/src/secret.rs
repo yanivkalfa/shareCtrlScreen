@@ -19,9 +19,8 @@
 //!
 //! Limits: the item is readable only while the login keychain is unlocked, so an
 //! unattended Mac that has logged out or rebooted cannot auto-login until the
-//! user unlocks it. Superseded items (a host saved again) are not deleted yet:
-//! `forget` is planned on [`SecretStore`]. When it lands it is `is_key_id`, then
-//! `entry`, then `delete_credential`, with `NoEntry` treated as success.
+//! user unlocks it. The engine calls [`SecretStore::forget`] when a config entry
+//! is removed, which deletes the item.
 //!
 //! ## References
 //! * Apple, Keychain Services: <https://developer.apple.com/documentation/security/keychain-services>
@@ -67,6 +66,23 @@ impl SecretStore for KeychainSecretStore {
                 tracing::warn!("keychain: could not read the saved password: {e}");
                 None
             }
+        }
+    }
+
+    fn forget(&self, sealed: &str) {
+        // Same guard as `open`: a foreign value is not one of our items, so it is
+        // never looked up or deleted.
+        if !is_key_id(sealed) {
+            return;
+        }
+        let Some(entry) = entry(sealed) else {
+            return;
+        };
+        match entry.delete_credential() {
+            // Already gone is the state we want, so it is not worth a log line.
+            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            // The error text carries the OSStatus message from the Keychain.
+            Err(e) => tracing::warn!("keychain: could not delete the saved password: {e}"),
         }
     }
 }
@@ -124,12 +140,10 @@ mod tests {
         }
     }
 
-    /// Removes the Keychain item for `id` so device tests leave nothing behind.
-    fn forget(id: &str) {
-        if let Ok(entry) = keyring::Entry::new(SERVICE, id) {
-            // Best effort: a missing item is the state we want anyway.
-            let _ = entry.delete_credential();
-        }
+    #[test]
+    fn forget_garbage_is_a_noop() {
+        KeychainSecretStore.forget("garbage");
+        KeychainSecretStore.forget("");
     }
 
     #[test]
@@ -149,7 +163,7 @@ mod tests {
             .get_password()
             .expect("Keychain item");
         assert_eq!(stored, secret);
-        forget(&sealed);
+        KeychainSecretStore.forget(&sealed);
     }
 
     #[test]
@@ -160,11 +174,15 @@ mod tests {
 
     #[test]
     #[ignore = "needs a Mac"]
-    fn deleted_item_is_none() {
+    fn forgotten_item_is_gone() {
         let sealed = KeychainSecretStore
             .seal("hunter2")
             .expect("Keychain available on macOS");
-        forget(&sealed);
+        KeychainSecretStore.forget(&sealed);
         assert!(KeychainSecretStore.open(&sealed).is_none());
+        let missing = keyring::Entry::new(SERVICE, &sealed)
+            .expect("Keychain entry")
+            .get_password();
+        assert!(matches!(missing, Err(keyring::Error::NoEntry)));
     }
 }

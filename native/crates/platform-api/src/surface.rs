@@ -5,6 +5,8 @@ use std::any::Any;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
+
 use crate::frame::Frame;
 
 /// Input captured on the video surface, normalized over the **letterboxed video
@@ -34,6 +36,24 @@ pub struct FileDrop {
     pub paths: Vec<PathBuf>,
     pub nx: f64,
     pub ny: f64,
+}
+
+/// Native handles of a [`VideoSurface`], for backends that act on the *window*
+/// rather than its pixels: the Linux shortcut hook grabs the keyboard on the
+/// video window (X11) or installs a shortcuts inhibitor on the **toplevel**
+/// `wl_surface` over the app's `wl_display` (Wayland — a sub-surface never has
+/// keyboard focus, so the inhibitor must name the parent). Valid for the
+/// surface's lifetime; the hook must not hold them past `uninstall`.
+#[derive(Debug, Clone, Copy)]
+pub struct SurfaceHandles {
+    /// The video surface itself (X11 child window, Wayland video `wl_surface`,
+    /// NSView, HWND).
+    pub video: RawWindowHandle,
+    /// The app window it was created in — what
+    /// [`crate::Platform::create_surface`] received. Keyboard focus lives here.
+    pub parent: RawWindowHandle,
+    /// The display connection both windows belong to.
+    pub display: RawDisplayHandle,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -68,6 +88,11 @@ pub enum SurfaceError {
 ///   button-up for everything held (the real releases land in another window).
 /// * Clearing the input sink (`None`) also first emits those releases, so the
 ///   host never ends up with stuck input.
+/// * On X11, [`hide`](Self::hide) **unmaps** the video window and
+///   [`show`](Self::show) maps it again. The shortcut hook's keyboard grab on
+///   that window ends when the server sees it unviewable, which is what keeps a
+///   modal's typing out of the remote session; a hide that merely moved or
+///   resized the window would leave the grab in place.
 pub trait VideoSurface: Send + Sync {
     fn show(&self);
     fn hide(&self);
@@ -84,6 +109,12 @@ pub trait VideoSurface: Send + Sync {
     fn create_presenter(&self) -> Result<Box<dyn Presenter>, SurfaceError>;
     /// Backend escape hatch (e.g. the Windows shortcut hook needs the HWND).
     fn as_any(&self) -> &dyn Any;
+    /// Native handles for window-level backends (see [`SurfaceHandles`]).
+    /// `None` means this backend does not expose them, and a hook that needs
+    /// them reports `install == false` instead of guessing.
+    fn native_handles(&self) -> Option<SurfaceHandles> {
+        None
+    }
 }
 
 /// Draws decoded frames onto a [`VideoSurface`]: aspect-preserving letterbox

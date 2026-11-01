@@ -50,4 +50,4 @@ pub use platform::{
     DisplayInfo, OsPermission, PermissionReport, PermissionState, Platform, PlatformInfo,
 };
 pub use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
-pub use surface::{FileDrop, Presenter, SurfaceError, VideoInput, VideoSurface};
+pub use surface::{FileDrop, Presenter, SurfaceError, SurfaceHandles, VideoInput, VideoSurface};

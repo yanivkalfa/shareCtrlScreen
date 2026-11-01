@@ -50,6 +50,9 @@ every crate below.
 | `wayland-backend` | 0.3 (already transitive via wayland-client) | MIT | `client_system` feature: libwayland-client backend, needed to join GDK's `wl_display` (`from_foreign_display`; L5, L7) |
 | `input-linux` / `mouse-keyboard-input` | 0.7 / 0.9 | MIT | uinput fallback |
 | `wl-clipboard-rs` (via arboard) | — | MIT | Wayland clipboard |
+| `gtk`, `gdkx11`, `gdkwayland-sys` (gtk-rs) | 0.18 (the versions tauri 2.11 locks; another minor would load a second gtk-rs type registry) | MIT (bindings; GTK itself is the system's LGPL library, dynamically linked as Tauri already does) | video surface (L5): find the app window's GTK toplevel, follow its layout, take keys from WebKit, XID / `wl_surface` of GDK windows |
+| `wayland-backend` (`client_system`), `wayland-sys` (`client`) | 0.3 / 0.31 (already in the tree via wl-clipboard-rs) | MIT | L5: share GDK's `wl_display` (libwayland guest mode) and create the video `wl_surface` with GDK-safe user data |
+| `glow`, `khronos-egl` (via wgpu `gles`) | as resolved by wgpu 30 | MIT OR Apache-2.0 (glow also Zlib) | L5: wgpu's GL/EGL fallback for machines without Vulkan |
 | `xcap` (reference only) | 0.9.8 (2026-08-01) | Apache-2.0 | X11 screenshot code to crib from; Wayland unimplemented |
 | `ash` (future) | 0.38+ | MIT OR Apache-2.0 | Vulkan Video unification (not v1) |
 

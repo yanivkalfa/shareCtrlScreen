@@ -57,8 +57,9 @@ arboard = { version = "3.6", default-features = false, features = ["wayland-data
 # X11 selection owner for file lists and X11 screen capture (pure-Rust
 # connection, no libxcb). Capture (task L2) uses MIT-SHM, DAMAGE, XFixes and
 # RandR; `damage` implies `xfixes`, `randr` implies `render`. The shortcut hook
-# (L7) uses the XInput2 keyboard grab (`xinput`) and key replay (`xtest`).
-x11rb = { version = "0.14", features = ["shm", "damage", "xfixes", "randr", "xinput", "xtest"] }
+# (L7) uses the XInput2 keyboard grab (`xinput`) and key replay (`xtest`). The
+# video surface (L5) uses SHAPE for the hover-bar clip.
+x11rb = { version = "0.14", features = ["shm", "damage", "xfixes", "randr", "xinput", "xtest", "shape"] }
 # Wayland selection owner for file lists (data-control protocols).
 wl-clipboard-rs = "0.9"
 # Shortcut hook on Wayland: keyboard-shortcuts-inhibit (`unstable`) on GDK's own
@@ -73,7 +74,24 @@ wl-clipboard-rs = "0.9"
 # than 1.20 (Ubuntu 22.04): the 1.23-only API is behind a feature we do not set.
 wayland-client = "0.31"
 wayland-backend = { version = "0.3", features = ["client_system"] }
-wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+# `staging`: wp_fractional_scale_v1 for the video subsurface (L5).
+wayland-protocols = { version = "0.32", features = ["client", "unstable", "staging"] }
+# The video subsurface (L5) also creates its video `wl_surface` through
+# libwayland directly (GDK-safe user data, see surface/wayland/wl.rs).
+wayland-sys = { version = "0.31", features = ["client"] }
+# Video surface + presenter (task L5). The renderer (shader, letterbox, reveal,
+# held-input release) is shared with macOS in surface-wgpu; this crate turns on
+# the Linux GPU backends: Vulkan first, GL (EGL) for VMs without Vulkan.
+surface-wgpu = { path = "../surface-wgpu" }
+wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "vulkan", "gles"] }
+pollster = "0.4"
+raw-window-handle = "0.6"
+# The exact GTK3 stack of tauri 2.11 (see Cargo.lock): another minor would load
+# a second, incompatible copy of the gtk-rs type registry. Used to find the app
+# window's GTK toplevel, follow its layout and take keys away from WebKit.
+gtk = "0.18"
+gdkx11 = "0.18"
+gdkwayland-sys = "0.18"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 tempfile = "3"
@@ -84,5 +102,17 @@ secret-service = { version = "5", features = ["rt-async-io-crypto-rust"] }
 # of the golden streams (src/codec/golden.rs). Already workspace dependencies.
 sha2.workspace = true
 hex.workspace = true
-# The shortcut hook's Xvfb tests build window handles.
-raw-window-handle = "0.6"
+# Scripted input for the headless Wayland video-surface test: the wlroots
+# virtual pointer under headless sway.
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+
+# The video-surface tests drive GTK, which must own the process' main thread,
+# so they bring their own `main` (libtest runs tests on worker threads). Both
+# skip cleanly when Xvfb / sway is not installed.
+[[test]]
+name = "x11_surface"
+harness = false
+
+[[test]]
+name = "wayland_surface"
+harness = false

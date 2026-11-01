@@ -7,8 +7,9 @@
 //! lists), Secret Service passwords (L9), XDG autostart (L10), the
 //! permissions preflight (L12), shortcut capture (L7), hardware video encode
 //! (L3) and decode (L4) ([`LinuxCodecs`]), the Cisco OpenH264 fallback (D2),
-//! X11 screen capture with display enumeration (L2, [`X11Capture`]) and
-//! Wayland screen capture through the portal and PipeWire (L1) are real; every
+//! X11 screen capture with display enumeration (L2, [`X11Capture`]), Wayland
+//! screen capture through the portal and PipeWire (L1) and the video surface +
+//! wgpu presenter (L5: X11 child window, Wayland subsurface) are real; every
 //! other capability fails safely with a clear message until its task lands
 //! (see `plans/05-TASKS.md`, lane L).
 
@@ -42,6 +43,7 @@ mod portal_capture;
 mod portal_session;
 mod portal_token;
 mod shortcuts;
+mod surface;
 
 /// Private X servers for the unit tests (clipboard, shortcuts), declared once
 /// here so the shared file is one module (`tests/x11_capture.rs` includes it
@@ -193,10 +195,10 @@ impl Platform for LinuxPlatform {
 
     fn create_surface(
         &self,
-        _window: RawWindowHandle,
-        _display: RawDisplayHandle,
+        window: RawWindowHandle,
+        display: RawDisplayHandle,
     ) -> Result<Arc<dyn VideoSurface>, SurfaceError> {
-        Err(SurfaceError::Backend(format!("remote display {NOT_YET}")))
+        surface::create(window, display)
     }
 
     fn create_injector(&self) -> Result<Box<dyn InputInjector>, InputError> {

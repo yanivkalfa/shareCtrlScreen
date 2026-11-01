@@ -45,8 +45,9 @@
 | W3 keymap switch | **done** `e2d6b1c` (Sonnet, Opus-reviewed) | `input::scancode` is an adapter over the generated keymap; NumLock is E0 45 (plain 45 is Pause). Device check: NumLock LED toggles, Pause does nothing |
 | W2 software codec selection | **done** (Sonnet, Opus-reviewed) | H.264 policy on Windows: hardware → MF software decoder → OpenH264 (only while `useOpenH264` is on); `h264_problem()` gives an actionable report when Media Foundation has no H.264 MFTs (N editions without the Media Feature Pack fail at launch — documented). Machine-B check: ignored test + log line "no hardware H264 decoder — using software decode" |
 | D7 release pipeline | **done** `448df49` (Opus, Opus-reviewed) | tag-triggered `release.yml` → reusable `build-assets.yml` → `scripts/release-assets.sh` (one recipe); NSIS/DMG/AppImage/deb/rpm, SHA256SUMS, per-OS third-party notices generated and attached (never committed), version read from cargo metadata, actions pinned to SHAs; macOS: certificate required when the secrets exist, ad-hoc only without them. macOS leg + AppImage verified only on GitHub |
-| L6, L5, T2, T3, T4 | in wave 2 | see rows above/below as they land |
+| L6, T2, T3, T4 | in wave 2 | see rows above/below as they land |
 | L1 Wayland capture | **done** (Opus, Opus-reviewed) | `portal_capture/`: portal ScreenCast (handshake shared with L12 in `portal_session.rs`, token scope kept: a combined token reopens a combined session) + pipewire-rs 0.10 stream thread, shared-memory BGRx/BGRA first (no modifiers → no DMA-BUF; L1b), cursor + damage metadata, pause/resize → `Lost` → resume; a stream-level failure → rebuild from the token on a background thread (reinit never blocks the host thread on a dialog); "Stop sharing" in the desktop indicator, a declined dialog or an unanswered one (120 s) end the hosted session (terminal, AnyDesk behaviour). The 120 s dialog wait on the host media thread happens only in the first `create_capture`. Monitor chosen in the portal dialog (Wayland `display` ids → `NoOutput`). Build needs `libpipewire-0.3-dev libspa-0.2-dev libclang-dev`. **Device-pending** (checklists/L1.md); acceptance test `tests/portal_capture.rs` (ignored) for T4. **Note for L6:** L6 layers a shared session slot over `portal_session::start(scope, previous, bound, abandon)` and extends `Granted` with the RemoteDesktop proxy; today the capture's `watch()` owns `granted.session` and closes it when the capture drops it. Once shared, that ownership moves into L6's slot, so only the last holder (capture or injector) closes the session |
+| L5 video surface | **built** (Opus), in review | X11: child window of the GTK toplevel on our own x11rb connection, XShape reveal clip, XDND drops via `XdndProxy`, Expose → redraw of the last frame. Wayland: the spike's area+video subsurface tree on GDK's connection (re-attached when GDK re-creates the toplevel surface), `wp_viewporter` crop + fractional scale, own `wl_data_device` for drops; decision-#3 separate window when there is no `wp_viewporter` or `SHARECTRL_VIDEO_WINDOW=separate`. Keys from the GTK toplevel on both (keymap: XKB − 8 = evdev). One wgpu presenter (Vulkan, GL fallback) over `surface-wgpu`. Headless tests: `tests/x11_surface.rs` (Xvfb), `tests/wayland_surface.rs` (headless sway). **Device-pending** (checklists/L5.md) |
 | everything else | open | as below. |
 
 Interfaces the remaining tasks must use: `Platform::create_capture / create_surface / create_injector / create_shortcut_hook / create_clipboard` (call on the thread that uses the object), `Engine::start(platform, decider)`, `Engine::attach_surface`, `IcePolicy::LoopbackOnly` for tests, mocks in `platform_api::mock`.
@@ -371,6 +372,14 @@ to run (TCC). Use `objc2` 0.6-family crates throughout (`objc2-app-kit`,
      video subsurface); `display` = GDK's `wl_display`.
   4. X11: `hide()` **unmaps** the video window and `show()` maps it (the hook's grab ends
      on unmap, which is what lets a modal be typed into).
+* As built: the shader is M4's `surface-wgpu/shaders/present.wgsl` (shared through the
+  `surface-wgpu` crate, not `platform-api/shaders`). X11 scale = GDK's integer window
+  scale, **not `Xft.dpi`**: on X11 `Xft.dpi` scales only text, while CSS px (and so the
+  40 px web toolbar the reveal uncovers) follow GDK's window scale. For the L7 hook:
+  `native_handles()` = (video child XID / video `wl_surface`, the toplevel handle
+  `create_surface` received, the display); the X11 video window is a **direct child** of
+  that toplevel and `hide()` unmaps it (tested under Xvfb). The Wayland fallback window
+  returns `None` (its toplevel surface is re-created on every show).
 
 ### L6 — Input injection: XTest / portal+libei / wlroots virtual input / uinput  (size L)
 * `impl InputInjector` with runtime backend selection and `PermissionReport` for each

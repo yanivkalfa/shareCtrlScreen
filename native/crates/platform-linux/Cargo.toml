@@ -9,6 +9,17 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Hardware encoders (task L3). Both are loaded with dlopen at run time — nothing
+# is linked and no SDK or headers are needed to build — so enabling them never
+# stops the app starting on a machine without the libraries: the probe simply
+# reports them absent.
+default = ["vaapi", "nvenc"]
+# Intel / AMD (any VA-API driver): libva.so.2 + libva-drm.so.2.
+vaapi = []
+# NVIDIA: libnvidia-encode.so.1 + libcuda.so.1 from the proprietary driver.
+nvenc = []
+
 # Linux implementation of `platform-api` (plan lane L). Empty on other targets.
 [target.'cfg(target_os = "linux")'.dependencies]
 platform-api = { path = "../platform-api" }
@@ -26,7 +37,9 @@ uuid.workspace = true
 # capture task (L1) uses and the permission flow only needs the D-Bus half.
 ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "screencast", "remote_desktop"] }
 tokio = { workspace = true }
-# Runtime probe for libva (decision #7: libva is dlopen'd, never linked).
+# ISC. dlopen/dlsym: the permissions preflight's libva probe and the VA-API /
+# NVENC / CUDA runtime bindings (decision #7: libva is dlopen'd, never linked).
+# Always on because the preflight needs it whatever the encoder features.
 libloading = "0.8"
 # Clipboard text (X11 + Wayland). No `image-data`: images are out of scope and the
 # default feature drags in the `image` decoder stack.

@@ -3,13 +3,16 @@
 //! Wayland subsurface, XTest / portal-libei / uinput injection, Secret Service,
 //! XDG autostart).
 //!
-//! Status: scaffold plus the clipboard (text and file lists). Paths and
-//! session-type detection are real; every other capability fails safely with a
-//! clear message until its task lands (see
-//! `plans/05-TASKS.md`, lane L).
+//! Status: paths, session-type detection, the clipboard (text and file
+//! lists), Secret Service passwords (L9), XDG autostart (L10), the
+//! permissions preflight (L12), hardware
+//! video encode (L3, [`LinuxCodecs`]) and the Cisco OpenH264 fallback (D2)
+//! are real; every other capability fails safely with a clear message until
+//! its task lands (see `plans/05-TASKS.md`, lane L).
 
 #![cfg(target_os = "linux")]
 
+mod codec;
 pub mod secret;
 
 use std::path::PathBuf;
@@ -18,8 +21,9 @@ use std::sync::Arc;
 mod autostart;
 mod clipboard;
 
+pub use codec::LinuxCodecs;
 use codec_openh264::{OpenH264, WithSoftwareH264};
-use platform_api::unavailable::{NoAutostart, NoCodecs};
+use platform_api::unavailable::NoAutostart;
 use platform_api::{
     Autostart, CaptureError, Clipboard, CodecFactory, DisplayInfo, InputError, InputInjector,
     OsPermission, Paths, PermissionReport, Platform, PlatformInfo, RawDisplayHandle,
@@ -61,9 +65,10 @@ impl SessionType {
 
 pub struct LinuxPlatform {
     session: SessionType,
-    /// VA-API/NVENC land in lane L; until then — and wherever they are missing
-    /// (libva < 2.20, decision #7) — Cisco OpenH264 is the codec.
-    codecs: WithSoftwareH264<NoCodecs>,
+    /// NVENC / VA-API first; wherever they are missing (no GPU, libva < 2.20 —
+    /// decision #7) `LinuxCodecs` returns NoEncoder and Cisco OpenH264 takes
+    /// over. Decoding is software until task L4.
+    codecs: WithSoftwareH264<LinuxCodecs>,
 }
 
 impl LinuxPlatform {
@@ -71,7 +76,7 @@ impl LinuxPlatform {
         let openh264 = Arc::new(OpenH264::new(config_dir().join("codecs")));
         Self {
             session: SessionType::detect(),
-            codecs: WithSoftwareH264::new(NoCodecs { reason: NOT_YET }, openh264),
+            codecs: WithSoftwareH264::new(LinuxCodecs::new(), openh264),
         }
     }
 

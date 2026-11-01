@@ -51,7 +51,10 @@ impl fmt::Display for AvccError {
                 write!(f, "unsupported NAL length-field size of {n} bytes")
             }
             AvccError::Truncated { offset } => {
-                write!(f, "NAL unit at byte {offset} runs past the end of the sample")
+                write!(
+                    f,
+                    "NAL unit at byte {offset} runs past the end of the sample"
+                )
             }
             AvccError::EmptyNal { offset } => write!(f, "empty NAL unit at byte {offset}"),
             AvccError::NoNal => f.write_str("the sample holds no NAL unit"),
@@ -244,7 +247,9 @@ mod tests {
         assert!(key.is_keyframe(Codec::Hevc));
         assert!(!key.has_parameter_sets(Codec::Hevc));
         let cra = avcc(4, &[cra]);
-        assert!(Nals::parse(&cra, 4).expect("parse").is_keyframe(Codec::Hevc));
+        assert!(Nals::parse(&cra, 4)
+            .expect("parse")
+            .is_keyframe(Codec::Hevc));
         let delta = avcc(4, &[trail_r]);
         assert!(!Nals::parse(&delta, 4)
             .expect("parse")

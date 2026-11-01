@@ -82,11 +82,11 @@ use objc2_core_media::{
 use objc2_core_video::{
     kCVImageBufferColorPrimaries_ITU_R_709_2, kCVImageBufferTransferFunction_ITU_R_709_2,
     kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVPixelBufferHeightKey,
-    kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferPixelFormatTypeKey,
-    kCVPixelBufferWidthKey, kCVPixelFormatType_32BGRA,
-    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVReturnSuccess, CVPixelBuffer,
-    CVPixelBufferGetBaseAddress, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRow,
-    CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeight, CVPixelBufferGetHeightOfPlane, CVPixelBufferGetPlaneCount, CVPixelBufferLockBaseAddress,
+    kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey,
+    kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVReturnSuccess,
+    CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBaseAddressOfPlane,
+    CVPixelBufferGetBytesPerRow, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeight,
+    CVPixelBufferGetHeightOfPlane, CVPixelBufferGetPlaneCount, CVPixelBufferLockBaseAddress,
     CVPixelBufferLockFlags, CVPixelBufferPool, CVPixelBufferUnlockBaseAddress,
 };
 use objc2_video_toolbox::{
@@ -99,7 +99,8 @@ use objc2_video_toolbox::{
     kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
     kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_RealTime,
     kVTCompressionPropertyKey_TransferFunction, kVTCompressionPropertyKey_YCbCrMatrix,
-    kVTDownsamplingMode_Average, kVTEncodeFrameOptionKey_ForceKeyFrame, kVTH264EntropyMode_CABAC,
+    kVTCouldNotCreateInstanceErr, kVTCouldNotFindVideoEncoderErr, kVTDownsamplingMode_Average,
+    kVTEncodeFrameOptionKey_ForceKeyFrame, kVTH264EntropyMode_CABAC, kVTParameterErr,
     kVTPixelTransferPropertyKey_DownsamplingMode, kVTPixelTransferPropertyKey_RealTime,
     kVTPixelTransferPropertyKey_ScalingMode, kVTProfileLevel_H264_ConstrainedHigh_AutoLevel,
     kVTProfileLevel_H264_Main_3_0, kVTProfileLevel_H264_Main_3_1, kVTProfileLevel_H264_Main_3_2,
@@ -107,9 +108,8 @@ use objc2_video_toolbox::{
     kVTProfileLevel_H264_Main_5_0, kVTProfileLevel_H264_Main_5_1, kVTProfileLevel_H264_Main_5_2,
     kVTProfileLevel_H264_Main_AutoLevel, kVTProfileLevel_HEVC_Main_AutoLevel,
     kVTScalingMode_Normal, kVTVideoEncoderSpecification_EnableLowLatencyRateControl,
-    kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder,
-    kVTCouldNotCreateInstanceErr, kVTCouldNotFindVideoEncoderErr, kVTParameterErr,
-    VTCompressionSession, VTEncodeInfoFlags, VTSessionSetProperty,
+    kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder, VTCompressionSession,
+    VTEncodeInfoFlags, VTSessionSetProperty,
 };
 use platform_api::{
     Codec, CodecError, CpuPlane, EncodedUnit, EncoderConfig, Frame, FrameData, PixelFormat,
@@ -120,9 +120,9 @@ use crate::avcc::Nals;
 use crate::convert::{copy_plane, retry_delay};
 use crate::gpu::CvPixelBufferFrame;
 use crate::vt_params::{
-    data_rate_limit_bytes, describe, expected_fps, h264_level, low_latency_refused,
-    no_encoder, session_lost, status_name, H264Level, DATA_RATE_WINDOW_SECS,
-    KEYFRAME_INTERVAL_FALLBACK, KEYFRAME_INTERVAL_FRAMES, MAX_QP,
+    data_rate_limit_bytes, describe, expected_fps, h264_level, low_latency_refused, no_encoder,
+    session_lost, status_name, H264Level, DATA_RATE_WINDOW_SECS, KEYFRAME_INTERVAL_FALLBACK,
+    KEYFRAME_INTERVAL_FRAMES, MAX_QP,
 };
 
 /// Timestamps are in microseconds.
@@ -304,7 +304,16 @@ fn parameter_set(
     };
     let (mut nal, mut size, mut count, mut header_length) = (ptr::null(), 0usize, 0usize, 0);
     // SAFETY: valid format description; every out-pointer is a valid local.
-    let rc = unsafe { get(desc, index, &mut nal, &mut size, &mut count, &mut header_length) };
+    let rc = unsafe {
+        get(
+            desc,
+            index,
+            &mut nal,
+            &mut size,
+            &mut count,
+            &mut header_length,
+        )
+    };
     if rc != NO_ERR {
         return Err(rc);
     }
@@ -354,7 +363,10 @@ fn codec_type(codec: Codec) -> Option<CMVideoCodecType> {
 }
 
 /// A CFDictionary from CFString keys to values of any CF type.
-fn dictionary(keys: &[&CFString], values: &[&CFType]) -> CFRetained<CFDictionary<CFString, CFType>> {
+fn dictionary(
+    keys: &[&CFString],
+    values: &[&CFType],
+) -> CFRetained<CFDictionary<CFString, CFType>> {
     CFDictionary::from_slices(keys, values)
 }
 
@@ -473,7 +485,11 @@ impl Session {
             cfg.height,
             expected_fps(cfg),
             cfg.bitrate_bps / 1000,
-            if low_latency { "low-latency rate control" } else { "standard rate control" }
+            if low_latency {
+                "low-latency rate control"
+            } else {
+                "standard rate control"
+            }
         );
         Ok(session)
     }
@@ -498,7 +514,11 @@ impl Session {
                 });
             }
             prefer(s, kVTCompressionPropertyKey_RealTime, yes);
-            prefer(s, kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, yes);
+            prefer(
+                s,
+                kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
+                yes,
+            );
             let fps = CFNumber::new_f64(expected_fps(cfg));
             prefer(s, kVTCompressionPropertyKey_ExpectedFrameRate, &fps);
             self.configure_profile(cfg);
@@ -559,7 +579,11 @@ impl Session {
                 ],
                 &[kVTScalingMode_Normal, kVTDownsamplingMode_Average, yes],
             );
-            prefer(s, kVTCompressionPropertyKey_PixelTransferProperties, &transfer);
+            prefer(
+                s,
+                kVTCompressionPropertyKey_PixelTransferProperties,
+                &transfer,
+            );
         }
         apply_bitrate(s, cfg.bitrate_bps)
     }
@@ -1021,7 +1045,10 @@ pub(crate) fn probe(codec: Codec) -> bool {
     match VtEncoder::new(cfg) {
         Ok(_) => true,
         Err(e) => {
-            tracing::info!("VideoToolbox: no hardware {} encoder ({e})", codec.as_caps_str());
+            tracing::info!(
+                "VideoToolbox: no hardware {} encoder ({e})",
+                codec.as_caps_str()
+            );
             false
         }
     }
@@ -1040,18 +1067,25 @@ mod tests {
 
     use super::*;
 
-
     /// A `420v` IOSurface buffer with a horizontal luma ramp, like a
     /// ScreenCaptureKit frame.
     fn capture_like(w: u32, h: u32) -> CvPixelBufferFrame {
         let pool = UploadPool::new(PixelFormat::Nv12, w, h).expect("pool");
         let (wu, hu) = (w as usize, h as usize);
-        let y: Vec<u8> = (0..wu * hu).map(|i| (16 + (i % wu) * 219 / wu) as u8).collect();
+        let y: Vec<u8> = (0..wu * hu)
+            .map(|i| (16 + (i % wu) * 219 / wu) as u8)
+            .collect();
         let uv = vec![128u8; wu * hu.div_ceil(2)];
         let buffer = pool
             .fill(
-                CpuPlane { data: &y, stride: wu },
-                Some(CpuPlane { data: &uv, stride: wu }),
+                CpuPlane {
+                    data: &y,
+                    stride: wu,
+                },
+                Some(CpuPlane {
+                    data: &uv,
+                    stride: wu,
+                }),
             )
             .expect("fill");
         CvPixelBufferFrame::new(buffer)
@@ -1076,7 +1110,10 @@ mod tests {
         assert_eq!(&first.data[..4], &[0, 0, 0, 1], "Annex-B start code");
         // SPS (type 7) leads the keyframe.
         assert_eq!(first.data[4] & 0x1f, 7, "SPS first on the keyframe");
-        assert!(units.iter().skip(1).all(|u| !u.keyframe), "no unrequested IDR");
+        assert!(
+            units.iter().skip(1).all(|u| !u.keyframe),
+            "no unrequested IDR"
+        );
     }
 
     #[test]

@@ -207,7 +207,11 @@ const STATUSES: &[(i32, &str, &str)] = &[
         "kVTPropertyNotSupportedErr",
         PROPERTY_ADVICE,
     ),
-    (kVTPropertyReadOnlyErr, "kVTPropertyReadOnlyErr", PROPERTY_ADVICE),
+    (
+        kVTPropertyReadOnlyErr,
+        "kVTPropertyReadOnlyErr",
+        PROPERTY_ADVICE,
+    ),
     (
         kVTParameterErr,
         "kVTParameterErr",
@@ -258,7 +262,11 @@ const STATUSES: &[(i32, &str, &str)] = &[
         "macOS refused this app access to the video encoder; reinstall the app from the \
          official download",
     ),
-    (kVTSessionMalfunctionErr, "kVTSessionMalfunctionErr", RESET_ADVICE),
+    (
+        kVTSessionMalfunctionErr,
+        "kVTSessionMalfunctionErr",
+        RESET_ADVICE,
+    ),
     (
         kVTVideoEncoderNeedsRosettaErr,
         "kVTVideoEncoderNeedsRosettaErr",
@@ -406,7 +414,10 @@ mod tests {
     #[test]
     fn every_status_has_a_name_and_actionable_advice() {
         let msg = describe("VTCompressionSessionCreate", kVTCouldNotFindVideoEncoderErr);
-        assert!(msg.contains("kVTCouldNotFindVideoEncoderErr (-12908)"), "{msg}");
+        assert!(
+            msg.contains("kVTCouldNotFindVideoEncoderErr (-12908)"),
+            "{msg}"
+        );
         assert!(msg.contains("Settings → Advanced"), "{msg}");
         let msg = describe("encode", -1);
         assert!(msg.contains("unknown VideoToolbox error (-1)"), "{msg}");

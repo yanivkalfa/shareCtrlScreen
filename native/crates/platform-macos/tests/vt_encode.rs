@@ -20,7 +20,7 @@ use objc2_core_video::{
     CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
 };
 use platform_api::{
-    Codec, EncodedUnit, EncoderConfig, Frame, FrameData, Platform, PixelFormat, VideoEncoder,
+    Codec, EncodedUnit, EncoderConfig, Frame, FrameData, PixelFormat, Platform, VideoEncoder,
 };
 use platform_macos::gpu::CvPixelBufferFrame;
 use platform_macos::MacPlatform;
@@ -131,14 +131,25 @@ fn encodes_300_frames_first_idr_mean_under_8ms() {
     let first = units.first().expect("no output at all");
     assert!(first.keyframe, "first unit is not a keyframe");
     assert_annexb(first);
-    assert_eq!(first.data[4] & 0x1f, 7, "keyframe does not lead with an SPS");
+    assert_eq!(
+        first.data[4] & 0x1f,
+        7,
+        "keyframe does not lead with an SPS"
+    );
     assert!(
         units.iter().skip(1).all(|u| !u.keyframe),
         "the encoder inserted a keyframe nobody asked for"
     );
     units.iter().for_each(assert_annexb);
-    assert!(units.len() >= 290, "only {} of 300 frames encoded", units.len());
-    assert!(mean <= Duration::from_millis(8), "mean encode {mean:?} > 8 ms");
+    assert!(
+        units.len() >= 290,
+        "only {} of 300 frames encoded",
+        units.len()
+    );
+    assert!(
+        mean <= Duration::from_millis(8),
+        "mean encode {mean:?} > 8 ms"
+    );
 }
 
 /// Five real-time seconds of 60 fps noise at 6 Mbit/s: the bytes produced
@@ -167,7 +178,10 @@ fn holds_the_bitrate_within_15_percent_over_5_seconds() {
         if forced {
             enc.force_keyframe();
         }
-        for u in enc.encode(&pictures[i % pictures.len()].frame()).expect("encode") {
+        for u in enc
+            .encode(&pictures[i % pictures.len()].frame())
+            .expect("encode")
+        {
             if i >= 150 && u.keyframe {
                 forced_key_seen = true;
             }
@@ -178,7 +192,10 @@ fn holds_the_bitrate_within_15_percent_over_5_seconds() {
     let secs = start.elapsed().as_secs_f64();
     let bps = bytes as f64 * 8.0 / secs;
     let ratio = bps / TARGET as f64;
-    eprintln!("{i} frames in {secs:.2} s: {:.2} Mbit/s ({ratio:.3} × target)", bps / 1e6);
+    eprintln!(
+        "{i} frames in {secs:.2} s: {:.2} Mbit/s ({ratio:.3} × target)",
+        bps / 1e6
+    );
     assert!(forced_key_seen, "forced keyframe never came out");
     assert!(
         (0.85..=1.15).contains(&ratio),
@@ -261,7 +278,10 @@ fn round_trip_through_the_platform_decoder_is_at_least_40_db() {
     let mut decoded = 0;
     for i in 0..30 {
         for u in enc.encode(&source.frame()).expect("encode") {
-            if let Some(frame) = dec.decode(&u.data, u.keyframe, i * 166_667).expect("decode") {
+            if let Some(frame) = dec
+                .decode(&u.data, u.keyframe, i * 166_667)
+                .expect("decode")
+            {
                 assert_eq!((frame.width, frame.height), (W, H));
                 best = best.max(psnr(&source.y, &decoded_luma(&frame)));
                 decoded += 1;

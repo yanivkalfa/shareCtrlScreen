@@ -1178,16 +1178,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "input"
-version = "2.0.0"
-dependencies = [
- "parking_lot",
- "protocol",
- "tracing",
- "windows 0.62.2",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2917,7 +2907,6 @@ version = "0.0.0"
 dependencies = [
  "gdkwayland-sys",
  "gtk",
- "input",
  "platform-api",
  "raw-window-handle",
  "tao",

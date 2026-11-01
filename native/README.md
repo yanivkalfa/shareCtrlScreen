@@ -21,7 +21,7 @@ The Cloudflare signaling server (`../server/`) and the JSON WebSocket protocol
 | `crates/codec` | Media Foundation HW H.264/HEVC encode (§5b, zero-copy, LTR, the low-latency `ICodecAPI` recipe) + D3D11-backed decode (§5c). |
 | `crates/transport` | str0m WebRTC (§6): video on an RTP media track with congestion control (BWE), ctl (reliable) / cursor (unreliable) / bulk (reliable) data channels. Unit-tested. |
 | `crates/signaling` | Async WebSocket client to the Cloudflare Worker: register, byte-exact ping/pong watchdog, backoff reconnect. |
-| `crates/input` | `SendInput` injection + Set-1 scancode table (§8a) + `WH_KEYBOARD_LL` shortcut hook. Ported from `input.js`/`keyhook.js`. Unit-tested. |
+| `crates/input` | `SendInput` injection + adapter over the shared generated keymap (`platform_api::keymap`, Set-1 column) + `WH_KEYBOARD_LL` shortcut hook. Ported from `input.js`/`keyhook.js`. Unit-tested. |
 | `crates/render` | D3D11 flip-model present (§7): waitable swapchain, `ALLOW_TEARING`, NV12→RGB BT.709 shader. |
 | `crates/elevation` | SYSTEM service primitives (§8b): session detection, `WTSQueryUserToken`, `CreateProcessAsUser`, input-desktop follow, service install/uninstall. |
 | `crates/engine` | OS-independent orchestration: handshake state machine (approve/password, live view↔control), and the session (ICE, transport driver, media threads, clipboard/file sync) — all OS access via `platform-api`. |

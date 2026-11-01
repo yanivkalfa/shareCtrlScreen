@@ -14,7 +14,7 @@
 | D6 docs | **done** `c4c55d4` (Haiku, Opus-reviewed) | root README install/what-works-where + docs/FIRST-RUN.md |
 | D5 permissions modal | **done** `1f3b607` (Sonnet) | host preflight: screenCapture + inputInjection; viewer preflight only with captureShortcuts on |
 | L10 XDG autostart | **done** `136dbd9` (Haiku, Opus-reviewed) | `~/.config/autostart/sharectrl.desktop` |
-| D3 keymap | **done** (Sonnet) | `platform_api::keymap` generated from Chromium `dom_code_data.inc` (`tools/gen-keymap`); NumLock parity override kept (W3 decides); Power/edit keys excluded |
+| D3 keymap | **done** (Sonnet) | `platform_api::keymap` generated from Chromium `dom_code_data.inc` (`tools/gen-keymap`); NumLock kept at the plain `0x45` override until W3 (now removed); Power/edit keys excluded |
 | M7 clipboard | **done** `8d2dea6` (Sonnet) | NSPasteboard text + change count + file URLs; `set_files` refuses relative paths |
 | M9 autostart | **done** `2a7aa03` (Haiku, Opus-reviewed) | per-user LaunchAgent, no launchctl |
 | L12 permissions | **done** `2f5c0b4` (Sonnet) | portal preflight + consent flow, restore-token store (`portal_token.rs`) |
@@ -137,6 +137,16 @@ I1..I4 after all lanes (hardware validation)
 * Depends on: D3. Replace `input/src/scancode.rs` lookups with the generated table (Set-1
   column). Acceptance: existing scancode tests pass against the generated table; the
   104 old entries map identically (write a test that asserts it).
+* **Done (W3).** `input::scancode` is now a thin adapter over `KeyId::{to,from}_set1`; the
+  hand table is gone (kept only as a test fixture proving the 104 old entries). Callers
+  (`Injector`, the viewer window's `code_for`) are unchanged in shape. `MapVirtualKeyW` is not
+  used (layout-dependent). Decision, **NumLock parity override removed**: the old table sent
+  NumLock as plain `0x45`, but Windows reads plain `45` as Pause (`E1 1D 45`, make code `45`
+  not extended) and NumLock as `E0 45` (Chromium `0xe045`, AutoHotkey `SC145`). So the old
+  injector pressed Pause and the viewer forwarded a real Pause as NumLock. The generated
+  `0xe045` is used as is; `SET1_OVERRIDES` is deleted from `tools/gen-keymap`. This is the one
+  intentional difference from the 104 old entries (asserted in `scancode.rs`). Device smoke
+  to do: NumLock toggles the LED on the host and Pause does nothing.
 
 ---
 

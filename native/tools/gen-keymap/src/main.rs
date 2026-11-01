@@ -104,12 +104,6 @@ const EXCLUDED: &[&str] = &[
     "Props",
 ];
 
-/// Windows Set-1 values that differ from Chromium on purpose. Chromium
-/// records NumLock as extended (`0xe045`) so that `MapVirtualKey` can tell it
-/// from Pause (E1 1D 45); the injector this table replaces has always sent it
-/// as plain `0x45`, and the property test pins that, so the table keeps it.
-const SET1_OVERRIDES: &[(&str, u16)] = &[("NumLock", 0x0045)];
-
 #[derive(Debug, thiserror::Error)]
 enum Error {
     #[error("cannot read {path}: {source}")]
@@ -131,8 +125,6 @@ enum Error {
         first: String,
         second: String,
     },
-    #[error("override names `{0}`, which is not in the table")]
-    UnknownOverride(&'static str),
     #[error("the table has {0} keys; the generated indices are u8")]
     TooManyKeys(usize),
     #[error("rustfmt failed: {0}")]
@@ -248,12 +240,6 @@ fn select(rows: &[Row]) -> Result<Vec<Key>, Error> {
             })
         })
         .collect();
-    for &(dom, set1) in SET1_OVERRIDES {
-        keys.iter_mut()
-            .find(|key| key.dom == dom)
-            .ok_or(Error::UnknownOverride(dom))?
-            .set1 = set1;
-    }
     keys.sort_by_key(|key| key.usb);
 
     // Every inverse lookup is only well defined if a native code names one key.
@@ -503,13 +489,7 @@ mod tests {
             mac: NO_MAC,
             dom: Some(dom.to_owned()),
         };
-        // NumLock is only here because `select` insists its override applies.
-        let err = select(&[
-            row(0x070004, "KeyA", 30),
-            row(0x070005, "KeyB", 30),
-            row(0x070053, "NumLock", 69),
-        ])
-        .unwrap_err();
+        let err = select(&[row(0x070004, "KeyA", 30), row(0x070005, "KeyB", 30)]).unwrap_err();
         assert!(matches!(
             err,
             Error::Duplicate {
@@ -528,6 +508,14 @@ mod tests {
             assert!(!has(excluded), "{excluded} must not be in the table");
         }
         assert!(!has("NumpadMemoryStore"), "no native code on any OS");
+    }
+
+    #[test]
+    fn numlock_keeps_chromiums_extended_scancode() {
+        // Plain 0x45 is Pause to Windows; NumLock must stay E0 45 (task W3).
+        let keys = select(&parse(INC).unwrap()).unwrap();
+        let numlock = keys.iter().find(|key| key.dom == "NumLock");
+        assert_eq!(numlock.map(|key| key.set1), Some(0xe045));
     }
 
     #[test]

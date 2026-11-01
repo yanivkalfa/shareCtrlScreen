@@ -1021,13 +1021,24 @@ impl VideoEncoder for VtEncoder {
         if bps == self.cfg.bitrate_bps {
             return Ok(());
         }
-        if let Some(session) = &self.session {
-            // Live: VideoToolbox applies it from the next frame, no keyframe.
-            apply_bitrate(&session.raw, bps).map_err(|f| f.into_error(self.cfg.codec))?;
-        }
-        // Without a session the rebuild picks it up.
+        // Stored first: a session that is (or turns out to be) gone is
+        // rebuilt from `cfg`, and must come back at the new rate.
+        let previous = self.cfg.bitrate_bps;
         self.cfg.bitrate_bps = bps;
-        Ok(())
+        let Some(session) = &self.session else {
+            return Ok(());
+        };
+        // Live: VideoToolbox applies it from the next frame, no keyframe.
+        match apply_bitrate(&session.raw, bps) {
+            Ok(()) => Ok(()),
+            Err(f) if session_lost(f.status) => Err(self.failed(f)),
+            Err(f) => {
+                // The session still runs at the old rate; keep `cfg` saying so,
+                // so the next change (or a retry of this one) is applied.
+                self.cfg.bitrate_bps = previous;
+                Err(f.into_error(self.cfg.codec))
+            }
+        }
     }
 
     fn force_keyframe(&mut self) {

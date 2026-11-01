@@ -5,12 +5,13 @@
 //!
 //! Capabilities (plans/01 §4): H.264 always (the protocol guarantee, the
 //! fallback covers it); HEVC when a hardware HEVC session can actually be
-//! made, probed once on first use and logged; AV1 never — no Mac encodes it.
+//! made — probed once, in the background from platform creation
+//! ([`VtCodecs::start_probe`]), and logged; AV1 never — no Mac encodes it.
 //! Decoding is task M3; until it lands the decoder side is the fail-safe
 //! [`NoCodecs`], which the wrapper backs with OpenH264.
 
 use std::any::Any;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use platform_api::unavailable::NoCodecs;
 use platform_api::{Codec, CodecError, CodecFactory, EncoderConfig, VideoDecoder, VideoEncoder};
@@ -19,15 +20,35 @@ use crate::vt_encoder::{self, VtEncoder};
 use crate::vt_params::{even_size, validate};
 
 pub(crate) struct VtCodecs {
-    hevc: OnceLock<bool>,
+    /// The HEVC probe's answer. Shared with the thread that computes it.
+    hevc: Arc<OnceLock<bool>>,
     decode: NoCodecs,
 }
 
 impl VtCodecs {
     pub(crate) fn new(decode: NoCodecs) -> Self {
         Self {
-            hevc: OnceLock::new(),
+            hevc: Arc::new(OnceLock::new()),
             decode,
+        }
+    }
+
+    /// Start the HEVC probe now, off the caller's thread. Building and
+    /// tearing down a hardware session takes tens of milliseconds, and the
+    /// first `host_encodable` runs inside the engine's codec negotiation; a
+    /// probe started at platform creation is normally done by then. Should
+    /// negotiation come first, `OnceLock` makes it wait for this probe
+    /// rather than run a second one.
+    pub(crate) fn start_probe(&self) {
+        let hevc = Arc::clone(&self.hevc);
+        let spawned = std::thread::Builder::new()
+            .name("vt-hevc-probe".into())
+            .spawn(move || {
+                hevc.get_or_init(|| vt_encoder::probe(Codec::Hevc));
+            });
+        if let Err(e) = spawned {
+            // Not fatal: the first `host_encodable` probes instead.
+            tracing::warn!("VideoToolbox: could not start the HEVC probe thread ({e})");
         }
     }
 

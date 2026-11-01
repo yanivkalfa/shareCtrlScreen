@@ -1,9 +1,13 @@
 //! VideoToolbox encoder acceptance (plan task M2), through the platform's own
 //! `CodecFactory` exactly as the host uses it. Needs a Mac with a hardware
-//! video encoder (every Apple-silicon Mac); no TCC permission is involved, so
-//! it also runs on a GitHub macOS runner that exposes VideoToolbox. Every test
-//! is `#[ignore]`d because a machine without the hardware cannot pass them —
-//! see plans/checklists/M2.md:
+//! video encoder (every Apple-silicon Mac); no TCC permission is involved.
+//!
+//! **Device-pending.** Every test is `#[ignore]`d because a machine without
+//! the hardware cannot pass them, so the CI's `cargo test --workspace` runs
+//! none of them. The M2 acceptance is therefore verified by hand on a Mac
+//! (plans/checklists/M2.md) until task T2 (after M2 and M3) adds a GitHub
+//! macOS-runner step that runs them with `--ignored`, skipping when
+//! VideoToolbox has no hardware encoder there:
 //!
 //! ```text
 //! cargo test -p platform-macos --test vt_encode -- --ignored --nocapture --test-threads=1
@@ -74,9 +78,20 @@ fn gradient(phase: usize) -> Picture {
     }
 }
 
-/// Full-frame luma noise: far more detail than any test bitrate can carry,
-/// so the rate controller — not the content — sets the output size.
-fn noise(seed: u32) -> Picture {
+/// The scrolling ramp of [`gradient`] plus fresh low-amplitude luma noise
+/// (±6 codes) every frame — content for the rate-control test that must
+/// sit between two bounds:
+/// * left alone, the encoder would spend *more* than the target on it: new
+///   noise every frame cannot be predicted, and at low QP every one of its
+///   coefficients costs bits;
+/// * at the max-QP floor of 32 (quantizer step ≈ 26) noise this small
+///   quantizes to almost nothing, so the target is reachable *without*
+///   dropping frames — the rate controller settles at a QP below the floor.
+///
+/// Full-amplitude noise would break the second bound: no QP ≤ 32 fits it
+/// in the budget, so the encoder could only meet the target by dropping
+/// most frames (WWDC21 10158), which says nothing about its rate control.
+fn textured(seed: u32) -> Picture {
     let mut state = seed.wrapping_mul(2_654_435_761).max(1);
     let mut next = || {
         // xorshift32
@@ -85,11 +100,12 @@ fn noise(seed: u32) -> Picture {
         state ^= state << 5;
         state
     };
-    let (w, h) = (W as usize, H as usize);
-    Picture {
-        y: (0..w * h).map(|_| 16 + (next() % 220) as u8).collect(),
-        uv: vec![128; w * h / 2],
+    let mut picture = gradient(seed as usize * 4);
+    for px in &mut picture.y {
+        let offset = (next() % 13) as i32 - 6;
+        *px = (*px as i32 + offset).clamp(16, 235) as u8;
     }
+    picture
 }
 
 fn encoder(bitrate_bps: u32) -> Box<dyn VideoEncoder> {
@@ -152,9 +168,11 @@ fn encodes_300_frames_first_idr_mean_under_8ms() {
     );
 }
 
-/// Five real-time seconds of 60 fps noise at 6 Mbit/s: the bytes produced
-/// are within ±15 % of the target. A forced keyframe in the middle comes out
-/// as one, and a live bitrate change takes without a rebuild.
+/// Five real-time seconds of 60 fps [`textured`] content at 6 Mbit/s: the
+/// bytes produced are within ±15 % of the target, and (because that content
+/// fits under the QP floor) at least 90 % of the frames are encoded rather
+/// than dropped. A forced keyframe in the middle comes out as one, and a
+/// live bitrate change takes without a rebuild.
 #[test]
 #[ignore = "needs macOS hardware"]
 fn holds_the_bitrate_within_15_percent_over_5_seconds() {
@@ -163,11 +181,12 @@ fn holds_the_bitrate_within_15_percent_over_5_seconds() {
     let mut enc = encoder(TARGET / 2);
     // Live change before measuring: the session must follow it.
     enc.set_bitrate(TARGET).expect("live bitrate change");
-    let pictures: Vec<Picture> = (0..16).map(noise).collect();
+    let pictures: Vec<Picture> = (0..16).map(textured).collect();
     let interval = Duration::from_micros(16_667);
     let start = Instant::now();
     let mut bytes = 0usize;
     let mut forced_key_seen = false;
+    let mut encoded = 0usize;
     let mut i = 0usize;
     while start.elapsed() < Duration::from_secs(5) {
         let due = start + interval * i as u32;
@@ -186,6 +205,7 @@ fn holds_the_bitrate_within_15_percent_over_5_seconds() {
                 forced_key_seen = true;
             }
             bytes += u.data.len();
+            encoded += 1;
         }
         i += 1;
     }
@@ -193,10 +213,15 @@ fn holds_the_bitrate_within_15_percent_over_5_seconds() {
     let bps = bytes as f64 * 8.0 / secs;
     let ratio = bps / TARGET as f64;
     eprintln!(
-        "{i} frames in {secs:.2} s: {:.2} Mbit/s ({ratio:.3} × target)",
+        "{i} frames submitted, {encoded} encoded in {secs:.2} s: {:.2} Mbit/s \
+         ({ratio:.3} × target)",
         bps / 1e6
     );
     assert!(forced_key_seen, "forced keyframe never came out");
+    assert!(
+        encoded * 10 >= i * 9,
+        "only {encoded} of {i} frames encoded: the target was met by dropping frames"
+    );
     assert!(
         (0.85..=1.15).contains(&ratio),
         "{:.2} Mbit/s is outside ±15 % of {} Mbit/s",
@@ -265,10 +290,15 @@ fn psnr(a: &[u8], b: &[u8]) -> f64 {
 fn round_trip_through_the_platform_decoder_is_at_least_40_db() {
     logs();
     let platform = MacPlatform::new();
+    // OpenH264 off while the encoder is built, so a failed hardware session
+    // fails the test instead of being silently replaced by the software
+    // encoder; back on for the decoder, which falls back to it before M3.
+    platform.openh264().set_enabled(false);
     let mut enc = platform
         .codecs()
         .new_encoder(None, config(8_000_000))
         .expect("hardware H.264 encoder");
+    platform.openh264().set_enabled(true);
     let mut dec = platform
         .codecs()
         .new_decoder(None, Codec::H264, W, H)

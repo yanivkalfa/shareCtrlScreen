@@ -60,6 +60,7 @@ impl MacPlatform {
     pub fn new() -> Self {
         let openh264 = Arc::new(OpenH264::new(config_dir().join("codecs")));
         let hardware = codecs::VtCodecs::new(NoCodecs { reason: NOT_YET });
+        hardware.start_probe();
         Self {
             codecs: WithSoftwareH264::new(hardware, openh264),
         }

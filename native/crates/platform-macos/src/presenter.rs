@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use objc2::rc::Retained;
 use objc2_quartz_core::{CAMetalLayer, CATransaction};
-use platform_api::{Frame, FrameData, Presenter, SurfaceError};
+use platform_api::{CursorSprite, Frame, FrameData, Presenter, SurfaceError};
 use surface_wgpu::{DrawParams, Renderer, Source, SurfaceState};
 
 use crate::gpu::CvPixelBufferFrame;
@@ -318,6 +318,12 @@ impl Presenter for MetalPresenter {
     /// D3D11 path, where decoder and swapchain must use one device).
     fn device(&self) -> Option<&dyn Any> {
         None
+    }
+
+    /// The host's cursor image (task D9), drawn by the shared renderer from
+    /// the next frame on.
+    fn set_cursor_sprite(&mut self, sprite: Option<&CursorSprite>) -> Result<(), SurfaceError> {
+        self.renderer.set_cursor_sprite(sprite)
     }
 }
 

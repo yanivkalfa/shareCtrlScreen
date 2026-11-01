@@ -11,6 +11,7 @@
 
 pub mod config;
 pub mod control;
+pub mod cursor;
 pub mod input;
 pub mod signaling;
 pub mod transfer;

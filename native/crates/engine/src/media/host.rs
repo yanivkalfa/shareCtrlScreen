@@ -18,6 +18,9 @@ pub(crate) struct HostMedia {
     pub display: Option<String>,
     pub codec: Codec,
     pub shared: Arc<Shared>,
+    /// The reliable control channel, for cursor images (D9): an image is sent
+    /// once, so it must not be lost the way a stale position may be.
+    pub ctl_tx: Sender<Vec<u8>>,
 }
 
 /// Host capture → encode loop. Runs on its own thread; the capture session and
@@ -36,7 +39,12 @@ pub(crate) fn host_media_loop(
         display,
         codec,
         shared,
+        ctl_tx,
     } = media;
+    // The host's cursor images (D9). Per session: a new session (including a
+    // reconnect) starts empty, so the first shape the new capture reports is
+    // sent again even if an earlier session had sent it.
+    let mut cursor_images = super::cursor::HostCursor::default();
     let codecs = platform.codecs();
     let mut cap = match platform.create_capture(display.as_deref()) {
         Ok(c) => c,
@@ -201,6 +209,14 @@ pub(crate) fn host_media_loop(
                 // capture pixels, which differ from the encode size whenever the
                 // viewer's window is smaller than this screen.
                 if let Some(cur) = &frame.cursor {
+                    // A changed image goes out on the reliable channel BEFORE the
+                    // position naming it, so the viewer usually has the image by
+                    // the time it is asked to draw it (until then it keeps the
+                    // image it was drawing).
+                    let frame_size = (frame.frame.width, frame.frame.height);
+                    for part in cursor_images.update(cur.shape.as_ref(), frame_size) {
+                        let _ = ctl_tx.send(serde_json::to_vec(&part).unwrap_or_default());
+                    }
                     let x =
                         (cur.position.x as f64 / frame.frame.width.max(1) as f64).clamp(0.0, 1.0);
                     let y =
@@ -208,7 +224,7 @@ pub(crate) fn host_media_loop(
                     let msg = protocol::ControlMsg::Cursor {
                         x,
                         y,
-                        shape: None,
+                        shape: cursor_images.current(),
                         visible: cur.visible,
                     };
                     let _ = cursor_tx.send(serde_json::to_vec(&msg).unwrap_or_default());

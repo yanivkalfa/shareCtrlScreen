@@ -49,6 +49,8 @@
 | W2 software codec selection | **done** (Sonnet, Opus-reviewed) | H.264 policy on Windows: hardware → MF software decoder → OpenH264 (only while `useOpenH264` is on); `h264_problem()` gives an actionable report when Media Foundation has no H.264 MFTs (N editions without the Media Feature Pack fail at launch — documented). Machine-B check: ignored test + log line "no hardware H264 decoder — using software decode" |
 | D7 release pipeline | **done** `448df49` (Opus, Opus-reviewed) | tag-triggered `release.yml` → reusable `build-assets.yml` → `scripts/release-assets.sh` (one recipe); NSIS/DMG/AppImage/deb/rpm, SHA256SUMS, per-OS third-party notices generated and attached (never committed), version read from cargo metadata, actions pinned to SHAs; macOS: certificate required when the secrets exist, ad-hoc only without them. macOS leg + AppImage verified only on GitHub |
 | D8 modifier translation | **done** (Opus, Opus-reviewed; I2 device pass pending) | viewer-side `KeyTranslator` (`engine/src/modifiers.rs`): Cmd ↔ Ctrl swap and Cmd+Tab→Alt+Tab (Mac → PC), Ctrl ↔ Cmd and Alt+Tab→Cmd+Tab (PC → Mac), sent-code tracking; host OS via new optional `connect-response.os`; `translateModifiers` toggle (default on) in Settings → Advanced; unit + loopback-tested. **Device-pending** (I2 Mac↔Windows); closes M6's blocked Cmd+Tab line |
+| M12 take every Cmd shortcut (macOS viewer) | **done** (Opus, Opus-reviewed, merged 99ed737; type-checked for aarch64-apple-darwin, device-pending) | M6 tap takes every Cmd chord + Ctrl+arrows while the video has the keyboard; Cmd+Q stays local (tap and key monitor); Force Quit / Lock Screen never claimed; every modifier synchronised before a taken key; hook keys now share the surface's FIFO input channel (D8 ordering risk closed); focus loss releases at once. Also: toolbar-reveal diagnostics + layer-frame sync + full-screen cover (owner's "top edge does nothing"). **Device-pending** (checklists/M6.md §6–§7) |
+| D9 host cursor sprite on the viewer | **done** (Opus, Opus-reviewed; device-pending I1–I3: real cursor images incl. I-beam in a terminal) | additive cursor-shape message, host sends on change, viewer draws the real sprite at position−hotspot in both presenters; replaces the synthetic triangle |
 | T4 Wayland CI | **done** (Haiku, Opus-reviewed; jobs unverified until pushed; GNOME portal tests are device-pass items) | `native-ci.yml` jobs `wayland-sway` (ubuntu-24.04: sway + xdg-desktop-portal-wlr + pipewire + wireplumber; runs L5 `wayland_surface`, L1 `portal_capture --ignored`, and L6 `input::tests` minus uinput and `xtest_*`) and `wayland-gnome` (ubuntu-24.04: mutter 46 + xdg-desktop-portal-gnome; proves the stack, runs no test: the consent dialog has no headless pre-authorization, so the libei and GNOME portal-capture tests are device-pass items). Scripts in `.github/wayland/`. Local (lane, WSL): `wayland_surface` PASS (T4-02); `input::tests` wlroots and EIS pass, uinput fails under REQUIRED as designed (T4-03). Owner verification after the push: see the T4 card |
 | L5 video surface | **done** (Opus, Opus-reviewed; device-pending per checklists/L5.md) | X11: child window of the GTK toplevel on our own x11rb connection, XShape reveal clip, XDND drops via `XdndProxy`, Expose → redraw of the last frame. Wayland: the spike's area+video subsurface tree on GDK's connection (re-attached when GDK re-creates the toplevel surface), `wp_viewporter` crop + fractional scale, drops through GDK's own data device (sink window); decision-#3 separate window when there is no `wp_viewporter` or `SHARECTRL_VIDEO_WINDOW=separate`. Keys from the GTK toplevel on both (keymap: XKB − 8 = evdev). One wgpu presenter (Vulkan, GL fallback) over `surface-wgpu`. Headless tests: `tests/x11_surface.rs` (Xvfb), `tests/wayland_surface.rs` (headless sway). **Device-pending** (checklists/L5.md) |
 | L1 Wayland capture | **done** (Opus, Opus-reviewed) | `portal_capture/`: portal ScreenCast (handshake shared with L12 in `portal_session.rs`, token scope kept: a combined token reopens a combined session) + pipewire-rs 0.10 stream thread, shared-memory BGRx/BGRA first (no modifiers → no DMA-BUF; L1b), cursor + damage metadata, pause/resize → `Lost` → resume; a stream-level failure → rebuild from the token on a background thread (reinit never blocks the host thread on a dialog); "Stop sharing" in the desktop indicator, a declined dialog or an unanswered one (120 s) end the hosted session (terminal, AnyDesk behaviour). The 120 s dialog wait on the host media thread happens only in the first `create_capture`. Monitor chosen in the portal dialog (Wayland `display` ids → `NoOutput`). Build needs `libpipewire-0.3-dev libspa-0.2-dev libclang-dev`. **Device-pending** (checklists/L1.md); acceptance test `tests/portal_capture.rs` (ignored) for T4. **Note for L6:** L6 layers a shared session slot over `portal_session::start(scope, previous, bound, abandon)` and extends `Granted` with the RemoteDesktop proxy; today the capture's `watch()` owns `granted.session` and closes it when the capture drops it. Once shared, that ownership moves into L6's slot, so only the last holder (capture or injector) closes the session. **Done in L6:** `portal_shared.rs` holds the combined session; the capture joins it (`Held::Shared`) when its token is combined, remote control already holds it, or remote control would use the portal, and owns only screen-only sessions itself |
@@ -649,9 +651,216 @@ to run (TCC). Use `objc2` 0.6-family crates throughout (`objc2-app-kit`,
   * Risks: on a Mac viewer, Cmd comes through the surface path and Tab through the M6 tap.
     Their relative order is M6's guarantee (it forwards Cmd itself when the surface has
     not). If Tab ever reached the translator first, the host would get Tab, then Ctrl.
+    (Closed by M12: hook keys now join the surface's FIFO channel, and the tap forwards
+    every modifier the surface has not sent yet.)
     A Mac user's habits around Control change meaning on a PC host: a lone Control tap is a
     Win/Super tap (Start menu, GNOME Activities), and Control+click is Win+click, not the
     macOS secondary click (nothing maps it to a right-click).
+
+### M12 — macOS: take every Cmd shortcut while the video has the keyboard  (size S–M; owner feedback 2026-11-01 from a Mac viewer on an Ubuntu host)
+* Problem: M6's tap takes a fixed set (Cmd+Tab/`/Space, Ctrl+arrows). Everything else with Cmd
+  goes through the app's responder chain first (`performKeyEquivalent`: menu bar, WebKit's
+  own Cmd+C/V/W/Q…), so most Cmd combinations never reach the host at all ("Cmd key does
+  not work" in the live test), and the ones macOS itself owns (Cmd+Space variants, Cmd+Tab)
+  were the only ones working. The owner wants ALL macOS global shortcuts forwarded.
+* Deliverable: while our window is key AND the video view has the keyboard (same focus
+  rule as M6), the session CGEventTap takes **every key-down/up carrying Cmd** (any other
+  modifiers too) and every M6 combination, and forwards the DOM codes to the host via the
+  existing shortcut-hook channel; nothing Cmd-based reaches the menu bar or WebKit while
+  captured. Exceptions, documented on the card and in the M6/M11 checklists: (1) shortcuts
+  macOS never delivers to a tap at all (Cmd+Ctrl+Q lock screen, Cmd+Opt+Esc force quit,
+  Touch ID / power): list them as "cannot be taken"; (2) **Cmd+Q stays local** as the one
+  escape hatch (the user can always quit; document it in README's macOS passthrough row);
+  (3) the sentinel/own-injection rule and `kCGEventTapDisabledByTimeout` re-enable stay.
+  Clicking any other window, or the video losing the keyboard, releases everything held
+  (release_all through the same path M6 uses) and restores local behaviour instantly.
+  Plain key-ups for keys pressed before capture started are forwarded, not swallowed (the
+  M6 "already held" rule). A setting is NOT added: this is the behaviour the owner wants.
+* The D8 translation still applies downstream (Mac→Windows/Linux swaps Cmd↔Ctrl by default;
+  the toggle in Settings → Advanced makes Cmd arrive literally as Super/Win). The card must
+  say so and the README macOS row must explain the toggle in one sentence.
+* Tests: the pure filter (`shortcut_filter.rs`) gets table tests for: any Cmd+key taken,
+  Cmd+Q not taken, M6 set still taken, Ctrl+arrows taken, plain keys untouched, modifier
+  key-up for a Cmd pressed before capture forwarded, reserved combos listed. `cargo check`
+  and clippy for aarch64-apple-darwin in the lane; the live check is I2.
+* Acceptance (I2, real Mac → Ubuntu/Windows): Cmd+Enter, Cmd+Shift+4, Cmd+Opt+D, Cmd+C/V
+  arrive on the host (translated or literal per the toggle); Cmd+Q still quits the viewer;
+  clicking the desktop restores local shortcuts; nothing stuck.
+* **As built (branch `task/M12`, in review; type-checked for aarch64-apple-darwin, the pure
+  filter tests run on every OS; device-pending, checklists/M6.md §6):**
+  * What is taken (`platform-macos/src/shortcut_filter.rs`, pure): every key-down carrying
+    Command, with any other modifiers, plus Ctrl+arrows (with any other modifiers), while
+    the video view has the keyboard (M6's focus rule, unchanged). WHY a tap for all of them:
+    AppKit offers a Command chord to `performKeyEquivalent:` down the key window's views
+    (WKWebView takes Cmd+C/V/A/Z) and then to the menu bar before `keyDown:`, and the Dock,
+    Spotlight, Mission Control and the screenshot service act on theirs before the app sees
+    them (Cocoa Event Handling Guide, "The Path of Key Events"); only a session tap is ahead
+    of all of them.
+  * **Cmd+Q stays local**: Command alone + the key the layout types as "q" (AppKit matches
+    menu key equivalents by character; physical ANSI Q when the layout types no Latin letter
+    there). The tap passes it, and the video view's key monitor (`view.rs`), which used to
+    send Cmd+Q to the remote, now lets it through to the menu bar's Quit (Tauri's default
+    macOS menu) — with or without shortcut capture. Cmd+Shift+Q and Cmd+Option+Q go to the
+    remote.
+  * **Cannot be taken** (listed in `NEVER_TAKEN`, never claimed even if delivered): Force
+    Quit Cmd+Option+Esc (also with Shift), Lock Screen Cmd+Ctrl+Q. Never delivered to a
+    tap at all: Touch ID / power, media and brightness keys (system-defined events below
+    the tap's mask; "Lower levels of the system trap and handle some events early"), and
+    every key while Secure Input is on. The video view's key monitor lets Cmd+Q and the
+    `NEVER_TAKEN` chords through to macOS too (`shortcut_filter::stays_local`, tested;
+    review round 1), so neither path sends them to the remote. Screenshots (Cmd+Shift+3/4/5) are now taken — M6
+    left them local; the M12 acceptance wants Cmd+Shift+4 on the host.
+  * Sentinel (own injected events, `Key::own`) and the `kCGEventTapDisabledByTimeout`
+    re-enable + health check are unchanged; the sentinel decision moved into the pure
+    filter so it is tested.
+  * **Ordering (the D8 reviewer's open risk), two parts.** (1) The engine's shortcut-hook
+    forwarder no longer locks the translator from the hook thread: it sends
+    `VideoInput::Key` into the **same FIFO channel** as the surface (`engine/src/session/mod.rs`
+    `hook_forwarder`). Before, a surface Cmd waiting in that channel (behind the input
+    thread's up-to-10 ms move pacing) could reach the translator after the hook's C. Codes
+    outside the shared keymap, and sends after the input thread ended, fall back to the
+    translator directly; the input loop now drains queued keys when the session stops.
+    (2) M6's "forward the chord's modifier unless the surface already holds it" now covers
+    all eight modifier keys (Cmd, Ctrl, Option, Shift, both sides) both ways: a modifier
+    down in the event's flags that the surface has not sent is forwarded first (and released
+    by the tap later); one the surface still holds but the flags no longer carry is released
+    first (a later duplicate up from the surface is harmless). Cmd+Shift+4 can no longer
+    reach the host as Cmd+4.
+  * Focus loss: besides the view's `release_all` (surface-held keys), the filter releases
+    every key and modifier it holds the moment focus goes (checked on every tap event and
+    every 50 ms run-loop turn); a taken key still physically held stays swallowed, silently,
+    until its key-up (the app that now has the keyboard never saw it go down). Key-ups of
+    keys pressed before capture pass (the monitor forwards them). No new setting.
+  * D8 still applies downstream: with "Translate modifiers" on (Settings → Advanced), Cmd
+    arrives on Windows/Linux as Ctrl (Cmd+C = Ctrl+C, Cmd+Tab = Alt+Tab); off, as Super/Win.
+  * Tests: `tests/shortcut_filter.rs` (runs on Windows/Linux too): any Cmd chord taken
+    (incl. Cmd+Enter, Cmd+Shift+4, Cmd+Opt+D, Cmd+Ctrl+F, F3, Esc), Ctrl+arrows with extra
+    modifiers, plain/non-Cmd chords untouched, Cmd+Q and its layout rule, reserved combos
+    listed and never claimed, sentinel ignored (also for flagsChanged and key-up), modifier
+    synchronisation both ways, a Cmd pressed before capture released on the host, focus loss
+    releases at once with orphans swallowed, stale orphans, release_all. Engine:
+    `hook_keys_queue_behind_the_surface_keys_sent_before_them`, the fallback, the stop drain.
+    macOS unit test pins the filter's modifier table to `keymap::MODIFIERS`.
+  * Toolbar reveal (scope addition, owner: "hovering the top edge does nothing", window not
+    full screen, flick out the top does nothing): not reproducible here. Added (a) a debug
+    line on every reveal transition with the view and layer frames, and a once-per-show
+    "pointer events arrive" line, so app.log tells "events never arrive" from "transition
+    fires but nothing moves"; (b) `apply_layout` now sets the layer's frame to the view's
+    when it did not follow (layer-hosting view; only when the layer sits directly in the
+    parent's layer); (c) `exited_through_top` (surface-wgpu, pure, tested): an exit within
+    8 CSS px of the top and nearer it than any side counts; (d) native full screen: the
+    menu bar + title bar overlay (`system_cover_pt`) moves the hide depth below it
+    (`Reveal::on_pointer_under_cover`, tested), otherwise the bar hid in the move that
+    uncovered it. Diagnosis and device steps: checklists/M6.md §7.
+  * platform-api: no change. New objc2-app-kit feature `NSScreen` (no new crate).
+
+### D9 — Draw the host's real cursor sprite on the viewer  (size M, all OSes; owner feedback 2026-11-01)
+* Problem: every viewer draws a synthetic white triangle at the out-of-band pointer position
+  (`render/src/lib.rs` cur_ps, and the surface-wgpu presenter's cursor quad). The hosts
+  already produce `CursorShape` (W1 DDA shape, M1 ScreenCaptureKit, L1 portal metadata,
+  L2 XFixes) and `CursorUpdate.shape` reaches the engine, but no shape is ever sent to the
+  viewer, so the user sees an arrow-ish blob instead of the I-beam, hand, resize or
+  Yaru/macOS/Windows cursor the host shows ("the mouse looks weird").
+* Deliverable: (1) protocol: an additive cursor-shape message on the existing cursor channel
+  (BGRA premultiplied or straight alpha stated explicitly, width/height, hotspot; sent only
+  when the shape changes, capped at 256×256, dedup by content hash; older viewers ignore
+  it, older hosts never send it and the viewer keeps the current quad as fallback);
+  (2) host: send the shape when `CursorUpdate.shape` changes and once at session start;
+  (3) viewer: upload the sprite to a texture and draw it at `position - hotspot`, scaled
+  with the video (Retina/HiDPI aware: the hotspot and size are in host pixels), with
+  correct alpha; hidden when `visible == false`; (4) both presenters: surface-wgpu (macOS,
+  Linux, and Windows if it uses it) and the D3D11 `render` crate; (5) the loopback harness
+  proves shape delivery + a pixel check that the sprite's opaque pixels land at the right
+  place; unit tests for hotspot/scale math; (6) README feature table row.
+* Non-goals: cursor animation (animated cursors send their first frame), cursor trails,
+  software cursor smoothing. Keep the out-of-band position path untouched (latency).
+* Acceptance (CI + I1–I3): loopback test green on all three OS legs; on a real session the
+  viewer shows the host's actual cursor images including I-beam in a terminal.
+* As built (branch `task/D9`, in review; no real session yet):
+  * Wire (`protocol/src/cursor.rs`, recorded in plans/04 §2): additive `ControlMsg::CursorShape`
+    (`"t":"curshape"`) on the reliable ordered **`ctl`** channel, not the `cursor` channel
+    (0 retransmits: a lost image would stay wrong until the next change; decision accepted by
+    the orchestrator). Premultiplied BGRA as hex, 16 KiB of pixels per part (≤ 16 parts,
+    ~32 KiB per message), header repeated per part; the viewer's `Assembler` bounds sizes
+    before allocating, requires in-order parts and clamps colour ≤ alpha. Positions stay on
+    the `cursor` channel unchanged; their existing `shape` field names the image id (`None` =
+    built-in arrow, which is all an older host ever sends). Older viewers fail to parse
+    `curshape` and drop it.
+  * Host (`engine/src/media/cursor.rs` `HostCursor`, used in `media/host.rs`): straight →
+    premultiplied once, FNV-1a content id over size, hotspot, host frame size and pixels;
+    sent only for an id not sent this session (FIFO of 32 mirroring the viewer's cache), and
+    again when the frame size changes; > 256 px per side is not sent (log line, viewer draws
+    the arrow; accepted instead of scaling). Per session, so a reconnect sends it again; the
+    capture backends report the current shape on a fresh session (DDA/SCK/XFixes/portal).
+  * Viewer (`ViewerCursors` in `Shared`, `InstalledSprite` in `media/viewer.rs`): the presenter
+    is given the image only when the named id changes; an id still arriving keeps the current
+    picture; hidden (`visible == false`) draws nothing.
+  * `platform-api` (approved additive): `Presenter::set_cursor_sprite` (default no-op),
+    `CursorSprite` (+ `placement`: top-left = pointer − hotspot, size = image / host frame
+    size, so Retina/HiDPI on either side needs nothing more), `MAX_CURSOR_SIDE`; doc fix:
+    `CursorUpdate.position` is the hotspot. **Windows fix:** DXGI's pointer position is the
+    image's top-left (DesktopDuplication sample), so `DdaCapture` now adds the last hotspot
+    (`dda_hotspot_position`); before, every non-arrow cursor was offset by its hotspot.
+  * Presenters: Windows uses the D3D11 `render` crate (premultiplied blend state, immutable
+    BGRA texture at t2, `spr_ps`; the fallback arrow redrawn tip-on-hotspot like wgpu's);
+    macOS and Linux use `surface-wgpu` (binding 4, `fs_sprite`, `PREMULTIPLIED_ALPHA_BLENDING`
+    pipeline, `geometry::sprite_rect`). Both keep the arrow until the first image arrives.
+  * Tests: protocol (round trip through JSON at 256², message size < 64 KiB, hostile/out-of-order
+    parts, clamping); engine (dedup, switch-back by id, frame-size re-send, oversize fallback,
+    hotspot clamp, host/viewer caches in step past capacity); platform-api (`placement` math,
+    mock CPU compositor); render (`cursor_quad` math, HLSL entry points compile); surface-wgpu
+    (geometry + a headless GPU pixel test: opaque texels on the hotspot at 1:1 and 2×, a
+    half-alpha texel blending to ≈ 192, arrow fallback); platform-windows (DDA hotspot
+    conversion); loopback `host_cursor_image_reaches_the_viewer_and_lands_on_the_hotspot`
+    (image delivered once with the host's geometry, and its opaque pixels cover exactly the
+    expected 4×6 pixels at every unclipped pointer position, through the mock presenter's CPU
+    compositor). No D3D11 pixel test: the `render` presenter needs an HWND swapchain.
+  * Review round 1 fixes:
+    * **ctl send queue** (`engine/src/session/ctl_queue.rs`): `Transport::send_ctl` now returns
+      `Ok(false)` when str0m refuses a message (its 128 KiB send buffer, shared by all
+      channels, is full until the peer acknowledges). Before, the driver ignored that and the
+      message was lost; every cursor image ≥ 128 px (4+ parts) lost its tail and was never
+      re-sent. Every ctl send (media-thread messages, ping/pong, keyframe requests, bye) now
+      goes through one ordered queue that keeps refused messages at its head and retries them
+      each driver pass, before newer ones; it also replaces the pre-open backlog. A message
+      larger than the whole buffer is dropped with a warning (it could never be accepted).
+      Loopback `maximum_size_cursor_images_in_a_burst_all_arrive_intact`: six 256×256 images
+      (16 parts each, 96 parts, ≈ 3.2 MB on ctl) all arrive, the last byte-exact and drawn.
+    * Windows monochrome cursors: inverting pixels (the standard I-beam) are black with a 1-px
+      white rim (`outline_xor` since round 2, as WebRTC's `AddCursorOutline`), so they show on a dark
+      terminal.
+    * A 1:1 image is snapped to whole target pixels in both presenters (a centred letterbox
+      can start at x.5 and the bilinear sampler would blur it); the mock compositor's doc says
+      it samples nearest and does not snap.
+  * Review round 2 fixes:
+    * Liveness: every inbound ctl message now refreshes the peer-silence timer, not only
+      Ping/Pong. The peer's pong waits behind its cursor-image backlog in the ordered ctl
+      queue (MBs on a slow uplink: an animated large cursor can mean many 132–527 KB images),
+      and counting only pongs showed "link trouble" — or ended the session past the 15 s
+      grace — while video and parts kept arriving. The burst loopback asserts neither side
+      reports link trouble; on localhost the drain is milliseconds, so the slow-uplink case
+      rests on the rule itself (no link shaper in the harness).
+    * Teardown: the queue is cleared before the final Bye, so a cursor backlog cannot keep the
+      Bye out of the 250 ms pump.
+    * Windows masked-colour cursors: non-black XOR pixels get the same 1-px rim as monochrome
+      inverting pixels, in the contrasting colour (white beside dark, black beside light), so a
+      white-XOR I-beam shows on a white page (`outline_xor`).
+  * Not done (accepted): the host does not drop a queued image when a newer shape supersedes
+    it, so on a slow uplink a burst of new large images delays later ctl messages (perm,
+    clipboard) until it drains; liveness is no longer affected.
+  * Seen while fixing, not changed (outside D9), follow-ups:
+    * The viewer's file push sends `bulk` frames while `bulk_buffered() < 256 KiB`, but
+      `send_bulk` ignores the same `Ok(false)`, and str0m refuses anything past 128 KiB
+      buffered across all channels, so a large file transfer can lose chunks silently. Needs
+      the same treatment as ctl.
+    * Clipboard text is capped at `MAX_TEXT_BYTES` (256 KiB, `platform-api/src/os.rs`), but a
+      ctl message over str0m's 128 KiB send buffer can never be accepted. Between two copies
+      of this app that buffer is the real limit (str0m peers advertise a 256 KiB
+      `max-message-size`, `LOCAL_MAX_MESSAGE_SIZE`); only a peer advertising none would cap
+      messages at the 64 KiB default. Such text was silently lost before D9 and is now dropped
+      with a warning. Cap the clipboard at what fits, or chunk it.
+  * Not verified: real sessions (I1–I3): arrow/I-beam/hand/resize on each host, DXGI top-left
+    semantics on hardware, portal cursor scale under fractional scaling, Retina scale.
 
 ## Lane T — tests & CI
 

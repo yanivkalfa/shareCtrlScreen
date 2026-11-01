@@ -35,7 +35,9 @@ use std::any::Any;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use platform_api::{Frame, FrameData, Presenter, RawDisplayHandle, RawWindowHandle, SurfaceError};
+use platform_api::{
+    CursorSprite, Frame, FrameData, Presenter, RawDisplayHandle, RawWindowHandle, SurfaceError,
+};
 use raw_window_handle::{DisplayHandle, HandleError, HasDisplayHandle};
 use surface_wgpu::{DrawParams, Renderer, SurfaceState};
 
@@ -445,6 +447,12 @@ impl<T: Target> Presenter for WgpuPresenter<T> {
     /// `None`: a CPU presenter (v1); decoders hand it CPU frames.
     fn device(&self) -> Option<&dyn Any> {
         None
+    }
+
+    /// The host's cursor image (task D9). Held by the renderer, so a repaint
+    /// of the last frame (X11 expose) draws it too.
+    fn set_cursor_sprite(&mut self, sprite: Option<&CursorSprite>) -> Result<(), SurfaceError> {
+        lock(&self.core).renderer.set_cursor_sprite(sprite)
     }
 }
 

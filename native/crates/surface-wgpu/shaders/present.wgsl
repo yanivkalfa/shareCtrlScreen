@@ -10,7 +10,8 @@
 struct Params {
     // Video destination rectangle in target pixels: x, y, width, height.
     video_rect: vec4<f32>,
-    // Cursor sprite rectangle in target pixels (top-left = hotspot).
+    // Cursor quad in target pixels: the host's image placed hotspot-on-pointer,
+    // or the fallback arrow with its tip (top-left) on the pointer.
     cursor_rect: vec4<f32>,
     // Render-target size in pixels.
     target_size: vec2<f32>,
@@ -25,6 +26,9 @@ struct Params {
 @group(0) @binding(2) var plane0: texture_2d<f32>;
 // NV12: interleaved Cb/Cr at half resolution (RG8). Unused for RGB sources.
 @group(0) @binding(3) var plane1: texture_2d<f32>;
+// The host's cursor image (task D9): premultiplied BGRA, drawn by fs_sprite
+// with ONE, ONE_MINUS_SRC_ALPHA blending. A 1x1 placeholder when none.
+@group(0) @binding(4) var cursor_tex: texture_2d<f32>;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -104,4 +108,12 @@ fn fs_cursor(in: VsOut) -> @location(0) vec4<f32> {
     let edge = p.x < 0.12 || p.y > 0.88 || (p.y - p.x) < 0.12;
     let v = select(1.0, 0.0, edge);
     return vec4<f32>(v, v, v, 1.0);
+}
+
+// The host's real cursor image, already premultiplied: sampled as-is, since
+// bilinear filtering of premultiplied texels is what keeps scaled edges free
+// of dark fringes, and the pipeline blends ONE, ONE_MINUS_SRC_ALPHA.
+@fragment
+fn fs_sprite(in: VsOut) -> @location(0) vec4<f32> {
+    return textureSample(cursor_tex, samp, in.uv);
 }

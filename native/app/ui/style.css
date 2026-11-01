@@ -264,3 +264,26 @@ fieldset.field { border: 1px solid var(--line); border-radius: 8px; padding: 12p
   box-shadow: 0 6px 22px rgba(0, 0, 0, 0.45);
 }
 .toast-error { background: #4a2429; border-color: #6d343b; color: #ffc2bd; }
+
+/* Native <select> popups are drawn by the OS (light on GTK/WebKit), but the closed
+   control is ours: keep it on the dark panel with readable text and a visible arrow,
+   and give the option list dark colours where the engine honours them (WebKitGTK and
+   WKWebView do for background/color; the highlight stays the platform accent). */
+select.input {
+  appearance: none;
+  -webkit-appearance: none;
+  background-color: var(--panel-2);
+  background-image: linear-gradient(45deg, transparent 50%, var(--fg) 50%),
+    linear-gradient(135deg, var(--fg) 50%, transparent 50%);
+  background-position: calc(100% - 18px) calc(50% - 2px), calc(100% - 13px) calc(50% - 2px);
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  padding-right: 30px;
+  color: var(--fg);
+  color-scheme: dark;
+}
+select.input option {
+  background: var(--panel-2);
+  color: var(--fg);
+}
+select.input:disabled { opacity: 0.55; }

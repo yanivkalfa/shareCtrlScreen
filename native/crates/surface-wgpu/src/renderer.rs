@@ -11,10 +11,13 @@
 //! * WebGPU viewport rules (why geometry is in the shader, not a viewport):
 //!   <https://www.w3.org/TR/webgpu/#dom-gpurenderpassencoder-setviewport>
 //! * BT.709 matrix: ITU-R BT.709-6, Table 3 items 3.2–3.3.
+//! * Cursor image blending: `wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING`
+//!   (`One`, `OneMinusSrcAlpha`), the over operator for premultiplied pixels
+//!   (Porter & Duff 1984); the image arrives premultiplied (`protocol::cursor`).
 
-use platform_api::{Frame, FrameData, PixelFormat, SurfaceError};
+use platform_api::{CursorSprite, Frame, FrameData, PixelFormat, SurfaceError};
 
-use crate::geometry::{cursor_rect, letterbox, RectF};
+use crate::geometry::{cursor_rect, letterbox, sprite_rect, RectF};
 
 /// The presenter shader (NV12 BT.709 → RGB, letterbox, cursor). Public so a
 /// backend can validate or reuse it.
@@ -74,12 +77,23 @@ pub struct Renderer {
     nv12: wgpu::RenderPipeline,
     rgb: wgpu::RenderPipeline,
     cursor: wgpu::RenderPipeline,
+    /// The host's cursor image (D9), blended premultiplied.
+    sprite_pipeline: wgpu::RenderPipeline,
     sampler: wgpu::Sampler,
     uniforms: wgpu::Buffer,
-    /// Bound as plane 1 for RGB sources: every binding in the layout must be
-    /// filled even when the fragment entry point does not read it.
+    /// Bound as plane 1 for RGB sources and as the cursor image when there is
+    /// none: every binding in the layout must be filled even when the fragment
+    /// entry point does not read it.
     placeholder: wgpu::TextureView,
     upload: Option<Upload>,
+    sprite: Option<Sprite>,
+}
+
+/// The host's cursor image on the GPU.
+struct Sprite {
+    view: wgpu::TextureView,
+    /// Geometry for [`sprite_rect`] (size, hotspot, host frame size).
+    image: CursorSprite,
 }
 
 impl Renderer {
@@ -129,6 +143,7 @@ impl Renderer {
                 },
                 texture_entry(2),
                 texture_entry(3),
+                texture_entry(4),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -136,7 +151,7 @@ impl Renderer {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let pipeline = |vs: &str, fs: &str| {
+        let pipeline = |vs: &str, fs: &str, blend: Option<wgpu::BlendState>| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(fs),
                 layout: Some(&pipeline_layout),
@@ -153,11 +168,12 @@ impl Renderer {
                     module: &module,
                     entry_point: Some(fs),
                     compilation_options: Default::default(),
-                    // Opaque: video replaces the cleared target, and the cursor
-                    // shape is cut out with `discard`, so no blending is needed.
+                    // Opaque (`None`): video replaces the cleared target, and
+                    // the arrow is cut out with `discard`. Only the host's
+                    // cursor image blends, premultiplied.
                     targets: &[Some(wgpu::ColorTargetState {
                         format: target_format,
-                        blend: None,
+                        blend,
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                 }),
@@ -165,9 +181,14 @@ impl Renderer {
                 cache: None,
             })
         };
-        let nv12 = pipeline("vs_video", "fs_nv12");
-        let rgb = pipeline("vs_video", "fs_rgb");
-        let cursor = pipeline("vs_cursor", "fs_cursor");
+        let nv12 = pipeline("vs_video", "fs_nv12", None);
+        let rgb = pipeline("vs_video", "fs_rgb", None);
+        let cursor = pipeline("vs_cursor", "fs_cursor", None);
+        let sprite_pipeline = pipeline(
+            "vs_cursor",
+            "fs_sprite",
+            Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+        );
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("present"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -206,11 +227,68 @@ impl Renderer {
             nv12,
             rgb,
             cursor,
+            sprite_pipeline,
             sampler,
             uniforms,
             placeholder,
             upload: None,
+            sprite: None,
         }
+    }
+
+    /// Install the host's cursor image (task D9), or `None` for the built-in
+    /// arrow. Uploaded once here; every later [`draw`](Self::draw) with a
+    /// cursor position draws it there.
+    pub fn set_cursor_sprite(&mut self, sprite: Option<&CursorSprite>) -> Result<(), SurfaceError> {
+        let Some(image) = sprite else {
+            self.sprite = None;
+            return Ok(());
+        };
+        if !image.is_valid() {
+            // `write_texture` with a short buffer is a wgpu validation error (a
+            // panic by default); refuse it as a reportable error instead.
+            self.sprite = None;
+            return Err(SurfaceError::Backend(format!(
+                "cursor image {}x{} with {} bytes is malformed",
+                image.width,
+                image.height,
+                image.bgra.len()
+            )));
+        }
+        let size = (image.width, image.height);
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("cursor image"),
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            // Non-sRGB: the bytes are the host's display (gamma-encoded) values,
+            // sampled as-is like the video. The render target is always a
+            // non-sRGB format or view (`Renderer::new`), so the premultiplied
+            // blend also runs on encoded values, as the host's own compositor
+            // blends its cursor. Were a backend to render into an sRGB view,
+            // this texture would need the matching sRGB format too, or edges
+            // would blend in linear space against gamma-encoded texels.
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        write_plane(
+            &self.queue,
+            &texture,
+            &image.bgra,
+            size.0 as usize * 4,
+            size,
+        );
+        self.sprite = Some(Sprite {
+            view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+            image: image.clone(),
+        });
+        Ok(())
     }
 
     /// Copy a CPU frame (`FrameData::Cpu`, NV12 or BGRA) into the renderer's
@@ -335,9 +413,19 @@ impl Renderer {
         params: DrawParams,
     ) {
         let video_rect = letterbox(params.target, params.video);
-        let cursor = params
-            .cursor
-            .map(|c| cursor_rect(video_rect, c, params.scale));
+        // The host's image where there is one, else the arrow (older hosts,
+        // or before the first image has arrived).
+        let image = params.cursor.and_then(|c| {
+            let s = self.sprite.as_ref()?;
+            Some((sprite_rect(video_rect, &s.image, c)?, &s.view))
+        });
+        let cursor = match image {
+            Some((rect, _)) => Some(rect),
+            None => params
+                .cursor
+                .map(|c| cursor_rect(video_rect, c, params.scale)),
+        };
+        let cursor_view = image.map_or(&self.placeholder, |(_, view)| view);
         let full_range = matches!(
             source,
             Source::Nv12 {
@@ -374,6 +462,10 @@ impl Renderer {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(plane1),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(cursor_view),
+                },
             ],
         });
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -400,7 +492,11 @@ impl Renderer {
             pass.draw(0..6, 0..1);
         }
         if cursor.is_some() {
-            pass.set_pipeline(&self.cursor);
+            pass.set_pipeline(if image.is_some() {
+                &self.sprite_pipeline
+            } else {
+                &self.cursor
+            });
             pass.draw(0..6, 0..1);
         }
     }
@@ -539,7 +635,14 @@ mod tests {
             .iter()
             .map(|e| e.name.as_str())
             .collect();
-        for entry in ["vs_video", "vs_cursor", "fs_nv12", "fs_rgb", "fs_cursor"] {
+        for entry in [
+            "vs_video",
+            "vs_cursor",
+            "fs_nv12",
+            "fs_rgb",
+            "fs_cursor",
+            "fs_sprite",
+        ] {
             assert!(entries.contains(&entry), "missing entry point {entry}");
         }
     }

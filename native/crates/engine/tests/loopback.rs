@@ -121,6 +121,8 @@ struct Peer {
     toasts: Arc<std::sync::Mutex<Vec<String>>>,
     /// Every role the engine reported, in order.
     roles: Arc<std::sync::Mutex<Vec<Role>>>,
+    /// How many "link trouble" countdown ticks the engine reported.
+    link_trouble: Arc<std::sync::atomic::AtomicU32>,
 }
 
 fn temp_root(name: &str) -> PathBuf {
@@ -142,9 +144,14 @@ fn start_peer(name: &str, relay: &str) -> Peer {
 ///
 /// [`PlatformInfo::name`]: platform_api::PlatformInfo::name
 fn start_peer_on(name: &str, relay: &str, os: &'static str) -> Peer {
+    start_peer_with(name, relay, |p| p.os_name = os)
+}
+
+/// A peer whose mock platform `configure` adjusts before the engine starts.
+fn start_peer_with(name: &str, relay: &str, configure: impl FnOnce(&mut MockPlatform)) -> Peer {
     let root = temp_root(name);
     let mut platform = MockPlatform::new(&root);
-    platform.os_name = os;
+    configure(&mut platform);
     let platform = Arc::new(platform);
     // Seed the config before the engine loads it: our relay, no public STUN.
     let cfg = Config {
@@ -169,12 +176,16 @@ fn start_peer_on(name: &str, relay: &str, os: &'static str) -> Peer {
     });
     let toasts: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
     let roles: Arc<std::sync::Mutex<Vec<Role>>> = Arc::default();
-    let (t, r) = (toasts.clone(), roles.clone());
+    let link_trouble: Arc<std::sync::atomic::AtomicU32> = Arc::default();
+    let (t, r, lt) = (toasts.clone(), roles.clone(), link_trouble.clone());
     tokio::spawn(async move {
         while let Some(ev) = ui_rx.recv().await {
             match ev {
                 UiEvent::Toast(msg) => t.lock().unwrap().push(msg),
                 UiEvent::RoleChanged(role) => r.lock().unwrap().push(role),
+                UiEvent::LinkTrouble { .. } => {
+                    lt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 _ => {}
             }
         }
@@ -185,6 +196,7 @@ fn start_peer_on(name: &str, relay: &str, os: &'static str) -> Peer {
         uuid,
         toasts,
         roles,
+        link_trouble,
     }
 }
 
@@ -344,6 +356,188 @@ async fn full_session_over_real_webrtc() {
         !toasts.iter().any(|t| t.contains("unavailable")),
         "no capability errors on the host: {toasts:?}"
     );
+}
+
+// ---- the host's real cursor image (D9) ------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_cursor_image_reaches_the_viewer_and_lands_on_the_hotspot() {
+    let relay = start_relay().await;
+    let host = start_peer("cursor-host", &relay);
+    let viewer = start_peer("cursor-viewer", &relay);
+    let t = Duration::from_secs(15);
+    eventually("both registered", t, || {
+        host.engine.server_connected() && viewer.engine.server_connected()
+    })
+    .await;
+    viewer.engine.connect_to(host.uuid.clone());
+
+    // The mock host reports its image once, with its first frame, before any
+    // channel is open: it must still arrive (reliable ctl, buffered until open)
+    // and be drawn wherever later position messages put the pointer.
+    eventually("frames drawn with the host's cursor image", t, || {
+        viewer
+            .platform
+            .surface
+            .state()
+            .presented
+            .iter()
+            .filter(|p| p.cursor_image_at.is_some())
+            .count()
+            >= 10
+    })
+    .await;
+
+    let shape = platform_api::mock::mock_cursor_shape();
+    {
+        let s = viewer.platform.surface.state();
+        // Received once (the content is unchanged), with the host's geometry and
+        // the pixels converted to premultiplied alpha (opaque white stays white,
+        // transparent texels are all-zero).
+        let installed: Vec<_> = s.cursor_sprites.iter().flatten().collect();
+        assert_eq!(installed.len(), 1, "installed once: {:?}", s.cursor_sprites);
+        let sprite = installed[0];
+        assert_eq!((sprite.width, sprite.height), (shape.width, shape.height));
+        assert_eq!(sprite.hotspot, shape.hotspot);
+        assert_eq!(
+            sprite.frame,
+            (640, 360),
+            "measured in the host's frame pixels"
+        );
+        assert_eq!(
+            sprite.bgra, shape.bgra,
+            "white/transparent survives premultiply"
+        );
+
+        // Pixel check: on this 1:1 surface the image's opaque block (image
+        // x ∈ [1,5), y ∈ [2,8), hotspot (2,3)) must cover exactly the 4×6 pixels
+        // at pointer + (−1, −1) — for every frame where it is not clipped.
+        let (sw, sh) = s.client_size;
+        assert_eq!((sw, sh), (640, 360));
+        let mut checked = 0;
+        for p in s.presented.iter() {
+            let (Some((nx, ny)), Some(at)) = (p.cursor, p.cursor_image_at) else {
+                continue;
+            };
+            let (px, py) = (
+                (nx * f64::from(sw)).round() as i32,
+                (ny * f64::from(sh)).round() as i32,
+            );
+            if px < 2 || py < 2 || px + 4 > sw as i32 || py + 6 > sh as i32 {
+                continue; // partly off-screen: clipped, a different rectangle
+            }
+            assert_eq!(
+                at,
+                platform_api::Rect {
+                    x: px - 1,
+                    y: py - 1,
+                    w: 4,
+                    h: 6
+                },
+                "pointer at ({px},{py})"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 5, "only {checked} unclipped frames to check");
+    }
+
+    viewer.engine.end_session();
+    eventually("both idle", t, || {
+        host.engine.role() == Role::Idle && viewer.engine.role() == Role::Idle
+    })
+    .await;
+}
+
+/// A 256×256 pointer image (the wire maximum: 256 KiB of pixels in 16 parts of
+/// ~33 KiB of JSON, ≈ 526 KB, four times SCTP's whole 128 KiB send buffer),
+/// distinct per `seed`.
+fn big_cursor(seed: u8) -> platform_api::CursorShape {
+    let side = 256u32;
+    let mut bgra = Vec::with_capacity((side * side * 4) as usize);
+    for i in 0..side * side {
+        let v = (i as u8).wrapping_mul(31).wrapping_add(seed);
+        // Straight alpha 255 everywhere, so premultiplying keeps the bytes.
+        bgra.extend_from_slice(&[v, seed, v ^ seed, 255]);
+    }
+    platform_api::CursorShape {
+        width: side,
+        height: side,
+        hotspot: platform_api::Point {
+            x: i32::from(seed),
+            y: 255 - i32::from(seed),
+        },
+        bgra,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn maximum_size_cursor_images_in_a_burst_all_arrive_intact() {
+    // Before ctl had a send queue, str0m refused every part past its 128 KiB
+    // send buffer and the driver dropped them: any image of 128 px or more
+    // lost its tail, was counted as sent, and never showed. Six maximum-size
+    // images back to back (the first shape plus a burst of five: 96 parts,
+    // ≈ 3.2 MB on ctl, queued before the channel opens and flushed at open)
+    // must all get through, in order, the last one complete and current —
+    // without the viewer ever reporting link trouble while it drains (pongs
+    // wait behind the parts; every ctl message counts as proof of life). On
+    // localhost the drain takes milliseconds, so this guards the plumbing;
+    // the slow-uplink case rests on that rule in the driver.
+    let relay = start_relay().await;
+    let burst: Vec<_> = (2..=6).map(big_cursor).collect();
+    let last = burst[burst.len() - 1].clone();
+    let host = start_peer_with("bigcur-host", &relay, |p| {
+        p.capture.cursor_shape = Some(big_cursor(1));
+        p.capture.cursor_burst = burst;
+    });
+    let viewer = start_peer("bigcur-viewer", &relay);
+    let t = Duration::from_secs(20);
+    eventually("both registered", t, || {
+        host.engine.server_connected() && viewer.engine.server_connected()
+    })
+    .await;
+    viewer.engine.connect_to(host.uuid.clone());
+
+    eventually("the last 256×256 image installed and drawn", t, || {
+        let s = viewer.platform.surface.state();
+        let installed = s
+            .cursor_sprites
+            .last()
+            .and_then(|s| s.as_ref())
+            .is_some_and(|s| s.hotspot == last.hotspot);
+        installed
+            && s.presented
+                .last()
+                .is_some_and(|p| p.cursor_image_at.is_some())
+    })
+    .await;
+    {
+        let s = viewer.platform.surface.state();
+        let Some(Some(sprite)) = s.cursor_sprites.last() else {
+            panic!("no image installed");
+        };
+        assert_eq!((sprite.width, sprite.height), (256, 256));
+        assert_eq!(sprite.frame, (640, 360));
+        assert!(
+            sprite.bgra == last.bgra,
+            "every byte of all 16 parts arrived"
+        );
+    }
+    // The session survived the 3.2 MB on ctl (pings queued behind it), and
+    // neither side ever reported link trouble.
+    assert!(matches!(viewer.engine.role(), Role::Viewer { .. }));
+    for (who, p) in [("viewer", &viewer), ("host", &host)] {
+        assert_eq!(
+            p.link_trouble.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{who} reported link trouble"
+        );
+    }
+
+    viewer.engine.end_session();
+    eventually("both idle", t, || {
+        host.engine.role() == Role::Idle && viewer.engine.role() == Role::Idle
+    })
+    .await;
 }
 
 /// A raw protocol client, to play a peer that does not follow the rules.

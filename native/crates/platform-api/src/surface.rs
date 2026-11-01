@@ -122,6 +122,11 @@ pub trait VideoSurface: Send + Sync {
 /// frame of queue depth, no vsync wait when the OS allows it (low latency).
 pub trait Presenter {
     /// `cursor` is normalized `[0,1]` over the video; `None` = no sprite.
+    ///
+    /// `cursor` is the pointer's **hotspot**. With a sprite installed
+    /// ([`set_cursor_sprite`](Self::set_cursor_sprite)) the image is drawn at
+    /// [`CursorSprite::placement`]; without one the presenter draws its
+    /// built-in arrow with the tip on the hotspot.
     fn present(
         &mut self,
         frame: &Frame<'_>,
@@ -129,4 +134,135 @@ pub trait Presenter {
     ) -> Result<(), SurfaceError>;
     /// The GPU device decoders should output to (`None` for CPU presenters).
     fn device(&self) -> Option<&dyn Any>;
+    /// Draw `sprite` (the host's real cursor image) at the cursor position from
+    /// the next `present` on; `None` returns to the built-in arrow. Called only
+    /// when the image changes, so a presenter may upload it to a texture here.
+    ///
+    /// Default: ignored, so a presenter that cannot draw images keeps the
+    /// arrow (the same picture a viewer of an older host gets).
+    fn set_cursor_sprite(&mut self, _sprite: Option<&CursorSprite>) -> Result<(), SurfaceError> {
+        Ok(())
+    }
+}
+
+/// Largest cursor image side the viewer accepts and the host sends, in pixels
+/// (the wire limit, [`protocol::cursor::MAX_SIDE`]).
+pub const MAX_CURSOR_SIDE: u32 = protocol::cursor::MAX_SIDE;
+
+/// The host's cursor image as the viewer draws it.
+///
+/// Unlike [`crate::CursorShape`] (straight alpha, what capture backends
+/// produce) the pixels here are **premultiplied** BGRA: the host converts once,
+/// so the wire and every presenter hold one format, and premultiplied is what
+/// GPU blending (`ONE, ONE_MINUS_SRC_ALPHA`) and bilinear scaling need to keep
+/// anti-aliased edges free of dark fringes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorSprite {
+    pub width: u32,
+    pub height: u32,
+    /// The image pixel that sits on the pointer position, from its top-left.
+    pub hotspot: crate::Point,
+    /// `width * height * 4` bytes: B, G, R, A, rows top-down, no padding,
+    /// premultiplied alpha (every colour byte ≤ its alpha byte).
+    pub bgra: Vec<u8>,
+    /// Size of the host's captured frame the image's pixels are measured in.
+    /// The sprite scales with the video: `width / frame.0` of the picture's
+    /// width, whatever size the viewer displays it at (HiDPI on either side
+    /// is therefore already accounted for).
+    pub frame: (u32, u32),
+}
+
+impl CursorSprite {
+    /// Whether the fields are consistent and within [`MAX_CURSOR_SIDE`]. A
+    /// presenter may assume a sprite it receives from the engine is valid; the
+    /// engine checks with this before handing one over.
+    pub fn is_valid(&self) -> bool {
+        (1..=MAX_CURSOR_SIDE).contains(&self.width)
+            && (1..=MAX_CURSOR_SIDE).contains(&self.height)
+            && self.frame.0 > 0
+            && self.frame.1 > 0
+            && self.bgra.len() == self.width as usize * self.height as usize * 4
+    }
+
+    /// Where the image goes for a pointer at `cursor` (normalized `[0,1]` over
+    /// the video): `[x, y, width, height]` as fractions of the **video
+    /// rectangle**, top-left origin. Multiply by the letterboxed video
+    /// rectangle's size and add its origin to get presenter pixels.
+    ///
+    /// The image's top-left is `position - hotspot`; both the image and the
+    /// position are in the host's frame pixels, so dividing by the frame size
+    /// is the whole HiDPI story. `None` for an invalid sprite.
+    pub fn placement(&self, cursor: (f64, f64)) -> Option<[f64; 4]> {
+        if !self.is_valid() {
+            return None;
+        }
+        let (fw, fh) = (f64::from(self.frame.0), f64::from(self.frame.1));
+        let w = f64::from(self.width) / fw;
+        let h = f64::from(self.height) / fh;
+        let x = cursor.0.clamp(0.0, 1.0) - f64::from(self.hotspot.x) / fw;
+        let y = cursor.1.clamp(0.0, 1.0) - f64::from(self.hotspot.y) / fh;
+        Some([x, y, w, h])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Point;
+
+    fn sprite(w: u32, h: u32, hot: (i32, i32), frame: (u32, u32)) -> CursorSprite {
+        CursorSprite {
+            width: w,
+            height: h,
+            hotspot: Point { x: hot.0, y: hot.1 },
+            bgra: vec![0; (w * h * 4) as usize],
+            frame,
+        }
+    }
+
+    #[test]
+    fn placement_puts_the_hotspot_on_the_pointer() {
+        // 1000x500 frame, pointer at pixel (500, 250), I-beam hotspot (4, 8).
+        let s = sprite(9, 16, (4, 8), (1000, 500));
+        let [x, y, w, h] = s.placement((0.5, 0.5)).unwrap();
+        assert!((x * 1000.0 - 496.0).abs() < 1e-9);
+        assert!((y * 500.0 - 242.0).abs() < 1e-9);
+        assert!((w * 1000.0 - 9.0).abs() < 1e-9);
+        assert!((h * 500.0 - 16.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn placement_scales_with_the_video_not_the_viewer() {
+        // A Retina host (2880-px-wide frame) sends a 64-px arrow: it covers
+        // 64/2880 of the picture, whatever size the viewer shows it at.
+        let s = sprite(64, 64, (0, 0), (2880, 1800));
+        let [_, _, w, h] = s.placement((0.0, 0.0)).unwrap();
+        // On a 1440-px-wide video rectangle it is 32 px wide.
+        assert!((w * 1440.0 - 32.0).abs() < 1e-9);
+        assert!((h * 900.0 - 32.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn placement_clamps_the_pointer_and_may_hang_off_the_edge() {
+        let s = sprite(10, 10, (5, 5), (100, 100));
+        let [x, y, _, _] = s.placement((-1.0, 2.0)).unwrap();
+        assert!((x - -0.05).abs() < 1e-9);
+        assert!((y - 0.95).abs() < 1e-9);
+    }
+
+    #[test]
+    fn invalid_sprites_have_no_placement() {
+        assert!(sprite(0, 4, (0, 0), (10, 10))
+            .placement((0.5, 0.5))
+            .is_none());
+        assert!(sprite(4, 4, (0, 0), (0, 10))
+            .placement((0.5, 0.5))
+            .is_none());
+        assert!(sprite(257, 4, (0, 0), (1000, 10))
+            .placement((0.5, 0.5))
+            .is_none());
+        let mut short = sprite(4, 4, (0, 0), (10, 10));
+        short.bgra.pop();
+        assert!(!short.is_valid());
+    }
 }

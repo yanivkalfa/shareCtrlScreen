@@ -10,6 +10,7 @@
 //! * viewer only: input translation, file push, and optionally shortcut capture.
 
 mod clipboard;
+mod ctl_queue;
 mod driver;
 mod files;
 mod ice;
@@ -38,9 +39,22 @@ pub(crate) struct Shared {
     /// Host: the viewer's display size `w << 32 | h` (0 = unknown). The host
     /// encodes to it so the viewer presents 1:1.
     pub view_size: AtomicU64,
-    /// Viewer: latest cursor from the host (normalized x, y, visible), drawn as a
-    /// sprite by the presenter.
-    pub cursor: Mutex<Option<(f64, f64, bool)>>,
+    /// Viewer: latest cursor from the host, drawn as a sprite by the presenter.
+    pub cursor: Mutex<Option<ViewerPointer>>,
+    /// Viewer: the host's cursor images received so far (task D9).
+    pub cursor_images: Mutex<crate::media::cursor::ViewerCursors>,
+}
+
+/// The pointer as the last position message described it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ViewerPointer {
+    /// Hotspot, normalized `[0,1]` over the video.
+    pub x: f64,
+    pub y: f64,
+    pub visible: bool,
+    /// The image to draw (an id in [`Shared::cursor_images`]); `None` = the
+    /// presenter's built-in arrow.
+    pub shape: Option<u32>,
 }
 
 /// The live session, owned by [`Engine`].
@@ -234,6 +248,7 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission) 
             display: cfg.share_display_id.clone(),
             codec,
             shared,
+            ctl_tx: ctl_tx.clone(),
         };
         let stop_m = stop.clone();
         let ui = engine.ui_sender();
@@ -441,25 +456,20 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
 
     // OS shortcut capture (Win/Alt+Tab, Cmd+Tab, Super), when the user enabled it.
     if cfg.capture_shortcuts {
-        let (platform, surface, ctl, keys, stop_k) = (
+        let (platform, surface, ctl, keys, stop_k, hook_input) = (
             platform.clone(),
             surface.clone(),
             ctl_tx.clone(),
             keys.clone(),
             stop.clone(),
+            input_tx.clone(),
         );
         spawn_or_abort!(engine, stop, threads, "shortcuts", move || {
             let Some(mut hook) = platform.create_shortcut_hook() else {
                 tracing::info!("shortcut capture is not available on this platform");
                 return;
             };
-            // WHY the lock is fine on the hook thread (which must never block):
-            // the only other holder is the input thread, for one translation of
-            // a few comparisons and channel sends, never across a wait.
-            let forward: KeyForwarder = Box::new(move |code: &str, down: bool| {
-                keys.lock()
-                    .key(code, down, &mut |msg| send_input(&ctl, &msg));
-            });
+            let forward = hook_forwarder(hook_input, keys, ctl);
             if hook.install(surface.as_ref(), forward) {
                 hook.run(&stop_k);
             } else {
@@ -493,6 +503,40 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
 /// Queue one input message for the host on the ctl channel.
 fn send_input(ctl: &Sender<Vec<u8>>, msg: &InputMsg) {
     let _ = ctl.send(serde_json::to_vec(msg).unwrap_or_default());
+}
+
+/// The shortcut hook's forwarder: its keys join the surface's input channel,
+/// so the translator sees hook keys and surface keys in the order they were
+/// produced (M12).
+///
+/// WHY not lock the translator directly from the hook thread (D8's first
+/// version): the surface's keys wait in `input` (behind a pointer move the
+/// input thread may be pacing for up to 10 ms), so a Cmd sent by the surface
+/// could reach the translator **after** the Cmd+C that the hook took a moment
+/// later, and the host would get C, then Ctrl. The hook guarantees that the
+/// modifier is in the channel before its own key (it forwards the modifier
+/// itself unless the surface already did); one FIFO channel turns that into
+/// the order the host sees. A channel send never blocks, as the hook's OS
+/// callback requires.
+///
+/// Fallback to the translator directly: a code outside the shared keymap
+/// (cannot be a `&'static str` for [`VideoInput::Key`]), or the input thread
+/// already gone at session end (a release must still reach the host).
+fn hook_forwarder(
+    input: Sender<VideoInput>,
+    keys: Arc<Mutex<KeyTranslator>>,
+    ctl: Sender<Vec<u8>>,
+) -> KeyForwarder {
+    Box::new(move |code: &str, down: bool| {
+        if let Some(code) = platform_api::keymap::from_dom(code).map(platform_api::keymap::dom_for)
+        {
+            if input.send(VideoInput::Key { code, down }).is_ok() {
+                return;
+            }
+        }
+        keys.lock()
+            .key(code, down, &mut |msg| send_input(&ctl, &msg));
+    })
 }
 
 /// Translate surface input to protocol messages, coalescing pointer moves.
@@ -544,6 +588,14 @@ fn input_loop(
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    // Keys still queued when the session stops (the surface's and the
+    // shortcut hook's releases at teardown) go out anyway: a dropped key-up
+    // would leave that key held on the host until it notices the disconnect.
+    for ev in input_rx.try_iter() {
+        if matches!(ev, VideoInput::Key { .. }) {
+            send(ev);
         }
     }
 }
@@ -666,6 +718,94 @@ mod tests {
                 ("KeyC".to_string(), false)
             ]
         );
+    }
+
+    fn key_codes(ctl_rx: &std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<(String, bool)> {
+        sent(ctl_rx)
+            .into_iter()
+            .map(|m| match m {
+                InputMsg::KeyDown { code } => (code, true),
+                InputMsg::KeyUp { code } => (code, false),
+                other => panic!("not a key: {other:?}"),
+            })
+            .collect()
+    }
+
+    fn mac_to_windows_keys() -> Arc<Mutex<KeyTranslator>> {
+        Arc::new(Mutex::new(KeyTranslator::new(
+            OsFamily::Mac,
+            OsFamily::Windows,
+            Arc::new(AtomicBool::new(true)),
+        )))
+    }
+
+    /// M12: Cmd travels the surface's path, Cmd+C's C the hook's. Queued in
+    /// that order, the translator must see them in that order even though
+    /// the input thread has not run yet when the hook forwards C.
+    #[test]
+    fn hook_keys_queue_behind_the_surface_keys_sent_before_them() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (ctl_tx, ctl_rx) = std::sync::mpsc::channel();
+        let keys = mac_to_windows_keys();
+        let forward = hook_forwarder(tx.clone(), keys.clone(), ctl_tx.clone());
+        tx.send(VideoInput::Key {
+            code: "MetaLeft",
+            down: true,
+        })
+        .unwrap();
+        forward("KeyC", true);
+        forward("KeyC", false);
+        tx.send(VideoInput::Key {
+            code: "MetaLeft",
+            down: false,
+        })
+        .unwrap();
+        // Nothing reached the host yet: the hook did not jump the queue.
+        assert!(key_codes(&ctl_rx).is_empty());
+        drop((tx, forward));
+        input_loop(rx, ctl_tx, keys, Arc::new(AtomicBool::new(false)));
+        assert_eq!(
+            key_codes(&ctl_rx),
+            [
+                ("ControlLeft".to_string(), true),
+                ("KeyC".to_string(), true),
+                ("KeyC".to_string(), false),
+                ("ControlLeft".to_string(), false)
+            ]
+        );
+    }
+
+    #[test]
+    fn hook_keys_still_reach_the_host_once_the_input_thread_is_gone() {
+        let (tx, rx) = std::sync::mpsc::channel::<VideoInput>();
+        let (ctl_tx, ctl_rx) = std::sync::mpsc::channel();
+        drop(rx);
+        let forward = hook_forwarder(tx, mac_to_windows_keys(), ctl_tx);
+        forward("MetaLeft", false);
+        // A code outside the shared keymap goes straight to the translator.
+        forward("NotAKey", true);
+        assert_eq!(
+            key_codes(&ctl_rx),
+            [
+                ("ControlLeft".to_string(), false),
+                ("NotAKey".to_string(), true)
+            ]
+        );
+    }
+
+    #[test]
+    fn keys_queued_when_the_session_stops_are_still_sent() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (ctl_tx, ctl_rx) = std::sync::mpsc::channel();
+        tx.send(VideoInput::Move { nx: 0.5, ny: 0.5 }).unwrap();
+        tx.send(VideoInput::Key {
+            code: "KeyA",
+            down: false,
+        })
+        .unwrap();
+        // Already stopped: the loop body never runs, only the drain.
+        input_loop(rx, ctl_tx, identity_keys(), Arc::new(AtomicBool::new(true)));
+        assert_eq!(key_codes(&ctl_rx), [("KeyA".to_string(), false)]);
     }
 
     #[test]

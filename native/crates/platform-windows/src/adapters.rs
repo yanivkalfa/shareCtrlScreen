@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use platform_api::{
     Autostart, CaptureError, CapturedFrame, Clipboard, Codec, CodecError, CodecFactory,
-    CursorShape, CursorUpdate, EncodedUnit, EncoderConfig, FileDrop, Frame, FrameData,
-    InputInjector, KeyForwarder, MoveRect, Point, Presenter, Rect, ScreenCapture, SecretStore,
-    ShortcutHook, SurfaceError, VideoDecoder, VideoEncoder, VideoInput, VideoSurface,
+    CursorShape, CursorSprite, CursorUpdate, EncodedUnit, EncoderConfig, FileDrop, Frame,
+    FrameData, InputInjector, KeyForwarder, MoveRect, Point, Presenter, Rect, ScreenCapture,
+    SecretStore, ShortcutHook, SurfaceError, VideoDecoder, VideoEncoder, VideoInput, VideoSurface,
 };
 use protocol::InputMsg;
 use windows::Win32::Foundation::{HWND, POINT, RECT};
@@ -75,11 +75,18 @@ const SHAPE_MASKED_COLOR: u32 = 4;
 /// * Color: 32-bpp BGRA as-is.
 /// * Masked color: the alpha byte is a mask — 0 replaces the screen pixel
 ///   (opaque), 0xFF XORs it. XOR pixels can't be reproduced on another screen, so
-///   non-black XOR pixels are drawn opaque (they are the outline) and black ones
+///   non-black XOR pixels are drawn opaque in their colour with a 1-px
+///   contrasting rim (see [`outline_xor`]) and black ones (XOR no-ops)
 ///   transparent.
 /// * Monochrome: two stacked 1-bpp masks (AND above XOR), so the real height is
 ///   half. AND=1,XOR=0 is transparent; AND=0 is black/white by XOR; AND=1,XOR=1
-///   (invert) is drawn black so it stays visible.
+///   (invert) is drawn black with a 1-px white rim (see [`outline_xor`]).
+///
+/// ## References
+/// * `DXGI_OUTDUPL_POINTER_SHAPE_TYPE`:
+///   <https://learn.microsoft.com/windows/win32/api/dxgi1_2/ne-dxgi1_2-dxgi_outdupl_pointer_shape_type>
+/// * WebRTC `modules/desktop_capture/win/cursor.cc` (`AddCursorOutline`): the same
+///   black-plus-white-outline stand-in for inverting pixels.
 pub(crate) fn pointer_shape_to_bgra(
     kind: u32,
     width: u32,
@@ -95,8 +102,14 @@ pub(crate) fn pointer_shape_to_bgra(
                 return None;
             }
             let mut out = Vec::with_capacity(w * h * 4);
+            let mut xor = vec![false; w * h];
             for y in 0..h {
-                for px in data[y * pitch..y * pitch + w * 4].as_chunks::<4>().0 {
+                for (x, px) in data[y * pitch..y * pitch + w * 4]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .enumerate()
+                {
                     let (b, g, r, a) = (px[0], px[1], px[2], px[3]);
                     let alpha = if kind == SHAPE_COLOR {
                         a
@@ -105,8 +118,12 @@ pub(crate) fn pointer_shape_to_bgra(
                     } else {
                         0
                     };
+                    xor[y * w + x] = kind == SHAPE_MASKED_COLOR && a == 0xff && (b | g | r) != 0;
                     out.extend_from_slice(&[b, g, r, alpha]);
                 }
+            }
+            if kind == SHAPE_MASKED_COLOR {
+                outline_xor(&mut out, &xor, w, h);
             }
             Some((width, height, out))
         }
@@ -117,10 +134,12 @@ pub(crate) fn pointer_shape_to_bgra(
             }
             let bit = |row: usize, x: usize| (data[row * pitch + x / 8] >> (7 - (x % 8))) & 1;
             let mut out = Vec::with_capacity(w * h * 4);
+            let mut inverting = vec![false; w * h];
             for y in 0..h {
                 for x in 0..w {
                     let and = bit(y, x);
                     let xor = bit(y + h, x);
+                    inverting[y * w + x] = and == 1 && xor == 1;
                     out.extend_from_slice(match (and, xor) {
                         (0, 0) => &[0, 0, 0, 255],
                         (0, _) => &[255, 255, 255, 255],
@@ -129,9 +148,48 @@ pub(crate) fn pointer_shape_to_bgra(
                     });
                 }
             }
+            outline_xor(&mut out, &inverting, w, h);
             Some((width, h as u32, out))
         }
         _ => None,
+    }
+}
+
+/// XOR pixels (monochrome "invert", masked-colour XOR) cannot be reproduced on
+/// the viewer, which only blends, so they are drawn in one fixed colour — and
+/// one fixed colour vanishes on a background of that colour (the standard
+/// Windows I-beam, an inverting monochrome cursor drawn black, on a dark
+/// terminal; a masked-colour I-beam with white XOR pixels on a white page).
+/// Every transparent pixel touching an XOR pixel (8-neighbourhood) therefore
+/// becomes an opaque rim in the contrasting colour: white beside a dark XOR
+/// pixel, black beside a light one. A line with a contrasting rim reads on any
+/// background. `out` is straight BGRA, `xor` one flag per pixel, both `w * h`
+/// row-major; XOR pixels are opaque, so the rim never overwrites one.
+fn outline_xor(out: &mut [u8], xor: &[bool], w: usize, h: usize) {
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            if out[i * 4 + 3] != 0 {
+                continue; // only transparent pixels become rim
+            }
+            let neighbour = (y.saturating_sub(1)..(y + 2).min(h))
+                .flat_map(|ny| (x.saturating_sub(1)..(x + 2).min(w)).map(move |nx| ny * w + nx))
+                .find(|&n| xor[n]);
+            let Some(n) = neighbour else { continue };
+            // BT.601 luma of the XOR pixel decides the rim's colour.
+            let (b, g, r) = (
+                u32::from(out[n * 4]),
+                u32::from(out[n * 4 + 1]),
+                u32::from(out[n * 4 + 2]),
+            );
+            let luma = (299 * r + 587 * g + 114 * b) / 1000;
+            let rim = if luma < 128 {
+                [255, 255, 255, 255]
+            } else {
+                [0, 0, 0, 255]
+            };
+            out[i * 4..i * 4 + 4].copy_from_slice(&rim);
+        }
     }
 }
 
@@ -141,6 +199,10 @@ pub struct DdaCapture {
     dup: capture::Duplicator,
     device: D3d11Device,
     current: Option<D3d11Texture>,
+    /// Hotspot of the last pointer shape. DDA reports the shape only when it
+    /// changes but the position on every move, and the position is the
+    /// shape's top-left, so the hotspot must be remembered to convert it.
+    hotspot: Point,
 }
 
 impl DdaCapture {
@@ -151,7 +213,20 @@ impl DdaCapture {
             dup,
             device,
             current: None,
+            hotspot: Point::default(),
         })
+    }
+}
+
+/// DDA's pointer position → the trait's: `DXGI_OUTDUPL_POINTER_POSITION`
+/// is where the shape's **top-left** goes (Microsoft's DesktopDuplication
+/// sample draws the shape at it unchanged), while `CursorUpdate::position`
+/// is the hotspot on every backend. For the arrow (hotspot 0,0) they agree,
+/// which is why the difference only showed with the I-beam and resize cursors.
+pub(crate) fn dda_hotspot_position(top_left: Point, hotspot: Point) -> Point {
+    Point {
+        x: top_left.x.saturating_add(hotspot.x),
+        y: top_left.y.saturating_add(hotspot.y),
     }
 }
 
@@ -165,10 +240,8 @@ impl ScreenCapture for DdaCapture {
         let Some(f) = self.dup.acquire(timeout).map_err(capture_err)? else {
             return Ok(None);
         };
-        let cursor = f.cursor.map(|c| CursorUpdate {
-            visible: c.visible,
-            position: to_point(&c.position),
-            shape: c.shape.and_then(|s| {
+        let cursor = f.cursor.map(|c| {
+            let shape = c.shape.and_then(|s| {
                 let i = s.info;
                 pointer_shape_to_bgra(i.Type, i.Width, i.Height, i.Pitch, &s.data).map(
                     |(width, height, bgra)| CursorShape {
@@ -178,7 +251,18 @@ impl ScreenCapture for DdaCapture {
                         bgra,
                     },
                 )
-            }),
+            });
+            // A shape DXGI reported but we could not convert (unknown type,
+            // short buffer) leaves the previous hotspot and the viewer's
+            // previous image in place: the best guess we have.
+            if let Some(s) = &shape {
+                self.hotspot = s.hotspot;
+            }
+            CursorUpdate {
+                visible: c.visible,
+                position: dda_hotspot_position(to_point(&c.position), self.hotspot),
+                shape,
+            }
         });
         let dirty = f.dirty_rects.iter().map(to_rect).collect();
         let moves = f
@@ -460,6 +544,12 @@ impl Presenter for D3dPresenter {
     fn device(&self) -> Option<&dyn Any> {
         Some(&self.device)
     }
+
+    fn set_cursor_sprite(&mut self, sprite: Option<&CursorSprite>) -> Result<(), SurfaceError> {
+        self.renderer
+            .set_cursor_sprite(sprite)
+            .map_err(|e| SurfaceError::Backend(format!("cursor image: {e}")))
+    }
 }
 
 /// A standalone hardware D3D11 device for the viewer's decode + present.
@@ -627,27 +717,71 @@ mod tests {
 
     #[test]
     fn masked_color_makes_xor_black_transparent_and_outline_opaque() {
-        // replace pixel (mask 0), xor-black (transparent), xor-white (outline).
-        let data = [10, 20, 30, 0, 0, 0, 0, 0xff, 255, 255, 255, 0xff];
-        let (_, _, px) = pointer_shape_to_bgra(SHAPE_MASKED_COLOR, 3, 1, 12, &data).unwrap();
+        // replace pixel (mask 0), xor-black (transparent), xor-black (transparent,
+        // touching the next one), xor-white (outline).
+        let data = [
+            10, 20, 30, 0, 0, 0, 0, 0xff, 0, 0, 0, 0xff, 255, 255, 255, 0xff,
+        ];
+        let (_, _, px) = pointer_shape_to_bgra(SHAPE_MASKED_COLOR, 4, 1, 16, &data).unwrap();
         assert_eq!(&px[0..4], &[10, 20, 30, 255]);
-        assert_eq!(px[7], 0);
-        assert_eq!(px[11], 255);
+        assert_eq!(px[7], 0, "XOR black is a no-op: transparent");
+        assert_eq!(&px[12..16], &[255, 255, 255, 255]);
+        // The transparent pixel beside the light XOR pixel is its dark rim, so
+        // a white XOR I-beam still shows on a white page.
+        assert_eq!(&px[8..12], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn dark_xor_pixels_in_masked_cursors_get_a_light_rim() {
+        // transparent, XOR dark blue, transparent.
+        let data = [0, 0, 0, 0xff, 40, 0, 0, 0xff, 0, 0, 0, 0xff];
+        let (_, _, px) = pointer_shape_to_bgra(SHAPE_MASKED_COLOR, 3, 1, 12, &data).unwrap();
+        assert_eq!(&px[0..4], &[255, 255, 255, 255]);
+        assert_eq!(&px[4..8], &[40, 0, 0, 255]);
+        assert_eq!(&px[8..12], &[255, 255, 255, 255]);
     }
 
     #[test]
     fn monochrome_uses_stacked_and_xor_masks() {
         // 8x1 cursor: AND row then XOR row, 1 byte pitch.
         // px0: and=0,xor=0 black; px1: and=0,xor=1 white; px2: and=1,xor=0 clear;
-        // px3: and=1,xor=1 invert → black.
-        let and = 0b0011_0000u8;
+        // px3: and=1,xor=1 invert → black; px6: clear, far from any invert.
+        let and = 0b0011_1111u8;
         let xor = 0b0101_0000u8;
         let (w, h, px) = pointer_shape_to_bgra(SHAPE_MONOCHROME, 8, 2, 1, &[and, xor]).unwrap();
         assert_eq!((w, h), (8, 1));
         assert_eq!(&px[0..4], &[0, 0, 0, 255]);
         assert_eq!(&px[4..8], &[255, 255, 255, 255]);
-        assert_eq!(&px[8..12], &[0, 0, 0, 0]);
         assert_eq!(&px[12..16], &[0, 0, 0, 255]);
+        assert_eq!(&px[24..28], &[0, 0, 0, 0]);
+        // px2 and px4 are clear but touch the inverting px3: white outline.
+        assert_eq!(&px[8..12], &[255, 255, 255, 255]);
+        assert_eq!(&px[16..20], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn inverting_i_beam_gets_a_white_rim_so_it_shows_on_dark_backgrounds() {
+        // 5x5 monochrome cursor: an inverting vertical line at x = 2, rows 1..=3,
+        // everything else transparent (AND=1, XOR=0). 1-byte pitch, AND rows then
+        // XOR rows.
+        let and = [0b1111_1000u8; 5];
+        let mut xor = [0u8; 5];
+        for row in &mut xor[1..=3] {
+            *row = 0b0010_0000;
+        }
+        let data: Vec<u8> = and.iter().chain(xor.iter()).copied().collect();
+        let (w, h, px) = pointer_shape_to_bgra(SHAPE_MONOCHROME, 5, 10, 1, &data).unwrap();
+        assert_eq!((w, h), (5, 5));
+        let at = |x: usize, y: usize| &px[(y * 5 + x) * 4..(y * 5 + x) * 4 + 4];
+        for y in 1..=3 {
+            assert_eq!(at(2, y), &[0, 0, 0, 255], "the line itself is black");
+            assert_eq!(at(1, y), &[255, 255, 255, 255], "rim left");
+            assert_eq!(at(3, y), &[255, 255, 255, 255], "rim right");
+            assert_eq!(at(0, y), &[0, 0, 0, 0], "beyond the rim stays clear");
+        }
+        assert_eq!(at(2, 0), &[255, 255, 255, 255], "rim above");
+        assert_eq!(at(2, 4), &[255, 255, 255, 255], "rim below");
+        assert_eq!(at(0, 0), &[0, 0, 0, 0]);
     }
 
     #[test]
@@ -656,6 +790,17 @@ mod tests {
         assert!(pointer_shape_to_bgra(SHAPE_COLOR, 4, 1, 8, &[0; 16]).is_none());
         assert!(pointer_shape_to_bgra(SHAPE_MONOCHROME, 8, 1, 1, &[0; 2]).is_none());
         assert!(pointer_shape_to_bgra(99, 1, 1, 4, &[0; 4]).is_none());
+    }
+
+    #[test]
+    fn dda_top_left_becomes_the_hotspot_position() {
+        // An I-beam whose image top-left DDA reports at (100, 40), hotspot (4, 8):
+        // the pointer acts at (104, 48), which is what the trait reports.
+        let p = dda_hotspot_position(Point { x: 100, y: 40 }, Point { x: 4, y: 8 });
+        assert_eq!(p, Point { x: 104, y: 48 });
+        // The image may hang off the left/top edge (negative top-left).
+        let p = dda_hotspot_position(Point { x: -4, y: -8 }, Point { x: 4, y: 8 });
+        assert_eq!(p, Point { x: 0, y: 0 });
     }
 
     #[test]

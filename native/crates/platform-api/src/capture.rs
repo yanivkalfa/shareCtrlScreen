@@ -6,13 +6,25 @@ use std::time::Duration;
 
 use crate::frame::{Frame, MoveRect, Point, Rect};
 
-/// Cursor bitmap, always converted to straight-alpha BGRA by the backend (DXGI's
-/// monochrome / masked-color shapes included).
+/// Cursor bitmap, always converted to **straight-alpha** BGRA by the backend
+/// (DXGI's monochrome / masked-color shapes included; CoreGraphics, XFixes and
+/// PipeWire premultiplied images are divided back out).
+///
+/// Units: `width`, `height` and `hotspot` are **captured-frame pixels**, the
+/// same pixels as [`CursorUpdate::position`] and the frame's size. A backend
+/// whose OS hands out the image in another scale (macOS points on a Retina
+/// display) renders it at the frame's scale first, so the viewer can draw it
+/// at `bitmap size / frame size` of the video rectangle and it matches what
+/// the host's screen shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CursorShape {
     pub width: u32,
     pub height: u32,
+    /// The pixel of the image that sits on [`CursorUpdate::position`] (the
+    /// arrow's tip, the I-beam's centre), measured from the image's top-left.
     pub hotspot: Point,
+    /// `width * height * 4` bytes: B, G, R, A per pixel, rows top-down with no
+    /// padding, straight (not premultiplied) alpha.
     pub bgra: Vec<u8>,
 }
 
@@ -21,7 +33,11 @@ pub struct CursorShape {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CursorUpdate {
     pub visible: bool,
-    /// Position in captured-frame pixels.
+    /// Where the pointer acts, in captured-frame pixels: the **hotspot**
+    /// position, not the image's top-left corner. The image is drawn with its
+    /// top-left at `position - shape.hotspot`. (DXGI Desktop Duplication
+    /// reports the image's top-left instead; the Windows backend adds the
+    /// hotspot so every backend means the same point.)
     pub position: Point,
     /// New shape, if the shape changed.
     pub shape: Option<CursorShape>,

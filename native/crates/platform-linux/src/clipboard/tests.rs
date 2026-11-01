@@ -11,8 +11,7 @@
 //! under WSLg, `:0` mirrors the Windows clipboard, so anything copying on
 //! Windows (another `cargo test` included) would change what they read.
 
-#[path = "../../tests/support/xserver.rs"]
-mod xserver;
+use crate::test_xserver as xserver;
 
 use std::io::Write;
 use std::process::{Command, Stdio};

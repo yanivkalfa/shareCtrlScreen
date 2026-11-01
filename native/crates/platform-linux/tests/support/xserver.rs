@@ -1,5 +1,6 @@
 //! Private X servers for tests, shared by `tests/x11_capture.rs` and the
-//! clipboard unit tests (`src/clipboard/tests.rs`, included with `#[path]`).
+//! unit tests (clipboard, shortcut hook: included once as
+//! `crate::test_xserver` with `#[path]` in `src/lib.rs`).
 //!
 //! Each server runs on a display number of its own, so tests never touch the
 //! developer's desktop — which matters most under WSLg, where `:0` mirrors the

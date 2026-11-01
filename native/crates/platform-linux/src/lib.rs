@@ -43,6 +43,13 @@ mod portal_session;
 mod portal_token;
 mod shortcuts;
 
+/// Private X servers for the unit tests (clipboard, shortcuts), declared once
+/// here so the shared file is one module (`tests/x11_capture.rs` includes it
+/// separately, as its own crate).
+#[cfg(test)]
+#[path = "../tests/support/xserver.rs"]
+mod test_xserver;
+
 pub use uinput_access::{
     install_uinput_access, InstallMode, UinputInstallError, UinputInstallOutcome,
     UinputInstallPlan, UINPUT_GROUP, UINPUT_MODULES_LOAD_PATH, UINPUT_RULE_PATH,

@@ -10,8 +10,7 @@
 //! keys (they may be our own injector's), so the delivery tests turn that off
 //! and [`virtual_keyboard_input_is_not_forwarded`] checks the production path.
 
-#[path = "../../tests/support/xserver.rs"]
-mod xserver;
+use crate::test_xserver as xserver;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};

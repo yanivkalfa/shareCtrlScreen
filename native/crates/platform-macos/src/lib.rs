@@ -2,10 +2,10 @@
 //! VideoToolbox, an NSView + Metal surface, CGEvent injection and event taps,
 //! NSPasteboard, Keychain, LaunchAgent).
 //!
-//! Status: screen capture and display enumeration (M1), clipboard (M7),
-//! Keychain (M8), autostart (M9), permissions (M11) and paths are real; every other
-//! capability fails safely with a clear message until its task lands (see
-//! `plans/05-TASKS.md`, lane M).
+//! Status: screen capture and display enumeration (M1), the video surface and
+//! presenter (M4), clipboard (M7), Keychain (M8), autostart (M9), permissions
+//! (M11) and paths are real; every other capability fails safely with a clear
+//! message until its task lands (see `plans/05-TASKS.md`, lane M).
 
 #![cfg(target_os = "macos")]
 
@@ -16,8 +16,13 @@ mod cursor;
 mod display_id;
 mod displays;
 pub mod gpu;
+mod import;
+pub mod keymap;
 mod permissions;
+mod presenter;
 mod slot;
+mod surface;
+mod view;
 
 pub use capture::SckCapture;
 
@@ -121,10 +126,10 @@ impl Platform for MacPlatform {
 
     fn create_surface(
         &self,
-        _window: RawWindowHandle,
+        window: RawWindowHandle,
         _display: RawDisplayHandle,
     ) -> Result<Arc<dyn VideoSurface>, SurfaceError> {
-        Err(SurfaceError::Backend(format!("remote display {NOT_YET}")))
+        Ok(surface::MacVideoSurface::create(window)?)
     }
 
     fn create_injector(&self) -> Result<Box<dyn InputInjector>, InputError> {

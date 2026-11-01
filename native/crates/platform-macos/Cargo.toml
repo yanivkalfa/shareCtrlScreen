@@ -15,23 +15,26 @@ platform-api = { path = "../platform-api" }
 codec-openh264 = { path = "../codec-openh264" }
 tracing.workspace = true
 dirs = "6"
+
 objc2 = "0.6"
 # Completion handlers and the capture delivery queue (task M1).
 block2 = "0.6"
 dispatch2 = "0.3"
-objc2-foundation = { version = "0.3", default-features = false, features = [
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "std",
     "NSArray",
     "NSDictionary",
     "NSEnumerator",
     "NSError",
     "NSGeometry",
+    # Window-resign-key observer of the video view (task M4).
+    "NSNotification",
     "NSString",
     "NSURL",
     "NSValue",
     "objc2-core-foundation",
 ] }
-objc2-app-kit = { version = "0.3", default-features = false, features = [
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "std",
     "NSCursor",
     "NSEvent",
@@ -42,9 +45,19 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSWorkspace",
     "objc2-core-foundation",
     "objc2-core-graphics",
+    # Video view (task M4): the NSView subclass, its events, drag and drop,
+    # and the key monitor's block.
+    "NSDragging",
+    "NSGraphics",
+    "NSResponder",
+    "NSTrackingArea",
+    "NSView",
+    "NSWindow",
+    "block2",
+    "objc2-quartz-core",
 ] }
 # TCC permission probes and requests (task M11); `plans/06-CRATES-AND-LICENSES.md`.
-objc2-core-foundation = { version = "0.3", default-features = false, features = [
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
     "std",
     "CFArray",
     "CFCGTypes",
@@ -52,7 +65,7 @@ objc2-core-foundation = { version = "0.3", default-features = false, features = 
     "CFNumber",
     "CFString",
 ] }
-objc2-core-graphics = { version = "0.3", default-features = false, features = [
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
     "std",
     "CGBitmapContext",
     "CGColorSpace",
@@ -67,26 +80,53 @@ objc2-core-graphics = { version = "0.3", default-features = false, features = [
     "CGWindow",
     "libc",
 ] }
-objc2-application-services = { version = "0.3", default-features = false, features = ["std", "HIServices", "AXUIElement"] }
+objc2-application-services = { version = "0.3.2", default-features = false, features = ["std", "HIServices", "AXUIElement"] }
 # Keychain (generic passwords). keyring 4.2 has no `macos` feature: the Keychain
 # store is selected by its default `v1` feature on macOS.
 keyring = "4.2"
 uuid.workspace = true
 # ScreenCaptureKit capture (task M1). Only the stream API: the defaults also
 # pull in AVFoundation (recording output) and the content-sharing picker.
-objc2-core-media = { version = "0.3", default-features = false, features = [
+objc2-core-media = { version = "0.3.2", default-features = false, features = [
     "std",
     "CMSampleBuffer",
     "CMTime",
     "objc2-core-video",
 ] }
-objc2-core-video = { version = "0.3", default-features = false, features = [
+objc2-core-video = { version = "0.3.2", default-features = false, features = [
     "std",
+    "CVBase",
     "CVBuffer",
     "CVImageBuffer",
     "CVPixelBuffer",
+    # Zero-copy present (task M4): CVPixelBuffer planes → MTLTexture.
+    "CVMetalTexture",
+    "CVMetalTextureCache",
+    "CVReturn",
+    "objc2",
+    "objc2-metal",
 ] }
-objc2-screen-capture-kit = { version = "0.3", default-features = false, features = [
+# Video surface + presenter (task M4): the shared shader/geometry/input logic,
+# wgpu on Metal, Core Animation for the layer, Metal types for the import.
+surface-wgpu = { path = "../surface-wgpu" }
+wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "metal"] }
+pollster = "0.4"
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CALayer",
+    "CAMediaTiming",
+    "CAMetalLayer",
+    "CATransaction",
+    "objc2-core-foundation",
+] }
+objc2-metal = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "MTLDevice",
+    "MTLPixelFormat",
+    "MTLResource",
+    "MTLTexture",
+] }
+objc2-screen-capture-kit = { version = "0.3.2", default-features = false, features = [
     "std",
     "SCError",
     "SCShareableContent",

@@ -9,7 +9,9 @@ every crate below.
 
 | Crate | Version | Licence | Used for |
 |---|---|---|---|
-| `wgpu` + `wgpu-hal` | current 2x (pin at task time) | MIT OR Apache-2.0 | presenter on macOS (Metal) and Linux (Vulkan/GL); `create_texture_from_hal` for zero-copy import |
+| `wgpu` + `wgpu-hal` | **30** (30.0.1, pinned by M4; MSRV 1.87) | MIT OR Apache-2.0 | presenter on macOS (Metal) and Linux (Vulkan/GL); `create_texture_from_hal` for zero-copy import. Shared shader/renderer in `crates/surface-wgpu` |
+| `pollster` | 0.4 | MIT OR Apache-2.0 | block on wgpu's adapter/device futures (presenter setup, headless tests) |
+| `naga` (dev only) | 30 | MIT OR Apache-2.0 | GPU-less WGSL validation test in `surface-wgpu` |
 | `raw-window-handle` | 0.6 (what Tauri 2.11 re-exports) | MIT/Apache/Zlib | surface parent handles |
 | `openh264` | 0.9.9 | BSD-2 (wrapper) / BSD-2 (lib) | software H.264, `libloading` feature only (Cisco binary downloaded at runtime; see 04 §5) |
 | `keyring` | 4.2.0 | MIT OR Apache-2.0 | Keychain / Secret Service (`macos`, `sync-secret-service` features) |
@@ -28,6 +30,7 @@ every crate below.
 | `objc2-video-toolbox` | 0.3.2 (2025-10-04) | VTCompressionSession / VTDecompressionSession (`kVTVideoEncoderSpecification_EnableLowLatencyRateControl` present in generated `VTCompressionProperties.rs`) |
 | `objc2-core-graphics` | 0.3.2 | CGEvent, CGEventTap, CGDisplay, CGWindowList, CGPreflightScreenCaptureAccess |
 | `objc2-metal`, `objc2-quartz-core` | 0.3.2 | CAMetalLayer, MTLTexture import |
+| `block2`, `dispatch2` | 0.6 / 0.3 | blocks for `NSEvent` local monitors; main-queue hops (`DispatchQueue::main`, `MainThreadBound`) — same objc2 project, `block2` is MIT, `dispatch2` Zlib OR Apache-2.0 OR MIT |
 | `screencapturekit` (reference only) | 11.1.1 (MIT OR Apache-2.0, 2026-10-26, macOS 13+) | safe wrapper to crib from; not a dependency (Swift bridge) |
 | `videotoolbox` (reference only) | docs.rs | shows the encoder-spec builder shape |
 

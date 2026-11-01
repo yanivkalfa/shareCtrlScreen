@@ -9,6 +9,7 @@ members = [
     "crates/platform-windows",
     "crates/platform-macos",
     "crates/platform-linux",
+    "crates/surface-wgpu",
     "crates/capture",
     "crates/codec",
     "crates/codec-openh264",

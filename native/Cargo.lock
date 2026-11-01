@@ -3659,13 +3659,17 @@ dependencies = [
  "ashpd",
  "codec-openh264",
  "dirs",
+ "keyring-core",
  "libloading 0.8.9",
  "platform-api",
+ "secret-service",
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
  "wl-clipboard-rs",
  "x11rb 0.14.0",
+ "zbus-secret-service-keyring-store",
 ]
 
 [[package]]

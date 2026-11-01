@@ -20,7 +20,7 @@ dirs = "6"
 # initialisation result for the process (see src/secret.rs). Pure Rust over zbus,
 # so no libdbus-1-dev is needed at build time.
 keyring-core = "1"
-zbus-secret-service-keyring-store = "1"
+zbus-secret-service-keyring-store = { version = "1", features = ["rt-async-io-crypto-rust"] }
 uuid.workspace = true
 # Portal D-Bus client. No `pipewire` feature: it pins an older pipewire-rs than the
 # capture task (L1) uses and the permission flow only needs the D-Bus half.

@@ -194,9 +194,8 @@ async fn handshake(
     while released.changed().await.is_ok() {}
     // The holders borrowed the session through their handles, which are all
     // gone, so this task holds the last reference to the outcome.
-    match Arc::into_inner(outcome).and_then(|o| o.result.into_inner()) {
-        Some(Ok(granted)) => granted.session.close().await,
-        Some(Err(_)) | None => {}
+    if let Some(Ok(granted)) = Arc::into_inner(outcome).and_then(|o| o.result.into_inner()) {
+        granted.session.close().await;
     }
 }
 

@@ -42,3 +42,5 @@ features = [
 
 [target.'cfg(windows)'.dev-dependencies]
 tracing-subscriber.workspace = true
+# The golden streams, decoder matrix and encoder shape check (task I5).
+codec-goldens = { path = "../codec-goldens" }

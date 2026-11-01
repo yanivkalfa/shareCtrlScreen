@@ -46,6 +46,8 @@ pub mod secret;
 mod adapters;
 mod cpu;
 mod displays;
+#[cfg(test)]
+mod golden_tests;
 pub mod gpu;
 
 use std::path::PathBuf;

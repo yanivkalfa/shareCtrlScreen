@@ -220,6 +220,13 @@ impl Encoder {
         })
     }
 
+    /// Whether this encoder is a hardware MFT, i.e. `new` did not fall back
+    /// to the Microsoft software encoder. Golden streams named after a
+    /// hardware encoder must come from one (task I5).
+    pub fn is_hardware(&self) -> bool {
+        !self.software
+    }
+
     /// Update the CBR target from the transport's BWE (§6 adaptive bitrate).
     pub fn set_bitrate(&mut self, bps: u32) -> Result<(), Error> {
         self.cfg.bitrate_bps = bps;

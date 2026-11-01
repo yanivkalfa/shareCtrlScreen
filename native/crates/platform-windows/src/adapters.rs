@@ -253,20 +253,7 @@ impl CodecFactory for MfCodecFactory {
         device: Option<&dyn Any>,
         cfg: EncoderConfig,
     ) -> Result<Box<dyn VideoEncoder>, CodecError> {
-        let dev = device_of(device)?;
-        let inner = codec::Encoder::new(
-            &dev.0,
-            codec::EncoderConfig {
-                width: cfg.width,
-                height: cfg.height,
-                fps_num: cfg.fps_num,
-                fps_den: cfg.fps_den,
-                bitrate_bps: cfg.bitrate_bps,
-                codec: to_mf_codec(cfg.codec),
-            },
-        )
-        .map_err(codec_err)?;
-        Ok(Box::new(MfEncoder { inner }))
+        Ok(Box::new(mf_encoder(device_of(device)?, cfg)?))
     }
 
     fn new_decoder(
@@ -283,8 +270,34 @@ impl CodecFactory for MfCodecFactory {
     }
 }
 
-struct MfEncoder {
+/// The Media Foundation encoder behind [`MfCodecFactory::new_encoder`],
+/// concrete so tests can ask whether it is the hardware MFT.
+pub(crate) fn mf_encoder(dev: &D3d11Device, cfg: EncoderConfig) -> Result<MfEncoder, CodecError> {
+    let inner = codec::Encoder::new(
+        &dev.0,
+        codec::EncoderConfig {
+            width: cfg.width,
+            height: cfg.height,
+            fps_num: cfg.fps_num,
+            fps_den: cfg.fps_den,
+            bitrate_bps: cfg.bitrate_bps,
+            codec: to_mf_codec(cfg.codec),
+        },
+    )
+    .map_err(codec_err)?;
+    Ok(MfEncoder { inner })
+}
+
+pub(crate) struct MfEncoder {
     inner: codec::Encoder,
+}
+
+impl MfEncoder {
+    /// False when Media Foundation fell back to Microsoft's software encoder.
+    #[cfg(test)]
+    pub(crate) fn is_hardware(&self) -> bool {
+        self.inner.is_hardware()
+    }
 }
 
 impl VideoEncoder for MfEncoder {

@@ -7,7 +7,7 @@
 //! macOS, Vulkan on Linux (Mesa lavapipe on GPU-less runners). A missing
 //! adapter fails the test with instructions rather than skipping silently.
 
-use platform_api::Frame;
+use platform_api::{CursorSprite, Frame, Point};
 use surface_wgpu::{DrawParams, Renderer};
 
 const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -29,11 +29,24 @@ fn gpu() -> (wgpu::Device, wgpu::Queue) {
 
 /// Render `frame` into a `target`-sized texture and return its RGBA pixels.
 fn render(frame: &Frame<'_>, target: (u32, u32), cursor: Option<(f64, f64)>) -> Image {
+    render_with(frame, target, cursor, None)
+}
+
+/// [`render`] with the host's cursor image installed (task D9).
+fn render_with(
+    frame: &Frame<'_>,
+    target: (u32, u32),
+    cursor: Option<(f64, f64)>,
+    sprite: Option<&CursorSprite>,
+) -> Image {
     let (device, queue) = gpu();
     let mut renderer = Renderer::new(&device, &queue, TARGET_FORMAT);
     renderer
         .upload(frame)
         .unwrap_or_else(|e| panic!("upload failed: {e}"));
+    renderer
+        .set_cursor_sprite(sprite)
+        .unwrap_or_else(|e| panic!("cursor image refused: {e}"));
     let Some(source) = renderer.uploaded() else {
         panic!("upload produced no source");
     };
@@ -288,6 +301,69 @@ fn cursor_sprite_is_drawn_with_its_tip_on_the_hotspot() {
     img.assert_rgb(46, 37, [128, 128, 128]); // right of the diagonal: video
     img.assert_rgb(31, 40, [128, 128, 128]); // left of the hotspot: video
     img.assert_rgb(20, 20, [128, 128, 128]); // far away: video
+}
+
+/// An 8×8 cursor image (premultiplied BGRA) for a 64×64 host frame: a 4×4
+/// opaque red block at image pixels [2, 6), one half-transparent white pixel
+/// at (6, 6), the rest transparent; hotspot (2, 2), the block's corner.
+fn red_block_sprite() -> CursorSprite {
+    let mut bgra = vec![0u8; 8 * 8 * 4];
+    for y in 2..6 {
+        for x in 2..6 {
+            let i = (y * 8 + x) * 4;
+            bgra[i..i + 4].copy_from_slice(&[0, 0, 255, 255]);
+        }
+    }
+    let i = (6 * 8 + 6) * 4;
+    bgra[i..i + 4].copy_from_slice(&[128, 128, 128, 128]);
+    CursorSprite {
+        width: 8,
+        height: 8,
+        hotspot: Point { x: 2, y: 2 },
+        bgra,
+        frame: (64, 64),
+    }
+}
+
+#[test]
+fn host_cursor_image_lands_hotspot_on_the_pointer_and_blends_premultiplied() {
+    let src = Nv12::solid(64, 64, (126, 128, 128)); // grey ≈ 128
+    let sprite = red_block_sprite();
+    // 1:1. Pointer at host pixel (32, 32) = the hotspot, so the image's
+    // top-left is (30, 30) and the red block covers [32, 36).
+    let img = render_with(&src.frame(), (64, 64), Some((0.5, 0.5)), Some(&sprite));
+    for (x, y) in [(32, 32), (35, 35), (33, 34)] {
+        img.assert_rgb(x, y, [255, 0, 0]);
+    }
+    for (x, y) in [(31, 31), (30, 30), (36, 33), (37, 37), (20, 20)] {
+        img.assert_rgb(x, y, [128, 128, 128]); // transparent texels: video
+    }
+    // Premultiplied over: 128 (image) + 128 · (1 − 128/255) (video) ≈ 192.
+    img.assert_rgb(36, 36, [192, 192, 192]);
+
+    // The same host frame shown twice as large: the image scales with the
+    // video (16×16 on screen) and the hotspot still sits on the pointer.
+    let big = render_with(&src.frame(), (128, 128), Some((0.5, 0.5)), Some(&sprite));
+    for (x, y) in [(65, 65), (70, 70)] {
+        big.assert_rgb(x, y, [255, 0, 0]);
+    }
+    for (x, y) in [(62, 62), (75, 66)] {
+        big.assert_rgb(x, y, [128, 128, 128]);
+    }
+
+    // No image: the built-in arrow (white inside) is back.
+    let arrow = render(&src.frame(), (64, 64), Some((0.5, 0.5)));
+    arrow.assert_rgb(35, 47, [255, 255, 255]);
+}
+
+#[test]
+fn malformed_cursor_images_are_refused() {
+    let (device, queue) = gpu();
+    let mut renderer = Renderer::new(&device, &queue, TARGET_FORMAT);
+    let mut sprite = red_block_sprite();
+    sprite.bgra.truncate(10);
+    assert!(renderer.set_cursor_sprite(Some(&sprite)).is_err());
+    assert!(renderer.set_cursor_sprite(None).is_ok());
 }
 
 #[test]

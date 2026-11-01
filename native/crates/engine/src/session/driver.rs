@@ -636,6 +636,16 @@ pub(super) fn transport_driver(d: Driver) {
                                     }
                                     continue;
                                 }
+                                // Viewer: a part of the host's cursor image
+                                // (D9). Reassembled and cached here; the media
+                                // thread picks it up when a position names it.
+                                // Never input, so the host side drops it too.
+                                Ok(protocol::ControlMsg::CursorShape(part)) => {
+                                    if !host_side {
+                                        shared.cursor_images.lock().push(part);
+                                    }
+                                    continue;
+                                }
                                 // A clean goodbye from either end.
                                 Ok(protocol::ControlMsg::Bye) => {
                                     notify_dead("the other side ended the session");
@@ -769,11 +779,21 @@ pub(super) fn transport_driver(d: Driver) {
                             }
                         }
                         Inbound::Cursor(bytes) => {
-                            // Viewer: update the sprite position (§7).
-                            if let Ok(protocol::ControlMsg::Cursor { x, y, visible, .. }) =
-                                serde_json::from_slice::<protocol::ControlMsg>(&bytes)
+                            // Viewer: update the sprite position (§7) and which
+                            // of the host's images to draw there (D9).
+                            if let Ok(protocol::ControlMsg::Cursor {
+                                x,
+                                y,
+                                visible,
+                                shape,
+                            }) = serde_json::from_slice::<protocol::ControlMsg>(&bytes)
                             {
-                                *shared.cursor.lock() = Some((x, y, visible));
+                                *shared.cursor.lock() = Some(super::ViewerPointer {
+                                    x,
+                                    y,
+                                    visible,
+                                    shape,
+                                });
                             }
                         }
                         Inbound::Disconnected => {

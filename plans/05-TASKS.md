@@ -50,7 +50,7 @@
 | D7 release pipeline | **done** `448df49` (Opus, Opus-reviewed) | tag-triggered `release.yml` → reusable `build-assets.yml` → `scripts/release-assets.sh` (one recipe); NSIS/DMG/AppImage/deb/rpm, SHA256SUMS, per-OS third-party notices generated and attached (never committed), version read from cargo metadata, actions pinned to SHAs; macOS: certificate required when the secrets exist, ad-hoc only without them. macOS leg + AppImage verified only on GitHub |
 | D8 modifier translation | **done** (Opus, Opus-reviewed; I2 device pass pending) | viewer-side `KeyTranslator` (`engine/src/modifiers.rs`): Cmd ↔ Ctrl swap and Cmd+Tab→Alt+Tab (Mac → PC), Ctrl ↔ Cmd and Alt+Tab→Cmd+Tab (PC → Mac), sent-code tracking; host OS via new optional `connect-response.os`; `translateModifiers` toggle (default on) in Settings → Advanced; unit + loopback-tested. **Device-pending** (I2 Mac↔Windows); closes M6's blocked Cmd+Tab line |
 | M12 take every Cmd shortcut (macOS viewer) | **done** (Opus, Opus-reviewed, merged 99ed737; type-checked for aarch64-apple-darwin, device-pending) | M6 tap takes every Cmd chord + Ctrl+arrows while the video has the keyboard; Cmd+Q stays local (tap and key monitor); Force Quit / Lock Screen never claimed; every modifier synchronised before a taken key; hook keys now share the surface's FIFO input channel (D8 ordering risk closed); focus loss releases at once. Also: toolbar-reveal diagnostics + layer-frame sync + full-screen cover (owner's "top edge does nothing"). **Device-pending** (checklists/M6.md §6–§7) |
-| D9 host cursor sprite on the viewer | **in progress** (Opus) | additive cursor-shape message, host sends on change, viewer draws the real sprite at position−hotspot in both presenters; replaces the synthetic triangle |
+| D9 host cursor sprite on the viewer | **done** (Opus, Opus-reviewed; device-pending I1–I3: real cursor images incl. I-beam in a terminal) | additive cursor-shape message, host sends on change, viewer draws the real sprite at position−hotspot in both presenters; replaces the synthetic triangle |
 | T4 Wayland CI | **done** (Haiku, Opus-reviewed; jobs unverified until pushed; GNOME portal tests are device-pass items) | `native-ci.yml` jobs `wayland-sway` (ubuntu-24.04: sway + xdg-desktop-portal-wlr + pipewire + wireplumber; runs L5 `wayland_surface`, L1 `portal_capture --ignored`, and L6 `input::tests` minus uinput and `xtest_*`) and `wayland-gnome` (ubuntu-24.04: mutter 46 + xdg-desktop-portal-gnome; proves the stack, runs no test: the consent dialog has no headless pre-authorization, so the libei and GNOME portal-capture tests are device-pass items). Scripts in `.github/wayland/`. Local (lane, WSL): `wayland_surface` PASS (T4-02); `input::tests` wlroots and EIS pass, uinput fails under REQUIRED as designed (T4-03). Owner verification after the push: see the T4 card |
 | L5 video surface | **done** (Opus, Opus-reviewed; device-pending per checklists/L5.md) | X11: child window of the GTK toplevel on our own x11rb connection, XShape reveal clip, XDND drops via `XdndProxy`, Expose → redraw of the last frame. Wayland: the spike's area+video subsurface tree on GDK's connection (re-attached when GDK re-creates the toplevel surface), `wp_viewporter` crop + fractional scale, drops through GDK's own data device (sink window); decision-#3 separate window when there is no `wp_viewporter` or `SHARECTRL_VIDEO_WINDOW=separate`. Keys from the GTK toplevel on both (keymap: XKB − 8 = evdev). One wgpu presenter (Vulkan, GL fallback) over `surface-wgpu`. Headless tests: `tests/x11_surface.rs` (Xvfb), `tests/wayland_surface.rs` (headless sway). **Device-pending** (checklists/L5.md) |
 | L1 Wayland capture | **done** (Opus, Opus-reviewed) | `portal_capture/`: portal ScreenCast (handshake shared with L12 in `portal_session.rs`, token scope kept: a combined token reopens a combined session) + pipewire-rs 0.10 stream thread, shared-memory BGRx/BGRA first (no modifiers → no DMA-BUF; L1b), cursor + damage metadata, pause/resize → `Lost` → resume; a stream-level failure → rebuild from the token on a background thread (reinit never blocks the host thread on a dialog); "Stop sharing" in the desktop indicator, a declined dialog or an unanswered one (120 s) end the hosted session (terminal, AnyDesk behaviour). The 120 s dialog wait on the host media thread happens only in the first `create_capture`. Monitor chosen in the portal dialog (Wayland `display` ids → `NoOutput`). Build needs `libpipewire-0.3-dev libspa-0.2-dev libclang-dev`. **Device-pending** (checklists/L1.md); acceptance test `tests/portal_capture.rs` (ignored) for T4. **Note for L6:** L6 layers a shared session slot over `portal_session::start(scope, previous, bound, abandon)` and extends `Granted` with the RemoteDesktop proxy; today the capture's `watch()` owns `granted.session` and closes it when the capture drops it. Once shared, that ownership moves into L6's slot, so only the last holder (capture or injector) closes the session. **Done in L6:** `portal_shared.rs` holds the combined session; the capture joins it (`Held::Shared`) when its token is combined, remote control already holds it, or remote control would use the portal, and owns only screen-only sessions itself |
@@ -776,6 +776,47 @@ to run (TCC). Use `objc2` 0.6-family crates throughout (`objc2-app-kit`,
   software cursor smoothing. Keep the out-of-band position path untouched (latency).
 * Acceptance (CI + I1–I3): loopback test green on all three OS legs; on a real session the
   viewer shows the host's actual cursor images including I-beam in a terminal.
+* As built (branch `task/D9`, in review; no real session yet):
+  * Wire (`protocol/src/cursor.rs`, recorded in plans/04 §2): additive `ControlMsg::CursorShape`
+    (`"t":"curshape"`) on the reliable ordered **`ctl`** channel, not the `cursor` channel
+    (0 retransmits: a lost image would stay wrong until the next change; decision accepted by
+    the orchestrator). Premultiplied BGRA as hex, 16 KiB of pixels per part (≤ 16 parts,
+    ~32 KiB per message), header repeated per part; the viewer's `Assembler` bounds sizes
+    before allocating, requires in-order parts and clamps colour ≤ alpha. Positions stay on
+    the `cursor` channel unchanged; their existing `shape` field names the image id (`None` =
+    built-in arrow, which is all an older host ever sends). Older viewers fail to parse
+    `curshape` and drop it.
+  * Host (`engine/src/media/cursor.rs` `HostCursor`, used in `media/host.rs`): straight →
+    premultiplied once, FNV-1a content id over size, hotspot, host frame size and pixels;
+    sent only for an id not sent this session (FIFO of 32 mirroring the viewer's cache), and
+    again when the frame size changes; > 256 px per side is not sent (log line, viewer draws
+    the arrow; accepted instead of scaling). Per session, so a reconnect sends it again; the
+    capture backends report the current shape on a fresh session (DDA/SCK/XFixes/portal).
+  * Viewer (`ViewerCursors` in `Shared`, `InstalledSprite` in `media/viewer.rs`): the presenter
+    is given the image only when the named id changes; an id still arriving keeps the current
+    picture; hidden (`visible == false`) draws nothing.
+  * `platform-api` (approved additive): `Presenter::set_cursor_sprite` (default no-op),
+    `CursorSprite` (+ `placement`: top-left = pointer − hotspot, size = image / host frame
+    size, so Retina/HiDPI on either side needs nothing more), `MAX_CURSOR_SIDE`; doc fix:
+    `CursorUpdate.position` is the hotspot. **Windows fix:** DXGI's pointer position is the
+    image's top-left (DesktopDuplication sample), so `DdaCapture` now adds the last hotspot
+    (`dda_hotspot_position`); before, every non-arrow cursor was offset by its hotspot.
+  * Presenters: Windows uses the D3D11 `render` crate (premultiplied blend state, immutable
+    BGRA texture at t2, `spr_ps`; the fallback arrow redrawn tip-on-hotspot like wgpu's);
+    macOS and Linux use `surface-wgpu` (binding 4, `fs_sprite`, `PREMULTIPLIED_ALPHA_BLENDING`
+    pipeline, `geometry::sprite_rect`). Both keep the arrow until the first image arrives.
+  * Tests: protocol (round trip through JSON at 256², message size < 64 KiB, hostile/out-of-order
+    parts, clamping); engine (dedup, switch-back by id, frame-size re-send, oversize fallback,
+    hotspot clamp, host/viewer caches in step past capacity); platform-api (`placement` math,
+    mock CPU compositor); render (`cursor_quad` math, HLSL entry points compile); surface-wgpu
+    (geometry + a headless GPU pixel test: opaque texels on the hotspot at 1:1 and 2×, a
+    half-alpha texel blending to ≈ 192, arrow fallback); platform-windows (DDA hotspot
+    conversion); loopback `host_cursor_image_reaches_the_viewer_and_lands_on_the_hotspot`
+    (image delivered once with the host's geometry, and its opaque pixels cover exactly the
+    expected 4×6 pixels at every unclipped pointer position, through the mock presenter's CPU
+    compositor). No D3D11 pixel test: the `render` presenter needs an HWND swapchain.
+  * Not verified: real sessions (I1–I3): arrow/I-beam/hand/resize on each host, DXGI top-left
+    semantics on hardware, portal cursor scale under fractional scaling, Retina scale.
 
 ## Lane T — tests & CI
 

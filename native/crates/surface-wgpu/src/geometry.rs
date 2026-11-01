@@ -95,9 +95,54 @@ pub fn cursor_rect(video_rect: RectF, cursor: (f64, f64), scale: f64) -> RectF {
     }
 }
 
+/// Where the host's cursor image goes (task D9): its
+/// [`platform_api::CursorSprite::placement`] — fractions of the video
+/// rectangle, hotspot already on the pointer — mapped onto `video_rect`.
+/// `None` when there is no image to draw (an invalid one included); the caller
+/// then draws the arrow from [`cursor_rect`].
+pub fn sprite_rect(
+    video_rect: RectF,
+    sprite: &platform_api::CursorSprite,
+    cursor: (f64, f64),
+) -> Option<RectF> {
+    let [x, y, w, h] = sprite.placement(cursor)?;
+    Some(RectF {
+        x: video_rect.x + x * video_rect.w,
+        y: video_rect.y + y * video_rect.h,
+        w: w * video_rect.w,
+        h: h * video_rect.h,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_image_lands_hotspot_first_and_scales_with_the_letterbox() {
+        // A Retina Mac (2880x1800 frame) sends a 64x64 arrow, hotspot (8, 8),
+        // shown on a 1440x1000 surface: the video is letterboxed to 1440x900
+        // at y = 50, so everything host-side is halved.
+        let sprite = platform_api::CursorSprite {
+            width: 64,
+            height: 64,
+            hotspot: platform_api::Point { x: 8, y: 8 },
+            bgra: vec![0; 64 * 64 * 4],
+            frame: (2880, 1800),
+        };
+        let video = letterbox((1440, 1000), (2880, 1800));
+        assert_eq!((video.y, video.w, video.h), (50.0, 1440.0, 900.0));
+        let r = sprite_rect(video, &sprite, (0.5, 0.5)).unwrap();
+        // Pointer at (720, 500); hotspot 8 host px = 4 viewer px.
+        for (got, want) in [(r.x, 716.0), (r.y, 496.0), (r.w, 32.0), (r.h, 32.0)] {
+            assert!((got - want).abs() < 1e-9, "{r:?}");
+        }
+        let broken = platform_api::CursorSprite {
+            bgra: Vec::new(),
+            ..sprite
+        };
+        assert!(sprite_rect(video, &broken, (0.5, 0.5)).is_none());
+    }
 
     #[test]
     fn letterbox_wide_target_gets_pillarbox_bars() {

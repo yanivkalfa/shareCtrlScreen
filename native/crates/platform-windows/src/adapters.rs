@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use platform_api::{
     Autostart, CaptureError, CapturedFrame, Clipboard, Codec, CodecError, CodecFactory,
-    CursorShape, CursorUpdate, EncodedUnit, EncoderConfig, FileDrop, Frame, FrameData,
-    InputInjector, KeyForwarder, MoveRect, Point, Presenter, Rect, ScreenCapture, SecretStore,
-    ShortcutHook, SurfaceError, VideoDecoder, VideoEncoder, VideoInput, VideoSurface,
+    CursorShape, CursorSprite, CursorUpdate, EncodedUnit, EncoderConfig, FileDrop, Frame,
+    FrameData, InputInjector, KeyForwarder, MoveRect, Point, Presenter, Rect, ScreenCapture,
+    SecretStore, ShortcutHook, SurfaceError, VideoDecoder, VideoEncoder, VideoInput, VideoSurface,
 };
 use protocol::InputMsg;
 use windows::Win32::Foundation::{HWND, POINT, RECT};
@@ -141,6 +141,10 @@ pub struct DdaCapture {
     dup: capture::Duplicator,
     device: D3d11Device,
     current: Option<D3d11Texture>,
+    /// Hotspot of the last pointer shape. DDA reports the shape only when it
+    /// changes but the position on every move, and the position is the
+    /// shape's top-left, so the hotspot must be remembered to convert it.
+    hotspot: Point,
 }
 
 impl DdaCapture {
@@ -151,7 +155,20 @@ impl DdaCapture {
             dup,
             device,
             current: None,
+            hotspot: Point::default(),
         })
+    }
+}
+
+/// DDA's pointer position → the trait's: `DXGI_OUTDUPL_POINTER_POSITION`
+/// is where the shape's **top-left** goes (Microsoft's DesktopDuplication
+/// sample draws the shape at it unchanged), while `CursorUpdate::position`
+/// is the hotspot on every backend. For the arrow (hotspot 0,0) they agree,
+/// which is why the difference only showed with the I-beam and resize cursors.
+pub(crate) fn dda_hotspot_position(top_left: Point, hotspot: Point) -> Point {
+    Point {
+        x: top_left.x.saturating_add(hotspot.x),
+        y: top_left.y.saturating_add(hotspot.y),
     }
 }
 
@@ -165,10 +182,8 @@ impl ScreenCapture for DdaCapture {
         let Some(f) = self.dup.acquire(timeout).map_err(capture_err)? else {
             return Ok(None);
         };
-        let cursor = f.cursor.map(|c| CursorUpdate {
-            visible: c.visible,
-            position: to_point(&c.position),
-            shape: c.shape.and_then(|s| {
+        let cursor = f.cursor.map(|c| {
+            let shape = c.shape.and_then(|s| {
                 let i = s.info;
                 pointer_shape_to_bgra(i.Type, i.Width, i.Height, i.Pitch, &s.data).map(
                     |(width, height, bgra)| CursorShape {
@@ -178,7 +193,15 @@ impl ScreenCapture for DdaCapture {
                         bgra,
                     },
                 )
-            }),
+            });
+            if let Some(s) = &shape {
+                self.hotspot = s.hotspot;
+            }
+            CursorUpdate {
+                visible: c.visible,
+                position: dda_hotspot_position(to_point(&c.position), self.hotspot),
+                shape,
+            }
         });
         let dirty = f.dirty_rects.iter().map(to_rect).collect();
         let moves = f
@@ -460,6 +483,12 @@ impl Presenter for D3dPresenter {
     fn device(&self) -> Option<&dyn Any> {
         Some(&self.device)
     }
+
+    fn set_cursor_sprite(&mut self, sprite: Option<&CursorSprite>) -> Result<(), SurfaceError> {
+        self.renderer
+            .set_cursor_sprite(sprite)
+            .map_err(|e| SurfaceError::Backend(format!("cursor image: {e}")))
+    }
 }
 
 /// A standalone hardware D3D11 device for the viewer's decode + present.
@@ -656,6 +685,17 @@ mod tests {
         assert!(pointer_shape_to_bgra(SHAPE_COLOR, 4, 1, 8, &[0; 16]).is_none());
         assert!(pointer_shape_to_bgra(SHAPE_MONOCHROME, 8, 1, 1, &[0; 2]).is_none());
         assert!(pointer_shape_to_bgra(99, 1, 1, 4, &[0; 4]).is_none());
+    }
+
+    #[test]
+    fn dda_top_left_becomes_the_hotspot_position() {
+        // An I-beam whose image top-left DDA reports at (100, 40), hotspot (4, 8):
+        // the pointer acts at (104, 48), which is what the trait reports.
+        let p = dda_hotspot_position(Point { x: 100, y: 40 }, Point { x: 4, y: 8 });
+        assert_eq!(p, Point { x: 104, y: 48 });
+        // The image may hang off the left/top edge (negative top-left).
+        let p = dda_hotspot_position(Point { x: -4, y: -8 }, Point { x: 4, y: 8 });
+        assert_eq!(p, Point { x: 0, y: 0 });
     }
 
     #[test]

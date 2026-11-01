@@ -7,13 +7,22 @@
 //! The NV12→RGB conversion is a pixel shader sampling two SRVs (`R8_UNORM` luma
 //! and `R8G8_UNORM` chroma) with the BT.709 matrix + range scale (§7). The
 //! cursor is drawn as a **separate sprite** at the out-of-band `PointerPosition`
-//! so it never lags the video stream.
+//! so it never lags the video stream: the host's real cursor image when it sent
+//! one (task D9, [`Renderer::set_cursor_sprite`]), a built-in arrow otherwise.
+//!
+//! ## References
+//! * Premultiplied-alpha blending (`D3D11_BLEND_ONE` / `D3D11_BLEND_INV_SRC_ALPHA`):
+//!   <https://learn.microsoft.com/windows/win32/api/d3d11/ne-d3d11-d3d11_blend>
+//!   and the over operator, Porter & Duff, "Compositing Digital Images" (1984).
+//! * Immutable textures with initial data (`D3D11_USAGE_IMMUTABLE`):
+//!   <https://learn.microsoft.com/windows/win32/api/d3d11/ne-d3d11-d3d11_usage>
 
 #![cfg(windows)]
 
 pub mod window;
 pub use window::VideoWindow;
 
+use platform_api::CursorSprite;
 use windows::core::{Interface, PCSTR};
 use windows::Win32::Foundation::{HANDLE, HWND};
 use windows::Win32::Graphics::Direct3D::Fxc::{D3DCompile, D3DCOMPILE_OPTIMIZATION_LEVEL3};
@@ -21,11 +30,12 @@ use windows::Win32::Graphics::Direct3D::{
     ID3DBlob, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_SRV_DIMENSION_TEXTURE2DARRAY,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader, ID3D11RenderTargetView,
-    ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
-    D3D11_COMPARISON_NEVER, D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_SAMPLER_DESC,
-    D3D11_SHADER_RESOURCE_VIEW_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC_0, D3D11_TEX2D_ARRAY_SRV,
-    D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_VIEWPORT,
+    ID3D11BlendState, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader,
+    ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D,
+    ID3D11VertexShader, D3D11_BIND_SHADER_RESOURCE, D3D11_COMPARISON_NEVER,
+    D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_SAMPLER_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC,
+    D3D11_SHADER_RESOURCE_VIEW_DESC_0, D3D11_SUBRESOURCE_DATA, D3D11_TEX2D_ARRAY_SRV,
+    D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_IMMUTABLE, D3D11_VIEWPORT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
@@ -76,9 +86,13 @@ float4 ps_main(VSOut i) : SV_Target {
 
 // Cursor sprite (§5a/§7): DDA delivers the desktop WITHOUT the mouse cursor, so
 // the viewer draws it client-side at the out-of-band PointerPosition — it feels
-// instant and never lags the stream. A simple arrow-ish quad; center + halfsize
-// come in NDC via a constant buffer.
-cbuffer Cursor : register(b0) { float2 center; float2 halfsize; float2 pad; }
+// instant and never lags the stream. The viewport is the letterboxed video, so
+// the quad comes in video-normalized units (x, y, w, h; top-left origin, y down)
+// and may hang past the edge (the rasterizer clips to the viewport, like the
+// host's screen edge clips its cursor).
+cbuffer Cursor : register(b0) { float4 rect; float4 pad; }
+// The host's cursor image (D9): premultiplied BGRA, blended ONE, INV_SRC_ALPHA.
+Texture2D<float4> SpriteTex : register(t2);
 
 struct CurOut { float4 pos : SV_Position; float2 luv : TEXCOORD0; };
 
@@ -90,19 +104,36 @@ CurOut cur_vs(uint id : SV_VertexID) {
     float2 c = corner[id];
     CurOut o;
     o.luv = c;
-    // Quad from center to center + 2*halfsize (top-left anchored, like a pointer).
-    float2 p = center + c * halfsize * 2.0;
-    o.pos = float4(p, 0, 1);
+    float2 p = rect.xy + c * rect.zw;
+    o.pos = float4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0, 1);
     return o;
 }
 
+// Fallback arrow (no image from the host yet, or an older host): tip at the
+// hotspot (top-left), vertical left edge, diagonal right edge; white with a
+// dark outline. Same shape as surface-wgpu's fs_cursor.
 float4 cur_ps(CurOut i) : SV_Target {
-    // A white arrow with a dark edge: filled lower-left triangle of the quad.
-    if (i.luv.x + i.luv.y > 1.0) discard;
-    float edge = (i.luv.x < 0.12 || i.luv.y < 0.12 || (i.luv.x + i.luv.y) > 0.88) ? 0.0 : 1.0;
+    if (i.luv.x > i.luv.y) discard;
+    float edge = (i.luv.x < 0.12 || i.luv.y > 0.88 || (i.luv.y - i.luv.x) < 0.12) ? 0.0 : 1.0;
     return float4(edge, edge, edge, 1.0);
 }
+
+// The host's image, already premultiplied: sampled as-is (bilinear filtering of
+// premultiplied texels keeps edges free of dark fringes when scaled).
+float4 spr_ps(CurOut i) : SV_Target {
+    return SpriteTex.Sample(Samp, i.luv);
+}
 "#;
+
+/// Fallback arrow size in presenter pixels at any scale (the pre-D9 sprite size).
+const ARROW_PX: (f32, f32) = (18.0, 26.0);
+
+/// The host's cursor image on the GPU (D9).
+struct Sprite {
+    srv: ID3D11ShaderResourceView,
+    /// Geometry (size, hotspot, host frame size) for [`CursorSprite::placement`].
+    image: CursorSprite,
+}
 
 /// A flip-model swapchain bound to the shared D3D11 device, rendering NV12
 /// frames from the decoder.
@@ -118,6 +149,13 @@ pub struct Renderer {
     cursor_vs: ID3D11VertexShader,
     cursor_ps: ID3D11PixelShader,
     cursor_cb: ID3D11Buffer,
+    /// Pixel shader that samples the host's cursor image (D9).
+    sprite_ps: ID3D11PixelShader,
+    /// Premultiplied-alpha blending for the cursor image; the video and the
+    /// fallback arrow draw opaque (default blend state).
+    sprite_blend: ID3D11BlendState,
+    /// The host's cursor image, when one is installed.
+    sprite: Option<Sprite>,
     allow_tearing: bool,
     /// The child HWND we present into — used to track its client size so the
     /// swapchain matches it (no DXGI stretch-scaling) and the video is letterboxed
@@ -188,6 +226,8 @@ impl Renderer {
         let rtv = Some(create_rtv(device, &swapchain)?);
         let (vs, ps) = compile_shaders(device)?;
         let (cursor_vs, cursor_ps) = compile_cursor_shaders(device)?;
+        let sprite_ps = compile_sprite_shader(device)?;
+        let sprite_blend = create_premultiplied_blend(device)?;
         let cursor_cb = create_cursor_cb(device)?;
         let sampler = create_sampler(device)?;
 
@@ -203,6 +243,9 @@ impl Renderer {
             cursor_vs,
             cursor_ps,
             cursor_cb,
+            sprite_ps,
+            sprite_blend,
+            sprite: None,
             allow_tearing,
             hwnd,
             width,
@@ -277,7 +320,7 @@ impl Renderer {
 
             // Cursor sprite on top (§5a/§7).
             if let Some((nx, ny)) = cursor {
-                self.draw_cursor(nx, ny)?;
+                self.draw_cursor(nx, ny, &vp)?;
             }
 
             let present_flags = if self.allow_tearing {
@@ -298,15 +341,72 @@ impl Renderer {
         Ok(())
     }
 
-    /// Draw the client-side cursor sprite at normalized position (§5a/§7).
-    fn draw_cursor(&mut self, nx: f64, ny: f64) -> Result<(), Error> {
-        // Normalized [0,1] → NDC (top-left origin; y flips).
-        let cx = (nx as f32) * 2.0 - 1.0;
-        let cy = 1.0 - (ny as f32) * 2.0;
-        // Fixed pixel-ish size in NDC (~18×26 px on 1080p).
-        let hx = 18.0 / self.width as f32;
-        let hy = 26.0 / self.height as f32;
-        let cb = [cx, cy, hx, hy, 0.0, 0.0, 0.0, 0.0];
+    /// Install the host's cursor image (D9), or `None` for the built-in arrow.
+    /// Uploads it once to an immutable texture; drawing it costs one quad.
+    pub fn set_cursor_sprite(&mut self, sprite: Option<&CursorSprite>) -> Result<(), Error> {
+        let Some(image) = sprite else {
+            self.sprite = None;
+            return Ok(());
+        };
+        if !image.is_valid() {
+            // Never hand D3D a buffer shorter than the texture it describes.
+            self.sprite = None;
+            return Err(Error::Shader(format!(
+                "cursor image {}x{} with {} bytes is malformed",
+                image.width,
+                image.height,
+                image.bgra.len()
+            )));
+        }
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: image.width,
+            Height: image.height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_IMMUTABLE,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let init = D3D11_SUBRESOURCE_DATA {
+            pSysMem: image.bgra.as_ptr().cast(),
+            SysMemPitch: image.width * 4,
+            SysMemSlicePitch: 0,
+        };
+        let mut texture = None;
+        // SAFETY: `init` points at `image.bgra`, which outlives the call and
+        // holds exactly `height` rows of `width * 4` bytes (`is_valid` above).
+        unsafe {
+            self.device
+                .CreateTexture2D(&desc, Some(&init), Some(&mut texture))?
+        };
+        let texture = texture.ok_or_else(|| Error::Shader("null cursor texture".into()))?;
+        let mut srv = None;
+        // SAFETY: valid texture; a null desc views the whole (single) mip.
+        unsafe {
+            self.device
+                .CreateShaderResourceView(&texture, None, Some(&mut srv))?
+        };
+        let srv = srv.ok_or_else(|| Error::Shader("null cursor SRV".into()))?;
+        self.sprite = Some(Sprite {
+            srv,
+            image: image.clone(),
+        });
+        Ok(())
+    }
+
+    /// Draw the client-side cursor at normalized position (§5a/§7): the host's
+    /// image when one is installed, the built-in arrow otherwise.
+    fn draw_cursor(&mut self, nx: f64, ny: f64, vp: &D3D11_VIEWPORT) -> Result<(), Error> {
+        let image = self.sprite.as_ref().map(|s| &s.image);
+        let rect = cursor_quad(image, (nx, ny), (vp.Width, vp.Height));
+        let cb = [rect[0], rect[1], rect[2], rect[3], 0.0, 0.0, 0.0, 0.0];
+        let sprite = self.sprite.as_ref().map(|s| s.srv.clone());
 
         // SAFETY: dynamic constant buffer written via a discard map.
         unsafe {
@@ -323,10 +423,25 @@ impl Renderer {
             self.context.Unmap(&self.cursor_cb, 0);
 
             self.context.VSSetShader(&self.cursor_vs, None);
-            self.context.PSSetShader(&self.cursor_ps, None);
             self.context
                 .VSSetConstantBuffers(0, Some(&[Some(self.cursor_cb.clone())]));
-            self.context.Draw(6, 0);
+            match sprite {
+                Some(srv) => {
+                    self.context.PSSetShader(&self.sprite_ps, None);
+                    self.context.PSSetShaderResources(2, Some(&[Some(srv)]));
+                    self.context
+                        .OMSetBlendState(&self.sprite_blend, None, 0xffff_ffff);
+                    self.context.Draw(6, 0);
+                    // Back to the default (opaque) state: the next frame's
+                    // video draw must replace the backbuffer, not blend into it.
+                    self.context
+                        .OMSetBlendState(None::<&ID3D11BlendState>, None, 0xffff_ffff);
+                }
+                None => {
+                    self.context.PSSetShader(&self.cursor_ps, None);
+                    self.context.Draw(6, 0);
+                }
+            }
         }
         Ok(())
     }
@@ -497,7 +612,61 @@ fn compile_cursor_shaders(
     }
 }
 
-/// A 32-byte dynamic constant buffer for the cursor sprite (center + halfsize).
+/// The cursor quad as `[x, y, w, h]` in units of the video viewport (top-left
+/// origin), which is what `cur_vs` takes. With the host's image: its
+/// [`CursorSprite::placement`] (hotspot on the pointer, scaled with the video).
+/// Without: the arrow, tip on the pointer, a constant [`ARROW_PX`] on screen
+/// whatever the viewport size (`video_px`, presenter pixels).
+fn cursor_quad(image: Option<&CursorSprite>, cursor: (f64, f64), video_px: (f32, f32)) -> [f32; 4] {
+    if let Some(r) = image.and_then(|i| i.placement(cursor)) {
+        return r.map(|v| v as f32);
+    }
+    [
+        cursor.0.clamp(0.0, 1.0) as f32,
+        cursor.1.clamp(0.0, 1.0) as f32,
+        ARROW_PX.0 / video_px.0.max(1.0),
+        ARROW_PX.1 / video_px.1.max(1.0),
+    ]
+}
+
+fn compile_sprite_shader(device: &ID3D11Device) -> Result<ID3D11PixelShader, Error> {
+    let blob = compile(SHADER_HLSL, "spr_ps", "ps_5_0")?;
+    let mut ps = None;
+    // SAFETY: valid bytecode blob.
+    unsafe { device.CreatePixelShader(blob_slice(&blob), None, Some(&mut ps))? };
+    ps.ok_or_else(|| Error::Shader("null cursor image PS".into()))
+}
+
+/// `ONE, INV_SRC_ALPHA` on colour and alpha: the over operator for
+/// premultiplied source pixels (Porter & Duff), the format the host's cursor
+/// image arrives in.
+fn create_premultiplied_blend(device: &ID3D11Device) -> Result<ID3D11BlendState, Error> {
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_BLEND_DESC, D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_ONE, D3D11_BLEND_OP_ADD,
+        D3D11_COLOR_WRITE_ENABLE_ALL, D3D11_RENDER_TARGET_BLEND_DESC,
+    };
+    let target = D3D11_RENDER_TARGET_BLEND_DESC {
+        BlendEnable: true.into(),
+        SrcBlend: D3D11_BLEND_ONE,
+        DestBlend: D3D11_BLEND_INV_SRC_ALPHA,
+        BlendOp: D3D11_BLEND_OP_ADD,
+        SrcBlendAlpha: D3D11_BLEND_ONE,
+        DestBlendAlpha: D3D11_BLEND_INV_SRC_ALPHA,
+        BlendOpAlpha: D3D11_BLEND_OP_ADD,
+        RenderTargetWriteMask: D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8,
+    };
+    let desc = D3D11_BLEND_DESC {
+        AlphaToCoverageEnable: false.into(),
+        IndependentBlendEnable: false.into(),
+        RenderTarget: [target; 8],
+    };
+    let mut state = None;
+    // SAFETY: valid, fully initialized desc.
+    unsafe { device.CreateBlendState(&desc, Some(&mut state))? };
+    state.ok_or_else(|| Error::Shader("null blend state".into()))
+}
+
+/// A 32-byte dynamic constant buffer for the cursor quad (`rect` + padding).
 fn create_cursor_cb(device: &ID3D11Device) -> Result<ID3D11Buffer, Error> {
     use windows::Win32::Graphics::Direct3D11::{
         D3D11_BIND_CONSTANT_BUFFER, D3D11_BUFFER_DESC, D3D11_CPU_ACCESS_WRITE, D3D11_USAGE_DYNAMIC,
@@ -574,4 +743,54 @@ fn create_sampler(device: &ID3D11Device) -> Result<ID3D11SamplerState, Error> {
     // SAFETY: valid desc.
     unsafe { device.CreateSamplerState(&desc, Some(&mut sampler))? };
     sampler.ok_or_else(|| Error::Shader("null sampler".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use platform_api::Point;
+
+    #[test]
+    fn the_hosts_image_sits_on_its_hotspot_and_scales_with_the_video() {
+        // 1920x1080 host frame, I-beam 9x16 with hotspot (4, 8), pointer at
+        // pixel (960, 540) of the host screen.
+        let beam = CursorSprite {
+            width: 9,
+            height: 16,
+            hotspot: Point { x: 4, y: 8 },
+            bgra: vec![0; 9 * 16 * 4],
+            frame: (1920, 1080),
+        };
+        let q = cursor_quad(Some(&beam), (0.5, 0.5), (960.0, 540.0));
+        // In viewport pixels (a half-size video): top-left (478, 266), 4.5x8.
+        let px = [q[0] * 960.0, q[1] * 540.0, q[2] * 960.0, q[3] * 540.0];
+        let want = [478.0, 266.0, 4.5, 8.0];
+        for (got, want) in px.iter().zip(want) {
+            assert!((got - want).abs() < 1e-3, "{px:?}");
+        }
+    }
+
+    #[test]
+    fn without_an_image_the_arrow_has_a_constant_on_screen_size() {
+        let q = cursor_quad(None, (0.25, 2.0), (1000.0, 500.0));
+        assert_eq!(q[0], 0.25);
+        assert_eq!(q[1], 1.0, "pointer clamped into the video");
+        assert!((q[2] * 1000.0 - ARROW_PX.0).abs() < 1e-4);
+        assert!((q[3] * 500.0 - ARROW_PX.1).abs() < 1e-4);
+    }
+
+    #[test]
+    fn the_shader_has_every_entry_point() {
+        for (entry, target) in [
+            ("vs_main", "vs_5_0"),
+            ("ps_main", "ps_5_0"),
+            ("cur_vs", "vs_5_0"),
+            ("cur_ps", "ps_5_0"),
+            ("spr_ps", "ps_5_0"),
+        ] {
+            if let Err(e) = compile(SHADER_HLSL, entry, target) {
+                panic!("{entry}: {e}");
+            }
+        }
+    }
 }

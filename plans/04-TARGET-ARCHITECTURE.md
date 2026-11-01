@@ -3,7 +3,8 @@
 This is the design every task in [05-TASKS.md](05-TASKS.md) builds toward. It keeps the
 Windows product exactly as it behaves today and adds macOS and Linux as *backends* behind
 one set of traits. Nothing here changes the wire protocol (except one additive optional
-field, `connect-response.os`, §6), the signaling server, or the
+field, `connect-response.os`, §6, and the additive `curshape` control message of D9, §2),
+the signaling server, or the
 Tauri UI contract (commands/events) — those were verified portable by the code sweep
 ([07-CODEBASE-SEAMS.md](07-CODEBASE-SEAMS.md)).
 
@@ -140,6 +141,30 @@ current code; the sweep lists the line for each):
 8. Secret store failure → do not save, toast; never plaintext.
 9. One session at a time; teardown order: clear sinks → stop flag → join → hide surface.
 10. Hover-bar clip never changes `client_size()`, so the host encode size stays stable.
+
+Additive contract changes made after this design (each approved by the orchestrator):
+
+* **D9, host cursor image (2026-11-01).** `Presenter::set_cursor_sprite(&mut self,
+  sprite: Option<&CursorSprite>) -> Result<(), SurfaceError>`, default `Ok(())` (a
+  presenter that ignores it keeps the built-in arrow). New `CursorSprite { width, height,
+  hotspot: Point, bgra: Vec<u8> /* premultiplied */, frame: (u32, u32) }` with
+  `is_valid()` and `placement(cursor) -> Option<[f64; 4]>` (the image rectangle as
+  fractions of the video, top-left = pointer − hotspot, size = image / host frame size),
+  and `MAX_CURSOR_SIDE` (= `protocol::cursor::MAX_SIDE`, 256). Doc-only fix:
+  `CursorUpdate.position` is the **hotspot** in captured-frame pixels on every backend
+  (DXGI reports the image's top-left; the Windows adapter adds the hotspot), and
+  `CursorShape` sizes/hotspot are captured-frame pixels with straight alpha.
+* **D9 wire protocol.** One additive control message, `{"t":"curshape", id, w, h, hx, hy,
+  fw, fh, part, parts, data}` (`ControlMsg::CursorShape`), on the reliable ordered `ctl`
+  channel — not the `cursor` channel, which never retransmits and would leave a lost image
+  wrong until the next change. `data` is lower-case hex of premultiplied BGRA, 16 KiB of
+  pixels per part (≤ 16 parts, each message ~32 KiB, under the 64 KiB SCTP default);
+  images over 256 px per side are not sent (the viewer draws the arrow). Positions stay
+  on the `cursor` channel unchanged; their existing optional `shape` field now names the
+  image id (`None` = arrow). Both ends keep the last 32 ids in insertion order, so a
+  cursor seen before is switched to by id alone. Older viewers fail to parse `curshape`
+  and drop it; older hosts never send it and never set `shape`, so the viewer keeps its
+  arrow. Details: `protocol/src/cursor.rs`.
 
 ## 3. Media data paths per OS (zero-copy where it matters)
 

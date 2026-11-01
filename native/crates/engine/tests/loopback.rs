@@ -346,6 +346,96 @@ async fn full_session_over_real_webrtc() {
     );
 }
 
+// ---- the host's real cursor image (D9) ------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_cursor_image_reaches_the_viewer_and_lands_on_the_hotspot() {
+    let relay = start_relay().await;
+    let host = start_peer("cursor-host", &relay);
+    let viewer = start_peer("cursor-viewer", &relay);
+    let t = Duration::from_secs(15);
+    eventually("both registered", t, || {
+        host.engine.server_connected() && viewer.engine.server_connected()
+    })
+    .await;
+    viewer.engine.connect_to(host.uuid.clone());
+
+    // The mock host reports its image once, with its first frame, before any
+    // channel is open: it must still arrive (reliable ctl, buffered until open)
+    // and be drawn wherever later position messages put the pointer.
+    eventually("frames drawn with the host's cursor image", t, || {
+        viewer
+            .platform
+            .surface
+            .state()
+            .presented
+            .iter()
+            .filter(|p| p.cursor_image_at.is_some())
+            .count()
+            >= 10
+    })
+    .await;
+
+    let shape = platform_api::mock::mock_cursor_shape();
+    {
+        let s = viewer.platform.surface.state();
+        // Received once (the content is unchanged), with the host's geometry and
+        // the pixels converted to premultiplied alpha (opaque white stays white,
+        // transparent texels are all-zero).
+        let installed: Vec<_> = s.cursor_sprites.iter().flatten().collect();
+        assert_eq!(installed.len(), 1, "installed once: {:?}", s.cursor_sprites);
+        let sprite = installed[0];
+        assert_eq!((sprite.width, sprite.height), (shape.width, shape.height));
+        assert_eq!(sprite.hotspot, shape.hotspot);
+        assert_eq!(
+            sprite.frame,
+            (640, 360),
+            "measured in the host's frame pixels"
+        );
+        assert_eq!(
+            sprite.bgra, shape.bgra,
+            "white/transparent survives premultiply"
+        );
+
+        // Pixel check: on this 1:1 surface the image's opaque block (image
+        // x ∈ [1,5), y ∈ [2,8), hotspot (2,3)) must cover exactly the 4×6 pixels
+        // at pointer + (−1, −1) — for every frame where it is not clipped.
+        let (sw, sh) = s.client_size;
+        assert_eq!((sw, sh), (640, 360));
+        let mut checked = 0;
+        for p in s.presented.iter() {
+            let (Some((nx, ny)), Some(at)) = (p.cursor, p.cursor_image_at) else {
+                continue;
+            };
+            let (px, py) = (
+                (nx * f64::from(sw)).round() as i32,
+                (ny * f64::from(sh)).round() as i32,
+            );
+            if px < 2 || py < 2 || px + 4 > sw as i32 || py + 6 > sh as i32 {
+                continue; // partly off-screen: clipped, a different rectangle
+            }
+            assert_eq!(
+                at,
+                platform_api::Rect {
+                    x: px - 1,
+                    y: py - 1,
+                    w: 4,
+                    h: 6
+                },
+                "pointer at ({px},{py})"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 5, "only {checked} unclipped frames to check");
+    }
+
+    viewer.engine.end_session();
+    eventually("both idle", t, || {
+        host.engine.role() == Role::Idle && viewer.engine.role() == Role::Idle
+    })
+    .await;
+}
+
 /// A raw protocol client, to play a peer that does not follow the rules.
 async fn raw_client(relay: &str, uuid: &str) -> mpsc::UnboundedSender<String> {
     let (ws, _) = tokio_tungstenite::connect_async(relay).await.unwrap();

@@ -38,9 +38,22 @@ pub(crate) struct Shared {
     /// Host: the viewer's display size `w << 32 | h` (0 = unknown). The host
     /// encodes to it so the viewer presents 1:1.
     pub view_size: AtomicU64,
-    /// Viewer: latest cursor from the host (normalized x, y, visible), drawn as a
-    /// sprite by the presenter.
-    pub cursor: Mutex<Option<(f64, f64, bool)>>,
+    /// Viewer: latest cursor from the host, drawn as a sprite by the presenter.
+    pub cursor: Mutex<Option<ViewerPointer>>,
+    /// Viewer: the host's cursor images received so far (task D9).
+    pub cursor_images: Mutex<crate::media::cursor::ViewerCursors>,
+}
+
+/// The pointer as the last position message described it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ViewerPointer {
+    /// Hotspot, normalized `[0,1]` over the video.
+    pub x: f64,
+    pub y: f64,
+    pub visible: bool,
+    /// The image to draw (an id in [`Shared::cursor_images`]); `None` = the
+    /// presenter's built-in arrow.
+    pub shape: Option<u32>,
 }
 
 /// The live session, owned by [`Engine`].
@@ -234,6 +247,7 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission) 
             display: cfg.share_display_id.clone(),
             codec,
             shared,
+            ctl_tx: ctl_tx.clone(),
         };
         let stop_m = stop.clone();
         let ui = engine.ui_sender();

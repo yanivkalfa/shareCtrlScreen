@@ -22,7 +22,9 @@ pub enum ControlMsg {
     KeyframeRequest,
     /// Host → Viewer: out-of-band cursor position + optional shape id
     /// (Plan 04 §5a/§7 — cursor rendered client-side so it feels instant).
-    /// `x`/`y` normalized `[0,1]`. `shape` references a shape sent separately.
+    /// `x`/`y` normalized `[0,1]`: the pointer's hotspot. `shape` names the
+    /// image (a [`ControlMsg::CursorShape`] id) the viewer draws there; `None`
+    /// means the built-in arrow (older hosts never set it).
     #[serde(rename = "cur")]
     Cursor {
         x: f64,
@@ -52,6 +54,12 @@ pub enum ControlMsg {
     /// never file lists or rendered formats. Size-capped by the sender.
     #[serde(rename = "clip")]
     Clipboard { text: String },
+    /// Host → Viewer, on the reliable `ctl` channel: one part of the host's
+    /// cursor image (task D9; format, caching and limits in
+    /// [`crate::cursor`]). Sent only when an image the viewer does not have
+    /// yet becomes current. Older viewers cannot parse it and ignore it.
+    #[serde(rename = "curshape")]
+    CursorShape(crate::cursor::CursorShapePart),
 }
 
 fn default_visible() -> bool {

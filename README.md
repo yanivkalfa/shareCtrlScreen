@@ -114,6 +114,7 @@ been tested on hardware.
 |---|---|---|---|---|
 | Screen capture | Yes (DXGI) | Yes, with Screen Recording permission (ScreenCaptureKit) | Yes, no prompt | Yes, after the portal consent dialog (ScreenCast) |
 | Remote mouse and keyboard | Yes. Elevated windows and UAC prompts need the Windows service or a host run as administrator | Yes, with Accessibility permission | Yes (XTest) | Yes on GNOME 46+ and KDE Plasma 6 (RemoteDesktop portal). Sway and Hyprland: through wlroots virtual input, no dialog (unverified). Others, such as Weston: view only unless the uinput setting is on |
+| The remote computer's real mouse pointer (arrow, I-beam, hand, resize), drawn on the viewer | Yes (pointer images from DXGI) | Yes (pointer images from AppKit) | Yes (XFixes) | Yes, when the portal sends pointer images (cursor metadata) |
 | Clipboard text, both ways | Yes | Yes | Yes. The clipboard lives only while the app runs | Yes, same as X11 |
 | Clipboard files, pasted on this side | Yes | Yes | Yes | Yes |
 | File push, controller to controlled | Yes | Yes | Yes | Yes |

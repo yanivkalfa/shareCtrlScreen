@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 
-use platform_api::{Codec, Platform, VideoSurface};
+use platform_api::{Codec, Platform, Presenter, VideoSurface};
 
 use crate::session::{serialize, Shared};
 
@@ -59,6 +59,8 @@ pub(crate) fn viewer_media_loop(
     let mut reported_size: (u32, u32) = (0, 0);
     let mut size_settled_at = std::time::Instant::now();
     let mut pending_size: (u32, u32) = (0, 0);
+    // Which of the host's cursor images the presenter holds (D9).
+    let mut sprite = InstalledSprite::default();
     while !stop.load(Ordering::SeqCst) {
         // Track window resizes (and hover-reveal offsets) — no-op when unchanged.
         surface.fit();
@@ -141,10 +143,9 @@ pub(crate) fn viewer_media_loop(
                                 continue; // reference-only; present the newest
                             }
                             // Draw the out-of-band cursor sprite on top (§7).
-                            let cursor = match *shared.cursor.lock() {
-                                Some((x, y, true)) => Some((x, y)),
-                                _ => None,
-                            };
+                            let pointer = *shared.cursor.lock();
+                            let cursor = pointer.filter(|p| p.visible).map(|p| (p.x, p.y));
+                            sprite.sync(presenter.as_mut(), &shared, pointer.and_then(|p| p.shape));
                             // A failing render is NOT silent: this was exactly the
                             // place a black screen hid (decode fine, render dead).
                             if let Err(e) = presenter.present(&frame, cursor) {
@@ -174,4 +175,38 @@ pub(crate) fn viewer_media_loop(
         }
     }
     Ok(())
+}
+
+/// The cursor image installed in the presenter, kept in step with the image
+/// the host names (D9). The presenter is told only on a change, because
+/// installing an image uploads a texture.
+#[derive(Debug, Default)]
+struct InstalledSprite {
+    /// `None` = the built-in arrow (also the state before any image arrives).
+    id: Option<u32>,
+}
+
+impl InstalledSprite {
+    /// Make the presenter draw image `wanted` (`None` = arrow). An id whose
+    /// image has not finished arriving keeps the current picture: the image
+    /// is on its way on the reliable channel, and flashing the arrow for
+    /// those few milliseconds would look worse than a moment's stale shape.
+    fn sync(&mut self, presenter: &mut dyn Presenter, shared: &Shared, wanted: Option<u32>) {
+        if wanted == self.id {
+            return;
+        }
+        let sprite = match wanted {
+            None => None,
+            Some(id) => match shared.cursor_images.lock().get(id) {
+                Some(s) => Some(s),
+                None => return,
+            },
+        };
+        if let Err(e) = presenter.set_cursor_sprite(sprite.as_deref()) {
+            // Recorded as installed anyway: retrying every frame would only
+            // repeat the failure; the next shape change tries again.
+            tracing::warn!("viewer: cursor image could not be shown: {e}");
+        }
+        self.id = wanted;
+    }
 }

@@ -34,7 +34,7 @@ use crate::os::{Autostart, Clipboard, Paths, SecretStore, MAX_TEXT_BYTES};
 use crate::platform::{
     DisplayInfo, OsPermission, PermissionReport, PermissionState, Platform, PlatformInfo,
 };
-use crate::surface::{FileDrop, Presenter, SurfaceError, VideoInput, VideoSurface};
+use crate::surface::{CursorSprite, FileDrop, Presenter, SurfaceError, VideoInput, VideoSurface};
 
 /// Lock, recovering from poisoning (a panicking test thread must not cascade).
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -62,6 +62,9 @@ pub struct MockCaptureConfig {
     pub static_after: Option<u64>,
     /// Return [`CaptureError::Lost`] once when this frame number is reached.
     pub lose_at: Option<u64>,
+    /// The pointer image, reported with the first frame and again with the
+    /// first frame after a `reinit` (as DXGI does). Default: [`mock_cursor_shape`].
+    pub cursor_shape: Option<CursorShape>,
 }
 
 impl Default for MockCaptureConfig {
@@ -72,7 +75,28 @@ impl Default for MockCaptureConfig {
             fps: 30,
             static_after: None,
             lose_at: None,
+            cursor_shape: Some(mock_cursor_shape()),
         }
+    }
+}
+
+/// The mock's pointer image: 6×10, hotspot (2, 3), straight alpha, an opaque
+/// white 4×6 block at image pixels x ∈ [1, 5), y ∈ [2, 8) and transparent
+/// elsewhere, so where its opaque pixels land on the viewer is easy to check.
+pub fn mock_cursor_shape() -> CursorShape {
+    let (w, h) = (6u32, 10u32);
+    let mut bgra = vec![0u8; (w * h * 4) as usize];
+    for y in 2..8 {
+        for x in 1..5 {
+            let i = ((y * w + x) * 4) as usize;
+            bgra[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+        }
+    }
+    CursorShape {
+        width: w,
+        height: h,
+        hotspot: Point { x: 2, y: 3 },
+        bgra,
     }
 }
 
@@ -88,6 +112,9 @@ pub struct MockCapture {
     next_due: Instant,
     bar_x: Option<u32>,
     lost_fired: bool,
+    /// Whether the next frame reports the pointer image (first frame, and
+    /// the first after a reinit).
+    shape_due: bool,
     /// Counts `release` calls that actually released a held frame (tests use it
     /// to check the release-on-every-path invariant).
     pub releases: u64,
@@ -103,6 +130,7 @@ impl MockCapture {
             next_due: Instant::now(),
             bar_x: None,
             lost_fired: false,
+            shape_due: true,
             releases: 0,
             reinits: 0,
             cfg,
@@ -211,12 +239,11 @@ impl ScreenCapture for MockCapture {
                 x: (self.seq % w as u64) as i32,
                 y: (self.seq % self.cfg.height as u64) as i32,
             },
-            shape: (self.seq == 0).then(|| CursorShape {
-                width: 1,
-                height: 1,
-                hotspot: Point::default(),
-                bgra: vec![0, 0, 0, 255],
-            }),
+            shape: if std::mem::take(&mut self.shape_due) {
+                self.cfg.cursor_shape.clone()
+            } else {
+                None
+            },
         });
         self.seq += 1;
         self.holding = true;
@@ -242,6 +269,7 @@ impl ScreenCapture for MockCapture {
         self.reinits += 1;
         self.paint_background();
         self.bar_x = None;
+        self.shape_due = true;
         Ok(())
     }
 
@@ -513,6 +541,12 @@ pub struct Presented {
     pub width: u32,
     pub height: u32,
     pub cursor: Option<(f64, f64)>,
+    /// Where the installed cursor image's visible (alpha > 0) pixels landed
+    /// on the surface, as their bounding box in surface pixels: the presenter
+    /// composites the image on the CPU the way a real one does on the GPU
+    /// (letterbox, [`CursorSprite::placement`], nearest texel per pixel
+    /// centre). `None` when no image was drawn (no cursor, or the arrow).
+    pub cursor_image_at: Option<Rect>,
 }
 
 /// Everything the mock surface saw. Inspect via [`MockSurface::state`].
@@ -522,6 +556,8 @@ pub struct SurfaceState {
     pub client_size: (u32, u32),
     pub fits: u64,
     pub presented: Vec<Presented>,
+    /// Every [`Presenter::set_cursor_sprite`] call, in order.
+    pub cursor_sprites: Vec<Option<CursorSprite>>,
     input_sink: Option<Sender<VideoInput>>,
     drop_sink: Option<Sender<FileDrop>>,
     held_keys: BTreeSet<&'static str>,
@@ -636,6 +672,7 @@ impl VideoSurface for MockSurface {
     fn create_presenter(&self) -> Result<Box<dyn Presenter>, SurfaceError> {
         Ok(Box::new(MockPresenter {
             state: self.state.clone(),
+            sprite: None,
         }))
     }
     fn as_any(&self) -> &dyn Any {
@@ -643,10 +680,12 @@ impl VideoSurface for MockSurface {
     }
 }
 
-/// Records each presented frame's stamp into the surface state.
+/// Records each presented frame's stamp into the surface state, and where the
+/// cursor image's pixels would land.
 #[derive(Debug)]
 pub struct MockPresenter {
     state: Arc<Mutex<SurfaceState>>,
+    sprite: Option<CursorSprite>,
 }
 
 impl Presenter for MockPresenter {
@@ -663,17 +702,87 @@ impl Presenter for MockPresenter {
             } => read_stamp(plane0.data),
             FrameData::Native(_) => None,
         };
-        lock(&self.state).presented.push(Presented {
+        let mut s = lock(&self.state);
+        let surface = s.client_size;
+        let cursor_image_at = match (&self.sprite, cursor) {
+            (Some(sprite), Some(c)) => {
+                visible_bounds(sprite, c, surface, (frame.width, frame.height))
+            }
+            _ => None,
+        };
+        s.presented.push(Presented {
             stamp,
             width: frame.width,
             height: frame.height,
             cursor,
+            cursor_image_at,
         });
         Ok(())
     }
     fn device(&self) -> Option<&dyn Any> {
         None
     }
+    fn set_cursor_sprite(&mut self, sprite: Option<&CursorSprite>) -> Result<(), SurfaceError> {
+        if sprite.is_some_and(|s| !s.is_valid()) {
+            return Err(SurfaceError::Backend("malformed cursor image".into()));
+        }
+        self.sprite = sprite.cloned();
+        lock(&self.state).cursor_sprites.push(self.sprite.clone());
+        Ok(())
+    }
+}
+
+/// CPU reference compositor for [`Presented::cursor_image_at`]: letterbox the
+/// video into `surface`, place the image with [`CursorSprite::placement`],
+/// and for every surface pixel whose centre falls inside it take the nearest
+/// texel; return the bounding box of those with alpha > 0.
+fn visible_bounds(
+    sprite: &CursorSprite,
+    cursor: (f64, f64),
+    surface: (u32, u32),
+    video: (u32, u32),
+) -> Option<Rect> {
+    let [x, y, w, h] = sprite.placement(cursor)?;
+    let (sw, sh) = (f64::from(surface.0), f64::from(surface.1));
+    let (vw, vh) = (f64::from(video.0), f64::from(video.1));
+    if sw <= 0.0 || sh <= 0.0 || vw <= 0.0 || vh <= 0.0 {
+        return None;
+    }
+    let scale = (sw / vw).min(sh / vh);
+    let (rw, rh) = (vw * scale, vh * scale);
+    let (rx, ry) = ((sw - rw) / 2.0, (sh - rh) / 2.0);
+    let (dx, dy, dw, dh) = (rx + x * rw, ry + y * rh, w * rw, h * rh);
+    let mut bounds: Option<(i64, i64, i64, i64)> = None;
+    let first = |v: f64| (v.floor() as i64).max(0);
+    for py in first(dy)..(dy + dh).ceil().min(sh) as i64 {
+        let cy = py as f64 + 0.5;
+        if cy < dy || cy >= dy + dh {
+            continue;
+        }
+        let ty = (((cy - dy) / dh) * f64::from(sprite.height)) as usize;
+        for px in first(dx)..(dx + dw).ceil().min(sw) as i64 {
+            let cx = px as f64 + 0.5;
+            if cx < dx || cx >= dx + dw {
+                continue;
+            }
+            let tx = (((cx - dx) / dw) * f64::from(sprite.width)) as usize;
+            let i = (ty * sprite.width as usize + tx) * 4 + 3;
+            if sprite.bgra.get(i).copied().unwrap_or(0) == 0 {
+                continue;
+            }
+            bounds = Some(match bounds {
+                None => (px, py, px, py),
+                Some((x0, y0, x1, y1)) => (x0.min(px), y0.min(py), x1.max(px), y1.max(py)),
+            });
+        }
+    }
+    let (x0, y0, x1, y1) = bounds?;
+    Some(Rect {
+        x: x0 as i32,
+        y: y0 as i32,
+        w: (x1 - x0 + 1) as u32,
+        h: (y1 - y0 + 1) as u32,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -969,6 +1078,41 @@ impl Platform for MockPlatform {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn mock_presenter_places_the_cursor_image_hotspot_first_and_letterboxed() {
+        let shape = mock_cursor_shape();
+        let sprite = CursorSprite {
+            width: shape.width,
+            height: shape.height,
+            hotspot: shape.hotspot,
+            bgra: shape.bgra,
+            frame: (640, 360),
+        };
+        let at = (100.0 / 640.0, 50.0 / 360.0);
+        // 1:1: the opaque block (image x ∈ [1,5), y ∈ [2,8)) relative to the
+        // hotspot (2,3) lands at pointer + (-1..3, -1..5).
+        assert_eq!(
+            visible_bounds(&sprite, at, (640, 360), (640, 360)),
+            Some(Rect {
+                x: 99,
+                y: 49,
+                w: 4,
+                h: 6
+            })
+        );
+        // Shown twice as large, letterboxed into a taller surface (bars of
+        // 40 px above and below): everything doubles and shifts down.
+        assert_eq!(
+            visible_bounds(&sprite, at, (1280, 800), (640, 360)),
+            Some(Rect {
+                x: 198,
+                y: 138,
+                w: 8,
+                h: 12
+            })
+        );
+    }
 
     fn dummy_handles() -> (RawWindowHandle, RawDisplayHandle) {
         (

@@ -2,22 +2,30 @@
 //! `CodecFactory` exactly as the host uses it. Needs a Mac with a hardware
 //! video encoder (every Apple-silicon Mac); no TCC permission is involved.
 //!
-//! **Device-pending.** Every test is `#[ignore]`d because a machine without
-//! the hardware cannot pass them, so the CI's `cargo test --workspace` runs
-//! none of them. The M2 acceptance is therefore verified by hand on a Mac
-//! (plans/checklists/M2.md) until task T2 (after M2 and M3) adds a GitHub
-//! macOS-runner step that runs them with `--ignored`, skipping when
-//! VideoToolbox has no hardware encoder there:
+//! Every test is `#[ignore]`d so `cargo test --workspace` stays fast, and each
+//! probes for a hardware H.264 encoder first and skips with a printed line
+//! without one (`tests/support/hardware.rs`). The macOS CI job runs the
+//! non-timing tests with `--ignored --nocapture` and
+//! `SCT_MAC_HW_TESTS_REQUIRED=1` (`.github/workflows/native-ci.yml`).
+//!
+//! The two timing tests (`encodes_300_frames_first_idr_mean_under_8ms`,
+//! `holds_the_bitrate_within_15_percent_over_5_seconds`) are device-only: a
+//! shared CI runner is too loaded for a wall-clock budget, so the CI step skips
+//! them by name. Run them on a Mac, `--test-threads=1` so they do not share the
+//! media engine (plans/checklists/M2.md §3):
 //!
 //! ```text
-//! cargo test -p platform-macos --test vt_encode -- --ignored --nocapture --test-threads=1
+//! cargo test --release -p platform-macos --test vt_encode -- --ignored --nocapture --test-threads=1
 //! ```
-//!
-//! `--test-threads=1` keeps the timing test from sharing the media engine.
 
 #![cfg(target_os = "macos")]
 
+#[path = "support/hardware.rs"]
+mod hardware;
+
 use std::time::{Duration, Instant};
+
+use hardware::skip;
 
 use objc2_core_video::{
     kCVReturnSuccess, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane,
@@ -128,8 +136,12 @@ fn assert_annexb(u: &EncodedUnit) {
 /// 300 synthetic 1080p frames: the first unit is an IDR with SPS/PPS in
 /// front, nothing else is a keyframe, and the mean `encode` call is ≤ 8 ms.
 #[test]
-#[ignore = "needs macOS hardware"]
+#[ignore = "timing, device-only: a shared CI runner is too loaded (skipped by name in CI)"]
 fn encodes_300_frames_first_idr_mean_under_8ms() {
+    if !platform_macos::h264_hardware_encoder_available() {
+        skip("no hardware H.264 encoder (VideoToolbox)");
+        return;
+    }
     logs();
     let mut enc = encoder(8_000_000);
     let pictures: Vec<Picture> = (0..8).map(|i| gradient(i * 4)).collect();
@@ -174,8 +186,12 @@ fn encodes_300_frames_first_idr_mean_under_8ms() {
 /// than dropped. A forced keyframe in the middle comes out as one, and a
 /// live bitrate change takes without a rebuild.
 #[test]
-#[ignore = "needs macOS hardware"]
+#[ignore = "timing, device-only: a shared CI runner is too loaded (skipped by name in CI)"]
 fn holds_the_bitrate_within_15_percent_over_5_seconds() {
+    if !platform_macos::h264_hardware_encoder_available() {
+        skip("no hardware H.264 encoder (VideoToolbox)");
+        return;
+    }
     logs();
     const TARGET: u32 = 6_000_000;
     let mut enc = encoder(TARGET / 2);
@@ -281,24 +297,24 @@ fn psnr(a: &[u8], b: &[u8]) -> f64 {
     }
 }
 
-/// Encode → decode through the platform factory on both sides → luma PSNR
-/// ≥ 40 dB on a gradient. The decoder is whatever the platform provides for
-/// H.264: VideoToolbox once task M3 is merged; Cisco OpenH264 until then
-/// (this test then also needs the network for the one-time download).
+/// Encode → decode through the platform factory → luma PSNR ≥ 40 dB on a
+/// gradient. Both sides are VideoToolbox: OpenH264 stays off throughout, so a
+/// failed hardware session fails the test instead of being replaced by the
+/// software codec, and the decoder is the M3 VideoToolbox decoder.
 #[test]
-#[ignore = "needs macOS hardware"]
+#[ignore = "needs a Mac with a hardware H.264 encoder (skips without one)"]
 fn round_trip_through_the_platform_decoder_is_at_least_40_db() {
+    if !platform_macos::h264_hardware_encoder_available() {
+        skip("no hardware H.264 encoder (VideoToolbox)");
+        return;
+    }
     logs();
     let platform = MacPlatform::new();
-    // OpenH264 off while the encoder is built, so a failed hardware session
-    // fails the test instead of being silently replaced by the software
-    // encoder; back on for the decoder, which falls back to it before M3.
     platform.openh264().set_enabled(false);
     let mut enc = platform
         .codecs()
         .new_encoder(None, config(8_000_000))
         .expect("hardware H.264 encoder");
-    platform.openh264().set_enabled(true);
     let mut dec = platform
         .codecs()
         .new_decoder(None, Codec::H264, W, H)

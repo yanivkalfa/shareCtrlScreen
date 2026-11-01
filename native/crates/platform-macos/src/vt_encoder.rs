@@ -1068,15 +1068,30 @@ pub(crate) fn probe(codec: Codec) -> bool {
 #[cfg(test)]
 mod tests {
     //! Need a Mac with a hardware video encoder (any Apple-silicon Mac; most
-    //! Intel Macs with a T2 chip or Quick Sync):
+    //! Intel Macs with a T2 chip or Quick Sync). Each probes first and skips
+    //! with a printed line without one (`tests/support/hardware.rs`):
     //!
     //! ```text
-    //! cargo test -p platform-macos --lib vt_encoder -- --ignored --nocapture
+    //! cargo test -p platform-macos --lib vt_encoder::tests -- --ignored --nocapture
     //! ```
+    //!
+    //! The macOS CI step runs the same command with
+    //! `SCT_MAC_HW_TESTS_REQUIRED=1`, so a skip there fails.
 
     use objc2_core_video::CVPixelBufferGetWidth;
 
     use super::*;
+    use crate::hardware::skip;
+
+    /// False, after a printed skip, when this Mac has no hardware H.264
+    /// encoder: the probe every hardware test in this module runs first.
+    fn hardware_present() -> bool {
+        if crate::h264_hardware_encoder_available() {
+            return true;
+        }
+        skip("no hardware H.264 encoder (VideoToolbox)");
+        false
+    }
 
     /// A `420v` IOSurface buffer with a horizontal luma ramp, like a
     /// ScreenCaptureKit frame.
@@ -1103,8 +1118,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs macOS hardware"]
+    #[ignore = "needs a Mac with a hardware H.264 encoder (skips without one)"]
     fn native_frames_encode_zero_copy_and_start_with_an_idr() {
+        if !hardware_present() {
+            return;
+        }
         let mut enc = VtEncoder::new(EncoderConfig::default()).expect("hardware H.264 encoder");
         let frame = capture_like(1920, 1080);
         let native = Frame {
@@ -1128,8 +1146,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs macOS hardware"]
+    #[ignore = "needs a Mac with a hardware H.264 encoder (skips without one)"]
     fn a_larger_capture_is_scaled_to_the_encode_size() {
+        if !hardware_present() {
+            return;
+        }
         let cfg = EncoderConfig {
             width: 1280,
             height: 720,
@@ -1155,8 +1176,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs macOS hardware"]
+    #[ignore = "needs a Mac with a hardware H.264 encoder (skips without one)"]
     fn forced_keyframes_and_live_bitrate_changes() {
+        if !hardware_present() {
+            return;
+        }
         let mut enc = VtEncoder::new(EncoderConfig::default()).expect("hardware H.264 encoder");
         let frame = capture_like(1920, 1080);
         let native = Frame {

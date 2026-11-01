@@ -55,6 +55,27 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      # VideoToolbox hardware tests (plan task T2). The macOS runner is an
+      # Apple-silicon image, which has a hardware H.264/HEVC encoder and decoder
+      # (GitHub runner-images README: `macos-latest` = macOS 26 arm64, and the
+      # `macos-14`/`macos-15` labels are arm64 too; Intel images are `-large` /
+      # `-intel` labels only). Each test probes first and, with
+      # SCT_MAC_HW_TESTS_REQUIRED=1, a missing encoder or decoder fails the job
+      # instead of skipping. The two timing tests are device-only (a loaded
+      # shared runner cannot hold a wall-clock budget) and skipped by name here.
+      # The golden-stream test checks VideoToolbox's output against FFmpeg's
+      # per-frame hashes (native/testdata/golden/README.md). --nocapture keeps
+      # the printed dB / frame lines in the log.
+      - name: VideoToolbox hardware tests (macOS)
+        if: runner.os == 'macOS'
+        env:
+          SCT_MAC_HW_TESTS_REQUIRED: "1"
+        run: |
+          cargo test -p platform-macos --lib vt_encoder::tests -- --ignored --nocapture
+          cargo test -p platform-macos --lib decode:: -- --ignored --nocapture
+          cargo test -p platform-macos --test vt_encode -- --ignored --nocapture --test-threads=1 \
+            --skip encodes_300_frames_first_idr_mean_under_8ms \
+            --skip holds_the_bitrate_within_15_percent_over_5_seconds
 
   release-build:
     # The optimized Windows build the dev/test pipelines ship.

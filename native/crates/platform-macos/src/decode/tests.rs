@@ -16,9 +16,12 @@ use objc2_core_video::{
     CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
 };
 use platform_api::{Codec, CodecFactory, EncoderConfig, Frame, FrameData, VideoDecoder};
+use sha2::{Digest, Sha256};
 
+use super::golden;
 use super::synth::{pattern, H264Synth};
 use super::*;
+use crate::hardware::skip;
 
 /// A decoded picture copied out of its pixel buffer (tight rows).
 struct Picture {
@@ -319,11 +322,16 @@ fn psnr(a: &Picture, b: &Picture) -> f64 {
 /// this Mac encodes and decodes it in hardware — HEVC.
 ///
 /// Needs a Mac with a hardware video encoder (any Apple silicon Mac, most
-/// Intel Macs); run there with
-/// `cargo test -p platform-macos decode::tests::round_trip -- --ignored --nocapture`.
+/// Intel Macs). It probes first and skips without one (see
+/// `tests/support/hardware.rs`); run with
+/// `cargo test -p platform-macos --lib decode:: -- --ignored --nocapture`.
 #[test]
-#[ignore = "needs macOS hardware (VideoToolbox encoder, task M2)"]
+#[ignore = "needs a Mac with a hardware H.264 encoder (skips without one)"]
 fn round_trip_gradient_psnr_at_least_40_db() {
+    if !crate::h264_hardware_encoder_available() {
+        skip("no hardware H.264 encoder (VideoToolbox)");
+        return;
+    }
     let platform = crate::MacPlatform::new();
     let factory = platform.codecs.hardware();
     let (width, height) = (1280, 720);
@@ -371,5 +379,86 @@ fn round_trip_gradient_psnr_at_least_40_db() {
         let db = psnr(&expected, &decoded);
         println!("{codec:?}: {db:.1} dB");
         assert!(db >= 40.0, "{codec:?}: PSNR {db:.1} dB < 40 dB");
+    }
+}
+
+/// SHA-256 (hex) of a decoded picture laid out like FFmpeg's `nv12` rawvideo:
+/// the Y rows, then the interleaved UV rows, tightly packed (even sizes).
+fn nv12_hash(p: &Picture) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(&p.y);
+    hasher.update(&p.uv);
+    hex::encode(hasher.finalize())
+}
+
+/// Decodes every access unit of `g` on `dec`: one picture each, its size and
+/// hash, with `dimensions()` checked against every picture.
+fn decode_golden(dec: &mut VtDecoder, g: &golden::Golden) -> Vec<((u32, u32), String)> {
+    g.access_units()
+        .enumerate()
+        .map(|(i, (au, key))| {
+            let picture = decode(dec, au, key, i as i64)
+                .unwrap_or_else(|| panic!("{} AU {i}: no picture", g.name));
+            ((picture.width, picture.height), nv12_hash(&picture))
+        })
+        .collect()
+}
+
+/// `got` against FFmpeg's reference for `g`: same count, sizes and hashes.
+fn assert_matches_ffmpeg(g: &golden::Golden, got: &[((u32, u32), String)]) {
+    assert_eq!(got.len(), g.frames.len(), "{}: picture count", g.name);
+    for (i, (got, want)) in got.iter().zip(&g.frames).enumerate() {
+        assert_eq!(got.0, want.0, "{} frame {i}: size", g.name);
+        assert_eq!(
+            got.1, want.1,
+            "{} frame {i}: pixels differ from FFmpeg's",
+            g.name
+        );
+    }
+}
+
+/// The VideoToolbox decoder reproduces FFmpeg's per-frame NV12 hashes on the
+/// golden streams (`native/testdata/golden`). H.264 and HEVC decoding are
+/// bit-exact by specification, and VideoToolbox hands out the decoded samples
+/// unconverted in `420v` (video range), so the planes must hash identically;
+/// a crop, reference or parameter-set mistake changes them. Each H.264 stream
+/// is decoded on a fresh decoder, then all of them on one decoder, which
+/// crosses the resolutions (640×360, 320×240, 352×288) like a host that
+/// changes size mid-session. HEVC is checked only where VideoToolbox decodes
+/// it in hardware (`VTIsHardwareDecodeSupported`).
+///
+/// Run by the macOS CI step (`--ignored`); skips where hardware decode is
+/// missing, and fails there under `SCT_MAC_HW_TESTS_REQUIRED=1`.
+#[test]
+#[ignore = "needs a Mac with hardware decode (VideoToolbox); the macOS CI step runs it"]
+fn golden_streams_match_ffmpegs_frame_hashes() {
+    if !hardware_decodes(Codec::H264) {
+        skip("no hardware H.264 decode (VTIsHardwareDecodeSupported is false)");
+        return;
+    }
+    let goldens = golden::all();
+    let h264: Vec<&golden::Golden> = goldens.iter().filter(|g| g.codec == Codec::H264).collect();
+    assert!(!h264.is_empty(), "no H.264 golden streams");
+    for g in &h264 {
+        let mut dec = VtDecoder::new(Codec::H264, 1920, 1080);
+        assert_matches_ffmpeg(g, &decode_golden(&mut dec, g));
+        println!("{}: {} frames match FFmpeg", g.name, g.frames.len());
+    }
+    let mut shared = VtDecoder::new(Codec::H264, 1920, 1080);
+    for g in &h264 {
+        assert_matches_ffmpeg(g, &decode_golden(&mut shared, g));
+    }
+    println!(
+        "{} H.264 streams on one decoder (resolution changes): all match FFmpeg",
+        h264.len()
+    );
+    if hardware_decodes(Codec::Hevc) {
+        for g in goldens.iter().filter(|g| g.codec == Codec::Hevc) {
+            let mut dec = VtDecoder::new(Codec::Hevc, 1920, 1080);
+            assert_matches_ffmpeg(g, &decode_golden(&mut dec, g));
+            println!("{}: {} frames match FFmpeg", g.name, g.frames.len());
+        }
+    } else {
+        skip("no hardware HEVC decode (VTIsHardwareDecodeSupported is false)");
     }
 }

@@ -36,6 +36,11 @@ mod view;
 mod vt_encoder;
 mod vt_params;
 
+// The skip convention of the hardware tests, shared with `tests/vt_encode.rs`.
+#[cfg(test)]
+#[path = "../tests/support/hardware.rs"]
+mod hardware;
+
 pub use capture::SckCapture;
 
 use std::path::PathBuf;
@@ -45,13 +50,22 @@ use codec_openh264::{OpenH264, WithSoftwareH264};
 use codecs::VtCodecs;
 use platform_api::unavailable::NoAutostart;
 use platform_api::{
-    Autostart, CaptureError, Clipboard, CodecFactory, DisplayInfo, InputError, InputInjector,
-    OsPermission, Paths, PermissionReport, Platform, PlatformInfo, RawDisplayHandle,
+    Autostart, CaptureError, Clipboard, Codec, CodecFactory, DisplayInfo, InputError,
+    InputInjector, OsPermission, Paths, PermissionReport, Platform, PlatformInfo, RawDisplayHandle,
     RawWindowHandle, ScreenCapture, SecretStore, ShortcutHook, SurfaceError, VideoSurface,
 };
 
 mod clipboard;
 mod secret;
+
+/// Whether this Mac opens a hardware H.264 encoder session (a real
+/// VideoToolbox session is built and dropped, with
+/// `RequireHardwareAcceleratedVideoEncoder`). The hardware tests call it
+/// first and skip when it is false; `tests/vt_encode.rs` uses it too. Not part
+/// of the app's behaviour: the app learns the same from the codec factory.
+pub fn h264_hardware_encoder_available() -> bool {
+    vt_encoder::probe(Codec::H264)
+}
 
 pub struct MacPlatform {
     /// VideoToolbox encode (M2) and decode (M3); Cisco OpenH264 for H.264

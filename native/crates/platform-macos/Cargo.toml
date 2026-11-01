@@ -193,3 +193,8 @@ objc2-screen-capture-kit = { version = "0.3.2", default-features = false, featur
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 tracing-subscriber.workspace = true
 libc = "0.2"
+# The golden-stream check (src/decode/tests.rs) hashes NV12 pictures with
+# SHA-256 and compares them with FFmpeg's `framehash` output, as platform-linux
+# does. Both are already workspace dependencies (MIT OR Apache-2.0).
+sha2.workspace = true
+hex.workspace = true

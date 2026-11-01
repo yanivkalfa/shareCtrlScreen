@@ -33,6 +33,7 @@ every crate below.
 | `block2`, `dispatch2` | 0.6 / 0.3 | blocks for `NSEvent` local monitors; main-queue hops (`DispatchQueue::main`, `MainThreadBound`) — same objc2 project, `block2` is MIT, `dispatch2` Zlib OR Apache-2.0 OR MIT |
 | `screencapturekit` (reference only) | 11.1.1 (MIT OR Apache-2.0, 2026-10-26, macOS 13+) | safe wrapper to crib from; not a dependency (Swift bridge) |
 | `videotoolbox` (reference only) | docs.rs | shows the encoder-spec builder shape |
+| `sha2`, `hex` (dev only) | workspace versions (`sha2` 0.10, `hex` 0.4) | SHA-256 of decoded NV12 for the golden-stream test (`decode::golden`); already in the workspace via platform-linux, protocol, engine |
 
 ## Linux
 

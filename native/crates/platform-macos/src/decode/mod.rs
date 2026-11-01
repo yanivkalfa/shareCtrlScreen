@@ -36,7 +36,8 @@
 //!   `kVTDecompressionPropertyKey_RealTime`,
 //!   `kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder`:
 //!   <https://developer.apple.com/documentation/videotoolbox/decompression-properties>
-//! * `VTIsHardwareDecodeSupported`:
+//! * `VTIsHardwareDecodeSupported` (the test gate for hardware decode; the
+//!   macOS CI step runs the golden-stream test only where it is true):
 //!   <https://developer.apple.com/documentation/videotoolbox/vtishardwaredecodesupported(_:)>
 //! * VideoToolbox result codes (`VTErrors.h`):
 //!   <https://developer.apple.com/documentation/videotoolbox/videotoolbox-constants>
@@ -71,6 +72,8 @@ mod format;
 mod session;
 mod status;
 
+#[cfg(test)]
+mod golden;
 #[cfg(test)]
 mod synth;
 #[cfg(test)]

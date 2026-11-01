@@ -295,12 +295,17 @@ async fn open_portal(
                 stream.position(),
                 if granted.token.is_some() { "with a" } else { "no" },
             );
-                crate::portal_monitor::publish(crate::portal_monitor::Monitor::of(stream));
                 let node = stream.pipe_wire_node_id();
+                let monitor = crate::portal_monitor::Monitor::of(stream);
                 granted
                     .open_pipewire_remote()
                     .await
-                    .map(|fd| (fd, node))
+                    .map(|fd| {
+                        // Published only once the stream is really open: a failed
+                        // open must not leave a monitor that no live session shows.
+                        crate::portal_monitor::publish(monitor);
+                        (fd, node)
+                    })
                     .map_err(|e| OpenError::Remote(Box::new(e)))
             }
         };
@@ -349,12 +354,17 @@ async fn open_shared(
                     stream.size(),
                     stream.position(),
                 );
-                crate::portal_monitor::publish(crate::portal_monitor::Monitor::of(stream));
                 let node = stream.pipe_wire_node_id();
+                let monitor = crate::portal_monitor::Monitor::of(stream);
                 granted
                     .open_pipewire_remote()
                     .await
-                    .map(|fd| (fd, node))
+                    .map(|fd| {
+                        // Published only once the stream is really open: a failed
+                        // open must not leave a monitor that no live session shows.
+                        crate::portal_monitor::publish(monitor);
+                        (fd, node)
+                    })
                     .map_err(|e| OpenError::Remote(Box::new(e)))
             }
         }

@@ -90,6 +90,8 @@ launch. This is expected and happens once per downloaded build:
 4. Or in Terminal, instead of 2–3: `xattr -dr com.apple.quarantine /Applications/ShareCtrlScreen.app`
 5. Grant **Screen & System Audio Recording** and **Accessibility** when asked (the app
    shows a checklist). Screen Recording needs a restart of the app after granting.
+   Capturing system shortcuts (Cmd+Tab, Cmd+Space, Ctrl+arrows) for the remote while
+   viewing needs **Input Monitoring** and **Accessibility**.
 
 *"ShareCtrlScreen is damaged and can't be opened"* means the quarantine flag is set on a
 bundle whose signature is missing or broken (an unsigned or re-zipped copy). Re-download

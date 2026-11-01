@@ -4,8 +4,8 @@
 //!
 //! Status: screen capture and display enumeration (M1), VideoToolbox encode
 //! (M2) and decode (M3), the video surface and presenter (M4), input
-//! injection (M5), clipboard (M7), Keychain (M8), autostart (M9),
-//! permissions (M11) and paths are real; every other
+//! injection (M5), the shortcut event tap (M6), clipboard (M7), Keychain (M8),
+//! autostart (M9), permissions (M11) and paths are real; every other
 //! capability fails safely with a clear message until its task lands (see
 //! `plans/05-TASKS.md`, lane M).
 
@@ -28,6 +28,8 @@ mod injector;
 pub mod keymap;
 mod permissions;
 mod presenter;
+mod shortcut_filter;
+mod shortcut_hook;
 mod slot;
 mod surface;
 mod view;
@@ -98,7 +100,7 @@ impl Platform for MacPlatform {
             start_at_login_label: "Start at sign-in",
             shortcut_capture_hint: "Cmd+Tab and other system shortcuts act on the remote \
                                     machine while the session window is focused (needs the \
-                                    Accessibility permission).",
+                                    Input Monitoring and Accessibility permissions).",
             login_screen_supported: false,
         }
     }
@@ -149,7 +151,7 @@ impl Platform for MacPlatform {
     }
 
     fn create_shortcut_hook(&self) -> Option<Box<dyn ShortcutHook>> {
-        None
+        Some(Box::new(shortcut_hook::EventTapHook::default()))
     }
 
     fn create_clipboard(&self) -> Box<dyn Clipboard> {

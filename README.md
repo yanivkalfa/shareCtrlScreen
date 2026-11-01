@@ -50,8 +50,9 @@ so the first launch needs one extra step.
    `xattr -dr com.apple.quarantine /Applications/ShareCtrlScreen.app`.)
 4. Grant the permissions in **System Settings → Privacy & Security**:
    - **Screen & System Audio Recording**: needed to share this Mac's screen.
-   - **Accessibility**: needed for the remote side to control this Mac.
-   - **Input Monitoring**: turn this on too if Cmd+Tab passthrough does not work when this
+   - **Accessibility**: needed for the remote side to control this Mac, and for Cmd+Tab
+     passthrough when this Mac controls another computer.
+   - **Input Monitoring**: needed together with Accessibility for Cmd+Tab passthrough when this
      Mac controls another computer.
 5. On macOS 15 (Sequoia) and later, macOS asks about once a month whether the app may
    keep recording the screen. Click **Allow**. A host that is left unattended stops
@@ -117,7 +118,7 @@ been tested on hardware.
 | Clipboard files, pasted on this side | Yes | Yes | Yes | Yes |
 | File push, controller to controlled | Yes | Yes | Yes | Yes |
 | Drop a file on a remote window | Yes | Yes, with Accessibility permission | Yes | No. The file stays on the clipboard and a notice shows |
-| Shortcut passthrough (Alt+Tab, Cmd+Tab, Super) | Experimental, off by default. Ctrl+Alt+Del and Win+L cannot be captured | Cmd+Tab, Cmd+Space and Cmd+\` while the session window is focused. Not while Secure Input is on (password fields) | Yes, the window grabs the keyboard | Depends on the compositor. If refused, the app says shortcuts are unsupported here |
+| Shortcut passthrough (Alt+Tab, Cmd+Tab, Super) | Experimental, off by default. Ctrl+Alt+Del and Win+L cannot be captured | Cmd+Tab, Cmd+Space, Cmd+\` and Ctrl+arrows (Spaces, Mission Control) while the session window is focused; Force Quit (Cmd+Option+Esc) always stays local. Not while Secure Input is on (password fields) | Yes, the window grabs the keyboard | Depends on the compositor. If refused, the app says shortcuts are unsupported here |
 | Lock screen (a user is logged in) | Yes, with the Windows service | In scope. Unverified | In scope. Unverified | In scope. Unverified |
 | Login window (nobody logged in) | Yes, with the Windows service | No | No | No |
 | Hardware video encode | Yes (Media Foundation, H.264 and HEVC) | Yes (VideoToolbox, H.264 and HEVC) | Intel and AMD via VA-API, when libva is 2.20 or newer. NVIDIA via NVENC (optional) | Same as X11 |

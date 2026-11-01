@@ -3,7 +3,7 @@
 //! [`platform_api::VideoSurface`] methods. Everything here is lock-free or
 //! behind a short mutex, so the UI thread never waits on the render thread.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Mutex, MutexGuard};
 
@@ -25,6 +25,12 @@ pub struct SurfaceState {
     /// Size of the last presented frame, `w << 32 | h` (0 = none yet). Input
     /// normalization uses it so clicks map over the letterbox rectangle.
     video: AtomicU64,
+    /// The surface has the keyboard: visible, and first responder (or the
+    /// platform's equivalent) in the key / foreground window. Written by the
+    /// UI thread on every focus change; read by the viewer's shortcut hook,
+    /// which runs on its own thread inside an OS input callback and must never
+    /// wait for the UI thread — hence an atomic, not a windowing-system query.
+    key_focus: AtomicBool,
     input: Mutex<InputState>,
     drops: Mutex<Option<Sender<FileDrop>>>,
 }
@@ -95,6 +101,16 @@ impl SurfaceState {
         crate::geometry::normalize(px, py, self.size(), self.video_size())
     }
 
+    pub fn set_key_focus(&self, focused: bool) {
+        self.key_focus.store(focused, Ordering::Release);
+    }
+
+    /// Whether the surface has the keyboard (see the field docs). `false`
+    /// until the UI thread first reports focus.
+    pub fn has_key_focus(&self) -> bool {
+        self.key_focus.load(Ordering::Acquire)
+    }
+
     pub fn input(&self) -> MutexGuard<'_, InputState> {
         lock(&self.input)
     }
@@ -148,6 +164,16 @@ mod tests {
         assert_eq!(s.normalize(500.0, 250.0), (0.5, 0.25));
         s.set_video_size(1000, 500); // letterboxed to y ∈ [250, 750]
         assert_eq!(s.normalize(500.0, 250.0), (0.5, 0.0));
+    }
+
+    #[test]
+    fn key_focus_starts_off_and_follows_the_ui_thread() {
+        let s = SurfaceState::new();
+        assert!(!s.has_key_focus());
+        s.set_key_focus(true);
+        assert!(s.has_key_focus());
+        s.set_key_focus(false);
+        assert!(!s.has_key_focus());
     }
 
     #[test]

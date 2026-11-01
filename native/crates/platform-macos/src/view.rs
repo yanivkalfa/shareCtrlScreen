@@ -30,8 +30,13 @@
 //! * `NSDraggingDestination`: <https://developer.apple.com/documentation/appkit/nsdraggingdestination>
 //! * `NSPasteboard.readObjects(forClasses:options:)` with
 //!   `urlReadingFileURLsOnly`: <https://developer.apple.com/documentation/appkit/nspasteboard/readobjects(forclasses:options:)>
-//! * `NSWindow.didResignKeyNotification`:
-//!   <https://developer.apple.com/documentation/appkit/nswindow/didresignkeynotification>
+//! * `NSWindow.didResignKeyNotification` / `didBecomeKeyNotification`:
+//!   <https://developer.apple.com/documentation/appkit/nswindow/didresignkeynotification>,
+//!   <https://developer.apple.com/documentation/appkit/nswindow/didbecomekeynotification>
+//! * `becomeFirstResponder` (the window's `firstResponder` changes only after
+//!   it returns `true`): <https://developer.apple.com/documentation/appkit/nsresponder/becomefirstresponder()>
+//! * `viewDidHide` / `viewDidUnhide` (also sent when an ancestor hides):
+//!   <https://developer.apple.com/documentation/appkit/nsview/viewdidhide()>
 
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -46,7 +51,8 @@ use objc2_app_kit::{
     NSAutoresizingMaskOptions, NSDragOperation, NSDraggingDestination, NSDraggingInfo, NSEvent,
     NSEventMask, NSEventPhase, NSEventType, NSPasteboardTypeFileURL,
     NSPasteboardURLReadingFileURLsOnlyKey, NSResponder, NSTrackingArea, NSTrackingAreaOptions,
-    NSView, NSWindow, NSWindowDidResignKeyNotification, NSWindowOrderingMode,
+    NSView, NSWindow, NSWindowDidBecomeKeyNotification, NSWindowDidResignKeyNotification,
+    NSWindowOrderingMode,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSDictionary, NSNotification, NSNotificationCenter, NSNumber,
@@ -105,9 +111,22 @@ define_class!(
             true
         }
 
+        #[unsafe(method(becomeFirstResponder))]
+        fn become_first_responder(&self) -> bool {
+            // SAFETY: forwarding the same selector to NSResponder.
+            let accepted: bool = unsafe { msg_send![super(self), becomeFirstResponder] };
+            // `firstResponder` still names the previous responder until this
+            // returns, so publish from what we know rather than re-query.
+            self.publish_key_focus(accepted);
+            accepted
+        }
+
         /// Focus moved to another view: its key-ups will never reach us.
         #[unsafe(method(resignFirstResponder))]
         fn resign_first_responder(&self) -> bool {
+            // Cleared even if the resign were refused: stopping shortcut
+            // capture too early is harmless, capturing for another view is not.
+            self.ivars().state.set_key_focus(false);
             self.ivars().state.input().release_all();
             // SAFETY: forwarding the same selector to NSResponder.
             unsafe { msg_send![super(self), resignFirstResponder] }
@@ -130,29 +149,54 @@ define_class!(
             self.apply_layout();
         }
 
+        /// The view (or an ancestor) was hidden: no keyboard for the remote.
+        #[unsafe(method(viewDidHide))]
+        fn view_did_hide(&self) {
+            self.ivars().state.set_key_focus(false);
+            // SAFETY: forwarding the same selector to NSView.
+            let () = unsafe { msg_send![super(self), viewDidHide] };
+        }
+
+        #[unsafe(method(viewDidUnhide))]
+        fn view_did_unhide(&self) {
+            // SAFETY: forwarding the same selector to NSView.
+            let () = unsafe { msg_send![super(self), viewDidUnhide] };
+            self.publish_key_focus(self.is_first_responder());
+        }
+
         #[unsafe(method(viewWillMoveToWindow:))]
         fn view_will_move_to_window(&self, new_window: Option<&NSWindow>) {
+            let center = NSNotificationCenter::defaultCenter();
+            // SAFETY: AppKit notification-name constants, valid for the
+            // process lifetime.
+            let observed = unsafe {
+                [
+                    (sel!(windowDidResignKey:), NSWindowDidResignKeyNotification),
+                    (sel!(windowDidBecomeKey:), NSWindowDidBecomeKeyNotification),
+                ]
+            };
             if let Some(old) = self.window() {
-                // SAFETY: `self` was registered for exactly this name/object.
-                unsafe {
-                    NSNotificationCenter::defaultCenter().removeObserver_name_object(
-                        self,
-                        Some(NSWindowDidResignKeyNotification),
-                        Some(&old),
-                    );
+                for (_, name) in observed {
+                    // SAFETY: `self` was registered for exactly this name/object.
+                    unsafe { center.removeObserver_name_object(self, Some(name), Some(&old)) };
                 }
             }
             if let Some(new) = new_window {
-                // SAFETY: `windowDidResignKey:` is defined below with the
-                // signature NSNotificationCenter calls (one NSNotification).
-                unsafe {
-                    NSNotificationCenter::defaultCenter().addObserver_selector_name_object(
-                        self,
-                        sel!(windowDidResignKey:),
-                        Some(NSWindowDidResignKeyNotification),
-                        Some(new),
-                    );
+                for (selector, name) in observed {
+                    // SAFETY: both selectors are defined below with the
+                    // signature NSNotificationCenter calls (one NSNotification).
+                    unsafe {
+                        center.addObserver_selector_name_object(
+                            self,
+                            selector,
+                            Some(name),
+                            Some(new),
+                        );
+                    }
                 }
+            } else {
+                // Leaving the window altogether: nothing to have focus in.
+                self.ivars().state.set_key_focus(false);
             }
             // SAFETY: forwarding the same selector to NSView.
             let () = unsafe { msg_send![super(self), viewWillMoveToWindow: new_window] };
@@ -162,7 +206,17 @@ define_class!(
         /// not change, but key-ups now go to the other app.
         #[unsafe(method(windowDidResignKey:))]
         fn window_did_resign_key(&self, _notification: &NSNotification) {
+            // WHY first: this is the "click away is a guaranteed escape" edge
+            // of the shortcut hook — from here on Cmd+Tab is local again.
+            self.ivars().state.set_key_focus(false);
             self.ivars().state.input().release_all();
+        }
+
+        /// Back in front (a click, or Cmd+Tab to us): the shortcut hook may
+        /// capture again if the view still holds the keyboard.
+        #[unsafe(method(windowDidBecomeKey:))]
+        fn window_did_become_key(&self, _notification: &NSNotification) {
+            self.publish_key_focus(self.is_first_responder());
         }
 
         /// Keys reach these only when the key monitor let them through (no
@@ -461,10 +515,7 @@ impl VideoView {
         let ours = event
             .window(self.mtm())
             .is_some_and(|w| Retained::as_ptr(&w) == Retained::as_ptr(&window));
-        let focused = window
-            .firstResponder()
-            .is_some_and(|r| std::ptr::eq(Retained::as_ptr(&r), self.as_responder()));
-        if !ours || !focused || !window.isKeyWindow() {
+        if !ours || !self.is_first_responder() || !window.isKeyWindow() {
             return false;
         }
         let key_code = event.keyCode();
@@ -499,6 +550,25 @@ impl VideoView {
     fn as_responder(&self) -> *const NSResponder {
         let responder: &NSResponder = self;
         responder
+    }
+
+    /// Whether we are our window's first responder (keyboard focus within
+    /// the window, whether or not the window is key).
+    fn is_first_responder(&self) -> bool {
+        self.window()
+            .and_then(|w| w.firstResponder())
+            .is_some_and(|r| std::ptr::eq(Retained::as_ptr(&r), self.as_responder()))
+    }
+
+    /// Publish whether the view has the keyboard, for the shortcut hook's
+    /// thread (`SurfaceState::has_key_focus`). The same three conditions the
+    /// key monitor checks per event in `handle_key`: first responder, in the
+    /// key window (which also means our app is active), and visible.
+    fn publish_key_focus(&self, first_responder: bool) {
+        let focused = first_responder
+            && !self.isHiddenOrHasHiddenAncestor()
+            && self.window().is_some_and(|w| w.isKeyWindow());
+        self.ivars().state.set_key_focus(focused);
     }
 
     fn drag(&self, event: &NSEvent) {
@@ -577,10 +647,7 @@ impl VideoView {
         let Some(window) = self.window() else {
             return;
         };
-        let focused = window
-            .firstResponder()
-            .is_some_and(|r| std::ptr::eq(Retained::as_ptr(&r), self.as_responder()));
-        if !focused {
+        if !self.is_first_responder() {
             return;
         }
         // SAFETY: reading the superview has no preconditions.

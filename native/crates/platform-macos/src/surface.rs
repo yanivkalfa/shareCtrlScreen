@@ -105,6 +105,12 @@ impl MacVideoSurface {
         }))
     }
 
+    /// The state shared with the view; the shortcut hook reads the view's
+    /// keyboard focus and held keys from it without touching AppKit.
+    pub(crate) fn shared_state(&self) -> &Arc<SurfaceState> {
+        &self.state
+    }
+
     /// Run `f` on the main thread: at once when already there, otherwise
     /// queued and waited for up to [`MAIN_WAIT`] (see the module docs).
     fn on_main(&self, what: &'static str, f: impl FnOnce(&VideoView) + Send + 'static) {

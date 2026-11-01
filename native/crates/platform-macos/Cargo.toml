@@ -71,6 +71,11 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
     "CFDictionary",
     "CFNumber",
     "CFString",
+    # Shortcut event tap (task M6): the tap's port, its run-loop source and
+    # the bounded `CFRunLoopRunInMode` (which takes a `CFTimeInterval`).
+    "CFDate",
+    "CFMachPort",
+    "CFRunLoop",
 ] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
     "std",
@@ -83,6 +88,7 @@ objc2-core-graphics = { version = "0.3.2", default-features = false, features = 
     "CGError",
     "CGEvent",
     # Input injection (task M5): event creation, its source and key codes.
+    # `CGEventTypes` also gives the shortcut tap (task M6) its masks and flags.
     "CGEventSource",
     "CGEventTypes",
     "CGRemoteOperation",

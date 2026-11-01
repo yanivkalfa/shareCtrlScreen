@@ -38,7 +38,7 @@ sharectrl-service.exe --install-service
      clicked **Don't Allow** earlier, turn it on here. macOS asks only once.
    - **Accessibility**: needed so the remote side can control this Mac, and for Cmd+Tab
      passthrough when this Mac controls another.
-   - **Input Monitoring**: turn this on too if Cmd+Tab passthrough does not work when this
+   - **Input Monitoring**: needed together with Accessibility for Cmd+Tab passthrough when this
      Mac controls another computer.
 5. On macOS 15 (Sequoia) and later, macOS asks about once a month whether ShareCtrlScreen
    may bypass the system private window picker. The text is "...is requesting to bypass

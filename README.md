@@ -261,10 +261,14 @@ publishes nothing. To build this machine's assets locally the same way, run
   installer) sets that flag on the host it launches, so Alt+Tab switches windows
   and the Windows key opens Start on a service-installed host. A host you start
   yourself — from Program Files or the portable copy — does not get the flag; the
-  shortcuts are still captured locally but the host's shell ignores them. The host
-  logs which case applies on startup (`UIAccess: granted` / `UIAccess: not
-  granted — <reason>` in `app.log`), and `sharectrl.exe --print-uiaccess` prints
-  that line and exits 0 (granted) or 1 (not).
+  shortcuts are still captured locally but the host's shell ignores them. The
+  running host logs which case applies on startup (`UIAccess: granted` / `UIAccess:
+  not granted — <reason>` in `app.log`) — that is the readout for the host instance
+  the service started. `sharectrl.exe --print-uiaccess` is a separate self-check: it
+  reports the status of that one invocation and exits 0/1. A `sharectrl.exe` you run
+  by hand is a fresh non-service process, so it always reports `not granted` — useful
+  to confirm "not granted", but it becomes a positive self-check only under the signed
+  build (a later release); to confirm a service host is granted, read its `app.log`.
 - **Modifier translation** (default on, ⚙ Settings → Advanced → "Translate modifiers for
   the remote OS"): Mac → Windows/Linux sends Cmd as Ctrl and Cmd+Tab as Alt+Tab, Mac
   Control as Win/Super; Windows/Linux → Mac sends Ctrl as Cmd, Win/Super as Control,

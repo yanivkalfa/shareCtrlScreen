@@ -496,12 +496,27 @@ function renderUpdate() {
   const notes = (lastUpdate.notes || '').trim();
   $('update-notes').textContent = notes;
   $('update-notes').classList.toggle('hidden', notes === '');
+  // A .deb/.rpm Linux install cannot self-update (the feed serves an AppImage, so
+  // the updater rejects the payload). Offer a manual download instead; every other
+  // install keeps the in-app "Update & restart". (task U3)
+  const selfUpdatable = lastUpdate.selfUpdatable !== false;
+  $('update-selfinstall').classList.toggle('hidden', !selfUpdatable);
+  $('update-manual').classList.toggle('hidden', selfUpdatable);
+  if (!selfUpdatable) return;
   // Warn (and relabel the button) before the click when a session is live, so
   // the consequence is explicit — updating closes the app and ends the session.
   $('update-session-warning').classList.toggle('hidden', !sessionLive());
   $('btn-update-install').textContent = sessionLive()
     ? 'End session & update'
     : 'Update & restart';
+}
+
+async function downloadUpdate() {
+  try {
+    await invoke('open_releases_page');
+  } catch (err) {
+    toast(String((err && err.message) || err), 'error');
+  }
 }
 
 async function checkForUpdates(silent) {
@@ -560,6 +575,7 @@ listen('updater-progress', (e) => {
 // ---- wiring ----------------------------------------------------------------
 $('btn-update-check').addEventListener('click', () => checkForUpdates(false));
 $('btn-update-install').addEventListener('click', installUpdate);
+$('btn-update-download').addEventListener('click', downloadUpdate);
 $('btn-settings-permissions').addEventListener('click', () => openPermissions(''));
 $('btn-permissions-close').addEventListener('click', closePermissions);
 $('btn-settings').addEventListener('click', openSettings);

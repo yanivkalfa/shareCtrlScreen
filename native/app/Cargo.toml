@@ -25,6 +25,11 @@ tauri = { version = "2", features = [] }
 # desktop-only. tauri-plugin-process backs the webview relaunch the updater uses.
 tauri-plugin-updater = "2.14.1"
 tauri-plugin-process = "2.4.0"
+# Opens the releases page in the system browser for a non-self-updatable Linux
+# .deb/.rpm install (task U3). Smallest reliable cross-platform opener; MIT
+# (already in the deny/about allow-lists). `that_detached` does not wait on the
+# browser process.
+open = "5"
 serde = { workspace = true }
 serde_json.workspace = true
 tokio = { workspace = true }

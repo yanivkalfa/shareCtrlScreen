@@ -18,6 +18,10 @@ elevation = { path = "../crates/elevation" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+# AUTOSTART_FLAG: the host the service launches is the sign-in instance.
+platform-api = { path = "../crates/platform-api" }
+
 [target.'cfg(windows)'.dependencies.windows]
 workspace = true
 features = [

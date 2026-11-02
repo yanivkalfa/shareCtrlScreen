@@ -4904,6 +4904,7 @@ name = "service"
 version = "2.1.4"
 dependencies = [
  "elevation",
+ "platform-api",
  "tracing",
  "tracing-subscriber",
  "windows 0.62.2",

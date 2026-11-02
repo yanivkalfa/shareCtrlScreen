@@ -10,6 +10,24 @@
 //! The consequence worth knowing: this starts the app **at logon**, not at boot.
 //! Reaching a machine that has restarted but not been logged into needs the
 //! SYSTEM service path instead, which is a different mechanism entirely.
+//!
+//! ## When the service is installed (task W4)
+//!
+//! The SYSTEM service launches the host into every session it sees, so with
+//! the service present the Run entry would start a SECOND host at each
+//! sign-in. The service therefore owns sign-in whenever
+//! [`elevation::service::ServiceStatus::owns_sign_in`] says so, and then:
+//! no Run entry is created, an existing one is removed (at startup and when
+//! the setting is saved), and saving the setting still succeeds (the UI sends
+//! it with every save; refusing would block unrelated settings). The saved
+//! value is kept, so the Run entry comes back by itself if the service is
+//! removed. A query failure counts as "no service": the Run key then behaves
+//! as it always did, which is never worse than before W4.
+//!
+//! ## References
+//!
+//! * Run and RunOnce registry keys:
+//!   <https://learn.microsoft.com/windows/win32/setupapi/run-and-runonce-registry-keys>
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::ERROR_SUCCESS;
@@ -89,34 +107,57 @@ pub fn is_enabled() -> bool {
 
 /// Register or unregister. Returns a human-readable error for the UI on failure
 /// rather than failing silently — a startup toggle that quietly does nothing is
-/// worse than one that says why.
+/// worse than one that says why. With the service owning sign-in, "on" removes
+/// any entry instead of writing one (module docs).
 pub fn set_enabled(on: bool) -> Result<(), String> {
-    if !on {
-        let Some(key) = open_run_key(KEY_SET_VALUE) else {
-            return Err("cannot open the Run registry key".into());
-        };
-        // SAFETY: valid key handle; closed on both paths.
-        let rc = unsafe {
-            let rc = RegDeleteValueW(key, VALUE_NAME);
-            let _ = RegCloseKey(key);
-            rc
-        };
-        // Already absent is success, not failure.
-        return match rc {
-            r if r == ERROR_SUCCESS => Ok(()),
-            r if r == windows::Win32::Foundation::ERROR_FILE_NOT_FOUND => Ok(()),
-            r => Err(format!(
-                "could not remove the startup entry (error {})",
-                r.0
-            )),
-        };
+    if on && service_owns_sign_in() {
+        tracing::info!(
+            "start at sign-in: the ShareCtrlScreen service starts the host at sign-in; \
+             no per-user Run entry is written"
+        );
+        return remove_entry();
     }
+    if on {
+        write_entry()
+    } else {
+        remove_entry()
+    }
+}
 
-    let cmd = desired_command().ok_or("cannot determine this program's path")?;
+/// Delete our Run value. Already absent is success.
+fn remove_entry() -> Result<(), String> {
     let Some(key) = open_run_key(KEY_SET_VALUE) else {
         return Err("cannot open the Run registry key".into());
     };
-    let wide = to_utf16(&cmd);
+    // SAFETY: valid key handle; closed on both paths.
+    let rc = unsafe {
+        let rc = RegDeleteValueW(key, VALUE_NAME);
+        let _ = RegCloseKey(key);
+        rc
+    };
+    match rc {
+        r if r == ERROR_SUCCESS => Ok(()),
+        r if r == windows::Win32::Foundation::ERROR_FILE_NOT_FOUND => Ok(()),
+        r => Err(format!(
+            "could not remove the startup entry (error {})",
+            r.0
+        )),
+    }
+}
+
+/// Write our Run value with [`desired_command`].
+fn write_entry() -> Result<(), String> {
+    let cmd = desired_command().ok_or("cannot determine this program's path")?;
+    write_value(&cmd)?;
+    tracing::info!("autostart registered: {cmd}");
+    Ok(())
+}
+
+fn write_value(cmd: &str) -> Result<(), String> {
+    let Some(key) = open_run_key(KEY_SET_VALUE) else {
+        return Err("cannot open the Run registry key".into());
+    };
+    let wide = to_utf16(cmd);
     // REG_SZ data is the UTF-16 bytes INCLUDING the terminating NUL.
     let bytes: &[u8] =
         // SAFETY: reinterpreting a u16 slice as bytes; length is exact and the
@@ -129,7 +170,6 @@ pub fn set_enabled(on: bool) -> Result<(), String> {
         rc
     };
     if rc == ERROR_SUCCESS {
-        tracing::info!("autostart registered: {cmd}");
         Ok(())
     } else {
         Err(format!(
@@ -139,7 +179,49 @@ pub fn set_enabled(on: bool) -> Result<(), String> {
     }
 }
 
-/// Re-point the registered command at this executable if it has moved.
+/// Whether the SYSTEM service, not the Run key, starts the host at sign-in.
+fn service_owns_sign_in() -> bool {
+    match elevation::service::query() {
+        Ok(status) => status.owns_sign_in(),
+        Err(e) => {
+            tracing::warn!("service state unknown ({e}); treating it as not installed");
+            false
+        }
+    }
+}
+
+/// What [`reconcile`] does to the Run entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunEntry {
+    Keep,
+    Write,
+    Remove,
+}
+
+/// The reconcile decision, pure so it can be tested without the registry or
+/// the SCM. `current` is the registered command, `desired` the one this
+/// executable would register.
+fn plan(
+    want: bool,
+    service_owns_sign_in: bool,
+    current: Option<&str>,
+    desired: Option<&str>,
+) -> RunEntry {
+    match (service_owns_sign_in, want, current) {
+        // The service starts the host; any Run entry would be a second host.
+        (true, _, Some(_)) => RunEntry::Remove,
+        (true, _, None) => RunEntry::Keep,
+        // A stale path fails silently at logon: re-point it.
+        (false, true, Some(existing)) if Some(existing) != desired => RunEntry::Write,
+        (false, true, Some(_)) => RunEntry::Keep,
+        (false, true, None) => RunEntry::Write,
+        // Setting is off but an entry lingers (e.g. edited config by hand).
+        (false, false, Some(_)) => RunEntry::Remove,
+        (false, false, None) => RunEntry::Keep,
+    }
+}
+
+/// Make the Run entry match the setting and the service (startup).
 ///
 /// The recorded path goes stale whenever the app is updated, reinstalled or run
 /// from a different build directory, and a stale Run entry fails silently at
@@ -147,25 +229,34 @@ pub fn set_enabled(on: bool) -> Result<(), String> {
 /// setting keeps meaning what it says.
 pub fn reconcile(should_be_enabled: bool) {
     let current = current_command();
-    match (should_be_enabled, current) {
-        (true, Some(existing)) => {
-            if Some(&existing) != desired_command().as_ref() {
+    let service = service_owns_sign_in();
+    let desired = desired_command();
+    match plan(
+        should_be_enabled,
+        service,
+        current.as_deref(),
+        desired.as_deref(),
+    ) {
+        RunEntry::Keep => {}
+        RunEntry::Write => {
+            if current.is_some() {
                 tracing::info!("autostart path changed — re-registering");
-                if let Err(e) = set_enabled(true) {
-                    tracing::warn!("autostart re-registration failed: {e}");
-                }
             }
-        }
-        (true, None) => {
-            if let Err(e) = set_enabled(true) {
+            if let Err(e) = write_entry() {
                 tracing::warn!("autostart registration failed: {e}");
             }
         }
-        // Setting is off but an entry lingers (e.g. edited config by hand).
-        (false, Some(_)) => {
-            let _ = set_enabled(false);
+        RunEntry::Remove => {
+            if service {
+                tracing::info!(
+                    "removing the per-user Run entry: the ShareCtrlScreen service starts \
+                     the host at sign-in"
+                );
+            }
+            if let Err(e) = remove_entry() {
+                tracing::warn!("autostart removal failed: {e}");
+            }
         }
-        (false, None) => {}
     }
 }
 
@@ -185,20 +276,42 @@ mod tests {
     }
 
     #[test]
-    fn enable_then_disable_roundtrips() {
-        // Touches the real per-user Run key, then restores the prior state.
-        let was = is_enabled();
-        if set_enabled(true).is_err() {
+    fn write_then_remove_roundtrips() {
+        // Touches the real per-user Run key, then restores the exact prior value.
+        let was = current_command();
+        if write_entry().is_err() {
             return; // locked-down registry — not a test failure
         }
         assert!(is_enabled());
         assert_eq!(current_command(), desired_command());
-        set_enabled(false).expect("removal should succeed");
+        remove_entry().expect("removal should succeed");
         assert!(!is_enabled());
         // Removing something already absent must be a no-op, not an error.
-        set_enabled(false).expect("second removal is a no-op");
-        if was {
-            let _ = set_enabled(true);
+        remove_entry().expect("second removal is a no-op");
+        if let Some(original) = was {
+            write_value(&original).expect("restore the original entry");
         }
+    }
+
+    const OLD: Option<&str> = Some(r#""C:\old\sharectrl.exe" --autostart"#);
+    const NEW: Option<&str> =
+        Some(r#""C:\Program Files\ShareCtrlScreen\sharectrl.exe" --autostart"#);
+
+    #[test]
+    fn with_the_service_any_entry_goes_and_none_is_written() {
+        for want in [true, false] {
+            assert_eq!(plan(want, true, OLD, NEW), RunEntry::Remove, "want={want}");
+            assert_eq!(plan(want, true, NEW, NEW), RunEntry::Remove, "want={want}");
+            assert_eq!(plan(want, true, None, NEW), RunEntry::Keep, "want={want}");
+        }
+    }
+
+    #[test]
+    fn without_the_service_the_entry_follows_the_setting() {
+        assert_eq!(plan(true, false, None, NEW), RunEntry::Write);
+        assert_eq!(plan(true, false, OLD, NEW), RunEntry::Write);
+        assert_eq!(plan(true, false, NEW, NEW), RunEntry::Keep);
+        assert_eq!(plan(false, false, OLD, NEW), RunEntry::Remove);
+        assert_eq!(plan(false, false, None, NEW), RunEntry::Keep);
     }
 }

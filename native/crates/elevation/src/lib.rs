@@ -12,7 +12,8 @@
 //!   * follow the input desktop (`OpenInputDesktop` → `GetUserObjectInformation`
 //!     → `SetThreadDesktop`) so the secure desktop / UAC prompt can be captured
 //!     and clicked,
-//!   * install / uninstall the service.
+//!   * install / start / stop / uninstall / query the service (the NSIS
+//!     installer's hooks drive these through `sharectrl-service.exe`).
 //!
 //! Honest limitations (documented, §8b): cannot silently bypass UAC (the local
 //! user must click a real consent prompt if credentials are required); DRM stays
@@ -27,6 +28,11 @@ pub mod session;
 
 pub use desktop::InputDesktopFollower;
 pub use session::{active_console_session, launch_in_session, user_token, SessionError};
+
+/// Passed by the service to the host it launches into the user session, so
+/// that host knows it is THE host of the session and other launches defer to
+/// it (`platform_windows::instance`, task W4).
+pub const SERVICE_HOST_FLAG: &str = "--service-host";
 
 /// Encode a Rust `&str` as a NUL-terminated UTF-16 buffer for `PCWSTR`/`PWSTR`.
 pub(crate) fn wide(s: &str) -> Vec<u16> {

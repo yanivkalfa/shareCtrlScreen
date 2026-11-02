@@ -40,6 +40,8 @@ native/third-party-licenses.html
 # Third-party notices generated per OS by native/scripts/release-assets.sh. Never
 # committed: a checked-in copy goes stale with every Cargo.lock change.
 native/app/THIRD-PARTY-LICENSES.html
+# The service binary staged for the Windows installer by release-assets.sh (task W4).
+native/app/service-bin/
 native/app/gen/schemas/
 
 # Cisco's OpenH264 binary must reach users only as a separate download from

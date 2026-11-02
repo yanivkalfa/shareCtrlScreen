@@ -75,17 +75,35 @@ It prints avg / p50 / p95 / max per stage and exits non-zero when p95 of encode 
 decode misses the §2 target (capture is printed but not gated: it includes waiting
 for the screen to change).
 
-## Install (§8b, §10)
+## Install (§8b, §10, task W4)
+
+The NSIS installer does this for you: it bundles `sharectrl-service.exe` next to
+`sharectrl.exe` in `$INSTDIR` and its hooks (`app/installer-hooks.nsh`) register and start
+the service, stop/restart it across an upgrade, and stop+remove it on uninstall. The
+service binary's commands, which those hooks drive and which also serve a manual install of
+the standalone asset (admin terminal):
 
 ```sh
-sharectrl-service.exe --install-service     # admin, once — registers LocalSystem service
-sharectrl-service.exe --uninstall-service   # admin
+sharectrl-service.exe --install-service     # register LocalSystem service (re-point if present) and start it
+sharectrl-service.exe --start-service        # start, wait until RUNNING
+sharectrl-service.exe --stop-service         # stop, wait until the service process has exited
+sharectrl-service.exe --uninstall-service    # stop, then remove
 ```
+
+Each prints one line and exits 0 on success, non-zero with a readable reason otherwise (the
+installer surfaces that line and gates on the exit code). `--install-service` refuses unless
+`sharectrl.exe` is in the same folder: the service launches the host from its own directory.
 
 The service is mandatory to reach the secure desktop (UAC / lock / login). UIAccess is
 deliberately **not** used, so the app runs **unsigned** — the only cost is a first-install
 SmartScreen "Run anyway" prompt (§8b/§11.4). No code-signing certificate, no codec
 license, no cloud bill: `$0` to build and ship (§11.4).
+
+One host per session (W4): the service launches the host with `--autostart --service-host`,
+so it is the session's single host and comes up minimized. While the service is installed
+the app does not add its per-user "Start with Windows" Run entry (it would be a second
+host), and a user-launched `sharectrl.exe` that finds the service's host running raises that
+window and exits (`crates/platform-windows/src/instance.rs`).
 
 ## macOS install
 

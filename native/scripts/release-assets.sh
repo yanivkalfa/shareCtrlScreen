@@ -39,7 +39,18 @@
 # same file is also attached to the release. It is generated, never committed: a checked-in
 # copy would be stale after every Cargo.lock change.
 #
+# Windows service (task W4): the installer carries sharectrl-service.exe next to
+# sharectrl.exe and registers + starts it (installer-hooks.nsh). The build stages the
+# binary at native/app/service-bin/bin/ (git-ignored) with `cargo install --root`, a fixed
+# path the Windows-only overlay tauri.windows-release.conf.json (second `--config`,
+# merged after tauri.release.conf.json, objects merged key by key) names as a bundle
+# resource and that installer-hooks.nsh embeds. Overlays, not tauri.conf.json: tauri-build
+# checks resources at compile time, so a plain `cargo build` without the staged binary
+# must not see them.
+#
 # References
+#   - cargo install (`--path`, `--root`, `--no-track`, `--force`, CARGO_TARGET_DIR as
+#     the build directory): https://doc.rust-lang.org/cargo/commands/cargo-install.html
 #   - Tauri CLI `build` (`--bundles`, `--target universal-apple-darwin`, `--config`, and
 #     `-- <args>` passed to cargo): https://v2.tauri.app/reference/cli/#build
 #   - Tauri bundle resources: https://v2.tauri.app/develop/resources/
@@ -98,9 +109,15 @@ build_steps() {
   case "$os" in
     windows)
       echo "$about --target x86_64-pc-windows-msvc --output-file THIRD-PARTY-LICENSES.html ../about.hbs"
-      # The SYSTEM service is a separate binary, not part of the Tauri bundle.
-      echo "cargo build -p service --release --locked"
-      echo "$tauri --bundles nsis -- --locked"
+      # The SYSTEM service ships INSIDE the installer (task W4): `cargo install` builds
+      # it with the release profile and copies it to native/app/service-bin/bin/, a
+      # fixed path whatever CARGO_TARGET_DIR is, where tauri.windows-release.conf.json
+      # (bundle resource -> $INSTDIR\sharectrl-service.exe) and installer-hooks.nsh
+      # (the copy that stops an older service before an upgrade) pick it up.
+      # --no-track: no .crates.toml bookkeeping in service-bin; --force: overwrite the
+      # previous build's copy.
+      echo "cargo install --path ../service --root service-bin --locked --no-track --force"
+      echo "$tauri --config tauri.windows-release.conf.json --bundles nsis -- --locked"
       ;;
     macos)
       echo "$about --target aarch64-apple-darwin --target x86_64-apple-darwin --output-file THIRD-PARTY-LICENSES.html ../about.hbs"
@@ -120,6 +137,16 @@ run_build() {
     # The AppImage tooling Tauri downloads is itself an AppImage; GitHub runners (and
     # containers, WSL) have no FUSE, so let it extract itself instead of mounting.
     export APPIMAGE_EXTRACT_AND_RUN=1
+  fi
+  if [[ -z "${CARGO_TARGET_DIR:-}" ]]; then
+    # cargo's own default for this workspace, made explicit: `cargo install` would
+    # otherwise build in a throwaway directory and recompile everything it shares
+    # with the other steps. cargo needs a native path on Windows (Git Bash: /c/x -> C:\x).
+    CARGO_TARGET_DIR="$native/target"
+    if command -v cygpath >/dev/null 2>&1; then
+      CARGO_TARGET_DIR="$(cygpath -w "$CARGO_TARGET_DIR")"
+    fi
+    export CARGO_TARGET_DIR
   fi
   local line
   local -a cmd
@@ -161,6 +188,7 @@ summary() {
 
 package_windows() {
   local bundle="$target_dir/release/bundle/nsis" setup
+  local service="$app_dir/service-bin/bin/sharectrl-service.exe"
   setup="$(one_file "$bundle" "ShareCtrlScreen_${version}_*-setup.exe")"
   # tauri-build copies bundle resources next to the binary; a missing copy means the
   # release overlay was not applied and the installer lacks the notices.
@@ -168,12 +196,20 @@ package_windows() {
     echo "error: THIRD-PARTY-LICENSES.html was not bundled (build without tauri.release.conf.json?)" >&2
     return 1
   }
+  # The staged service (task W4). That the installer really carries it and registers it
+  # is proven by installing it: native-ci.yml, job windows-installer.
+  [[ -f "$service" ]] || {
+    echo "error: $service missing; run the build phase first" >&2
+    return 1
+  }
   cp "$setup" "$dist/"
   # The bare app binary ships too, under its build name: a portable copy for people who
   # run it from a folder instead of installing (it is the same file the installer puts
   # in Program Files; it needs the WebView2 runtime, present on Windows 10/11).
   cp "$target_dir/release/sharectrl.exe" "$dist/"
-  cp "$target_dir/release/sharectrl-service.exe" "$dist/"
+  # The standalone service, for manual installs next to a portable sharectrl.exe; it is
+  # the very file the installer carries.
+  cp "$service" "$dist/"
 }
 
 package_macos() {

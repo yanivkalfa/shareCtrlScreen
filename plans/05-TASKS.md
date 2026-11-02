@@ -51,8 +51,13 @@
 | D8 modifier translation | **done** (Opus, Opus-reviewed; I2 device pass pending) | viewer-side `KeyTranslator` (`engine/src/modifiers.rs`): Cmd ↔ Ctrl swap and Cmd+Tab→Alt+Tab (Mac → PC), Ctrl ↔ Cmd and Alt+Tab→Cmd+Tab (PC → Mac), sent-code tracking; host OS via new optional `connect-response.os`; `translateModifiers` toggle (default on) in Settings → Advanced; unit + loopback-tested. **Device-pending** (I2 Mac↔Windows); closes M6's blocked Cmd+Tab line |
 | M12 take every Cmd shortcut (macOS viewer) | **done** (Opus, Opus-reviewed, merged 99ed737; type-checked for aarch64-apple-darwin, device-pending) | M6 tap takes every Cmd chord + Ctrl+arrows while the video has the keyboard; Cmd+Q stays local (tap and key monitor); Force Quit / Lock Screen never claimed; every modifier synchronised before a taken key; hook keys now share the surface's FIFO input channel (D8 ordering risk closed); focus loss releases at once. Also: toolbar-reveal diagnostics + layer-frame sync + full-screen cover (owner's "top edge does nothing"). **Device-pending** (checklists/M6.md §6–§7) |
 | D9 host cursor sprite on the viewer | **done** (Opus, Opus-reviewed; device-pending I1–I3: real cursor images incl. I-beam in a terminal) | additive cursor-shape message, host sends on change, viewer draws the real sprite at position−hotspot in both presenters; replaces the synthetic triangle |
+<<<<<<< HEAD
 | W4 installer bundles + registers the SYSTEM service | **in progress** (Opus) | NSIS hooks install/start/stop/uninstall `sharectrl-service.exe` next to `sharectrl.exe`; one host instance rule; CI silent install/uninstall job |
 | W5 UIAccess (Alt+Tab / Win key passthrough) | **in progress** (Opus; rebases onto W4) | route (a) only: the service sets `TokenUIAccess` (SeTcb) on the host token; `--print-uiaccess`; startup log line. Signed route deferred to W6 (see the card) |
+=======
+| W4 installer bundles + registers the SYSTEM service | **in review** (Opus; branch `task/W4`; Rust lane-proven, installer by new CI job only, device pass pending) | NSIS hooks install/start/stop/uninstall `sharectrl-service.exe` next to `sharectrl.exe`; one host instance rule; CI silent install/upgrade/uninstall job. Acceptance narrowed: service setup + one instance + standalone asset; elevated-window control is NOT a W4 claim |
+| W5 UIAccess (Alt+Tab / Win key passthrough) | **in progress** (Opus; rebases onto W4) | service sets `TokenUIAccess` (SeTcb) and/or signed `uiAccess="true"` build with self-signed Authenticode + Trusted Root import by the installer; `--print-uiaccess`; startup log line |
+>>>>>>> 9ca08e3 (W4: installer bundles, registers and starts the SYSTEM service)
 | T4 Wayland CI | **done** (Haiku, Opus-reviewed; jobs unverified until pushed; GNOME portal tests are device-pass items) | `native-ci.yml` jobs `wayland-sway` (ubuntu-24.04: sway + xdg-desktop-portal-wlr + pipewire + wireplumber; runs L5 `wayland_surface`, L1 `portal_capture --ignored`, and L6 `input::tests` minus uinput and `xtest_*`) and `wayland-gnome` (ubuntu-24.04: mutter 46 + xdg-desktop-portal-gnome; proves the stack, runs no test: the consent dialog has no headless pre-authorization, so the libei and GNOME portal-capture tests are device-pass items). Scripts in `.github/wayland/`. Local (lane, WSL): `wayland_surface` PASS (T4-02); `input::tests` wlroots and EIS pass, uinput fails under REQUIRED as designed (T4-03). Owner verification after the push: see the T4 card |
 | L5 video surface | **done** (Opus, Opus-reviewed; device-pending per checklists/L5.md) | X11: child window of the GTK toplevel on our own x11rb connection, XShape reveal clip, XDND drops via `XdndProxy`, Expose → redraw of the last frame. Wayland: the spike's area+video subsurface tree on GDK's connection (re-attached when GDK re-creates the toplevel surface), `wp_viewporter` crop + fractional scale, drops through GDK's own data device (sink window); decision-#3 separate window when there is no `wp_viewporter` or `SHARECTRL_VIDEO_WINDOW=separate`. Keys from the GTK toplevel on both (keymap: XKB − 8 = evdev). One wgpu presenter (Vulkan, GL fallback) over `surface-wgpu`. Headless tests: `tests/x11_surface.rs` (Xvfb), `tests/wayland_surface.rs` (headless sway). **Device-pending** (checklists/L5.md) |
 | L1 Wayland capture | **done** (Opus, Opus-reviewed) | `portal_capture/`: portal ScreenCast (handshake shared with L12 in `portal_session.rs`, token scope kept: a combined token reopens a combined session) + pipewire-rs 0.10 stream thread, shared-memory BGRx/BGRA first (no modifiers → no DMA-BUF; L1b), cursor + damage metadata, pause/resize → `Lost` → resume; a stream-level failure → rebuild from the token on a background thread (reinit never blocks the host thread on a dialog); "Stop sharing" in the desktop indicator, a declined dialog or an unanswered one (120 s) end the hosted session (terminal, AnyDesk behaviour). The 120 s dialog wait on the host media thread happens only in the first `create_capture`. Monitor chosen in the portal dialog (Wayland `display` ids → `NoOutput`). Build needs `libpipewire-0.3-dev libspa-0.2-dev libclang-dev`. **Device-pending** (checklists/L1.md); acceptance test `tests/portal_capture.rs` (ignored) for T4. **Note for L6:** L6 layers a shared session slot over `portal_session::start(scope, previous, bound, abandon)` and extends `Granted` with the RemoteDesktop proxy; today the capture's `watch()` owns `granted.session` and closes it when the capture drops it. Once shared, that ownership moves into L6's slot, so only the last holder (capture or injector) closes the session. **Done in L6:** `portal_shared.rs` holds the combined session; the capture joins it (`Held::Shared`) when its token is combined, remote control already holds it, or remote control would use the portal, and owns only screen-only sessions itself |
@@ -215,9 +220,72 @@ I1..I4 after all lanes (hardware validation)
   the service exists and is RUNNING (`sc query`) and `sharectrl-service.exe` sits next to
   `sharectrl.exe` under Program Files, then uninstalls silently and asserts the service is
   gone. Unit tests for any new Rust (instance rule, autostart decision).
-* Acceptance: on a real Windows host, one installer run + one UAC consent; afterwards, from
-  the viewer, a UAC prompt and the lock screen are visible AND controllable, one tray
-  instance exists, and uninstall removes the service. Orchestrator smoke on machine A.
+* Acceptance (narrowed 2026-11-02, see As built): on a real Windows host, one installer run
+  sets up the service — it is registered, auto-start and RUNNING afterwards; an upgrade over
+  it leaves it running; uninstall removes it and the folder. Exactly one host instance (a
+  second launch raises the running one and exits). The standalone `sharectrl-service.exe`
+  asset still installs by hand next to a portable `sharectrl.exe`. Whether a service-run host
+  can see/control a UAC prompt or the lock screen is NOT a W4 outcome (the service launches
+  the host with the user's token, unchanged by W4; that capability is tracked separately).
+  Orchestrator smoke on machine A.
+
+* As built (branch `task/W4`, in review; Rust proven in the lane, the installer only by the
+  new CI job — see "not verified"):
+  * **Service lifecycle** (`crates/elevation/src/service.rs`, rewritten): `install` creates
+    the LocalSystem auto-start service, or re-points an existing one with
+    `ChangeServiceConfigW` (upgrade / moved-into-Program-Files), then `StartService` and polls
+    `QueryServiceStatusEx` to RUNNING. `stop` waits for STOPPED **and then for the service
+    process to exit** (`OpenProcess(SYNCHRONIZE)` on the pid from the status), because the SCM
+    reports STOPPED before the process releases its locked `.exe`, which the installer then
+    overwrites/deletes. `uninstall` stops first (DeleteService only marks a running service).
+    `query` + `ServiceStatus::owns_sign_in()` drive the autostart rule and need no admin (the
+    default SD grants every user `QUERY_STATUS`/`QUERY_CONFIG`). Errors name the failed step;
+    `ERROR_ACCESS_DENIED` → an actionable "needs administrator" message; idempotent across
+    fresh install / upgrade / re-install. `service/src/main.rs` exposes
+    `--install/-start/-stop/-uninstall-service`, each printing one line and exiting 0/1 (2 for
+    bad usage) so the NSIS hooks' `nsExec::ExecToLog` surfaces the reason and the exit code
+    gates the install; `--install-service` refuses unless `sharectrl.exe` is beside it.
+  * **Host launch UNCHANGED in substance** (decision 2026-11-02, risk 1): the service still
+    launches the host into the active console session via `WTSQueryUserToken` +
+    `CreateProcessAsUserW` on `winsta0\default` with the user's environment block (§8b
+    invariants intact). The only change is the argument string: `--engine` (which the app
+    never read) → `--autostart --service-host`. `--autostart` because the service instance IS
+    the sign-in autostart, so it comes up minimized; `--service-host` marks it the session's
+    one host. The user token is now closed after the launch (it leaked before).
+  * **Exactly one host per session** (`crates/platform-windows/src/instance.rs`, new): the
+    service host creates a named auto-reset event `Local\ShareCtrlScreen.ServiceHost` (per
+    session; destroyed with its last handle, so no stale lock after a crash) and holds it for
+    life. A later launch opens it: a user launch sets it (after `AllowSetForegroundWindow`),
+    which makes the host unminimize/show/focus, then exits; a sign-in or duplicate service
+    launch exits quietly. With no service present the marker never exists and every launch
+    runs — nothing changes for a serviceless install. The decision table is a pure, unit-
+    tested `decide()`; `app/src/main.rs` runs the gate before logging so a handed-over launch
+    logs to `app-handover.log` instead of truncating the running host's `app.log`.
+  * **Autostart made service-aware** (`crates/platform-windows/src/autostart.rs`): while the
+    service owns sign-in (`owns_sign_in()`), the per-user Run entry is removed and never
+    written — the service is the autostart, a Run entry would be a second host. `set_enabled`
+    still returns `Ok` in that case (the UI sends `startWithWindows` on every Save; erroring
+    would block unrelated settings), the saved bool is kept, so the entry returns by itself if
+    the service is removed. A query failure counts as "no service" (never worse than pre-W4).
+    The write/remove decision is a pure, tested `plan()`.
+  * **Installer** (`native/app/installer-hooks.nsh` + `tauri.windows-release.conf.json`, new):
+    `sharectrl-service.exe` ships as a bundle **resource** (installed next to `sharectrl.exe`
+    in `$INSTDIR`, name preserved) and the `installerHooks` `.nsh` is wired through a Windows-
+    only release overlay (second `--config`, so a plain `cargo build` never sees the resource
+    that tauri-build would check at compile time). PREINSTALL stops an old service (using the
+    NEW exe extracted to `$PLUGINSDIR`; two embedded copies, justified in the `.nsh` header),
+    POSTINSTALL registers+starts, PREUNINSTALL stops+removes (with an `sc.exe` fallback if the
+    exe was deleted by hand). Each step logs to the details pane via `nsExec::ExecToLog` and a
+    failure `Abort`s naming the step; stays `perMachine`. `release-assets.sh` stages the exe
+    with `cargo install --path ../service --root service-bin` (fixed path independent of
+    `CARGO_TARGET_DIR`) and still ships the standalone asset (the same file).
+  * Tests: `elevation` (`owns_sign_in`/state mapping/error mapping, a no-admin `query`);
+    `service` (launch args, host-beside-service, and that `installer-hooks.nsh` names the same
+    service and commands via `include_str!`); `platform-windows` `instance::` (flag parsing,
+    the decision table, a real event claimed/opened/raised/dropped) and `autostart::` (the
+    `plan()` table, a registry round-trip restoring the exact prior value). The installer
+    itself (silent install → service RUNNING + both exes in Program Files → upgrade restarts
+    it → silent uninstall removes service+folder) is the new `windows-installer` CI job.
 
 ### W5 — UIAccess for the Windows host: Alt+Tab / Win key passthrough  (size M, Windows; owner request 2026-11-02; after W4 merges, rebase onto it)
 * **Scope decision 2026-11-02 (orchestrator, after the first research pass):** W5 ships route (a)

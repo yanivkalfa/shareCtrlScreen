@@ -15,8 +15,15 @@ is not code-signed. This is expected.
 1. Click **More info**.
 2. Click **Run anyway**. The installer then continues as usual.
 
-For UAC prompts, the lock screen and the sign-in screen, install the Windows service
-once. Open a terminal as administrator and run:
+The installer sets up the Windows service for you: it puts `sharectrl-service.exe` next to
+the app, then registers and starts the `ShareCtrlScreenHost` service after you approve one
+administrator prompt. That service is what lets the remote side reach UAC prompts, the lock
+screen and the sign-in screen, and it starts the app at every sign-in. Uninstalling removes
+it. You do not need to run anything by hand.
+
+If you run the **portable** `sharectrl.exe` instead of installing, and you want that same
+reach, put the standalone `sharectrl-service.exe` next to it and run this once from a
+terminal opened as administrator (`--uninstall-service` removes it):
 
 ```
 sharectrl-service.exe --install-service

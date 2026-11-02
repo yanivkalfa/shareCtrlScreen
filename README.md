@@ -264,11 +264,15 @@ publishes nothing. To build this machine's assets locally the same way, run
   shortcuts are still captured locally but the host's shell ignores them. The
   running host logs which case applies on startup (`UIAccess: granted` / `UIAccess:
   not granted — <reason>` in `app.log`) — that is the readout for the host instance
-  the service started. `sharectrl.exe --print-uiaccess` is a separate self-check: it
-  reports the status of that one invocation and exits 0/1. A `sharectrl.exe` you run
-  by hand is a fresh non-service process, so it always reports `not granted` — useful
-  to confirm "not granted", but it becomes a positive self-check only under the signed
-  build (a later release); to confirm a service host is granted, read its `app.log`.
+  the service started. `sharectrl.exe --print-uiaccess` is a separate self-check that
+  **prints** that same line for the one invocation you run; a `sharectrl.exe` you run by
+  hand is a fresh non-service process, so it always prints `not granted` — useful to
+  confirm "not granted", a positive self-check only under the signed build (a later
+  release); to confirm a service host is granted, read its `app.log`. Read the printed
+  line, not an exit code from `cmd … & echo %errorlevel%`: `sharectrl.exe` is a GUI-
+  subsystem binary, so cmd does not wait and reports `0` regardless. For the numeric code
+  use PowerShell `(Start-Process sharectrl.exe -ArgumentList '--print-uiaccess' -Wait
+  -PassThru).ExitCode` (0 granted / 1 not).
 - **Modifier translation** (default on, ⚙ Settings → Advanced → "Translate modifiers for
   the remote OS"): Mac → Windows/Linux sends Cmd as Ctrl and Cmd+Tab as Alt+Tab, Mac
   Control as Win/Super; Windows/Linux → Mac sends Ctrl as Cmd, Win/Super as Control,

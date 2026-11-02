@@ -40,12 +40,16 @@ host you start yourself does not get it. To check which case you have, look at t
   yourself (Program Files or the portable copy). Everything else works; only those two
   shell shortcuts stay on your own machine.
 
-`sharectrl.exe --print-uiaccess` is a separate self-check that prints a line and exits 0/1
-for the **invocation you run**, not for the running service host. A `sharectrl.exe` you
-start by hand is a fresh non-service process, so it reports `not granted` even on a working
-service host — read the service host's own `app.log` (above) to confirm it is granted. If
-the service could not set the flag for some reason, it still starts the host and records why
-in `sharectrl-service.log` next to the service executable.
+`sharectrl.exe --print-uiaccess` is a separate self-check that **prints** that same line for
+the **invocation you run**, not for the running service host. A `sharectrl.exe` you start by
+hand is a fresh non-service process, so it prints `not granted` even on a working service
+host — read the service host's own `app.log` (above) to confirm it is granted. Read the
+printed line: `sharectrl.exe` is a GUI-subsystem binary, so `cmd /c "… --print-uiaccess" &
+echo %errorlevel%` prints `0` whatever the result (cmd does not wait for it). For the numeric
+code (0 granted / 1 not), use PowerShell `(Start-Process sharectrl.exe -ArgumentList
+'--print-uiaccess' -Wait -PassThru).ExitCode`. If the service could not set the flag for some
+reason, it still starts the host and records why in `sharectrl-service.log` next to the
+service executable.
 
 ## macOS (13 Ventura or later)
 

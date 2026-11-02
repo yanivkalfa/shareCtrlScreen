@@ -56,6 +56,8 @@
 | W7 uninstaller removes the whole install dir (service log leftover) | **done** (Opus, Opus-reviewed, merged 03d98af; proven by the windows-installer CI job on push) | first windows-installer CI run failed only on uninstall-clean: `sharectrl-service.log` left in Program Files; RMDir /r $INSTDIR in POSTUNINSTALL |
 | U1 in-app updater (check/download/install/restart) | **done** (Opus, Opus-reviewed; device-pending U1.md: real update loop needs two updater-enabled releases) | tauri-plugin-updater 2.14.1 + tauri-plugin-process 2.4.0, updater signing key (orchestrator-created secrets), latest.json generated on the release, Settings UI, service-aware install+restart; TOP priority |
 | W8 service-host fast path (DDA capture + HW encode) | **done** (Opus, Opus-reviewed, merged 0afabeb; capture fast-path implemented, HW-encode fix device-pending hypothesis — checklists/W8.md) | service-launched host loses the fast DDA path + HW encoder → software fallback + media-loop restarts = lag; attach the capture thread (and so the shared device the HW MFT uses) to the active input desktop + reclassify E_ACCESSDENIED as recoverable and retry instead of ending the loop; goal widened to restore capture AND HW encode (owner: was smooth self-launched) |
+| M13 macOS toolbar drawer not shown (reveal fires, strip empty) | **done** (Opus, Opus-reviewed, merged bcf7b6f; type-checked for aarch64-apple-darwin, device-pending checklists/M13.md) | Root cause: `apply_layout` positioned the hosted layer's 40px gap with the parent *view*'s `isFlipped`, but a hosted layer's frame lives in the parent *layer*'s coordinate space, whose geometry flip is independent (wry: unflipped view, geometry-flipped WKWebView layer) — so the gap opened at the wrong visual edge and the video kept covering the toolbar. Fix (view.rs only; shared reveal.rs untouched): drive the layer frame from the parent layer's own `isGeometryFlipped`, so the strip is always at the visual top. Secondary: ignore `mouseExited` reveals mapped more than one bar height above the top (the app.log's y≈-470/-1025 artifacts). M12 reveal logging kept |
+| V1 host overshoots a congested link (video stutter) | **done** (Opus, Opus-reviewed, merged 003fbf8; loopback proves encoder tracks BWE down+up; on-screen smoothness device-pending checklists/V1.md) | ROOT CAUSE (investigation): July 78cd049 raised MIN_BITRATE 400k→2.5M + DESIRED→9M + a raw-BWE source pacer → encoder wont follow BWE down → overshoot→loss→BWE collapse (65↔3700), unpaced keyframe bursts. Fix (As built): MIN_BITRATE→500k + DESIRED→8M so the encoder follows BWE down; a hysteretic resolution ladder (1.0/0.75/0.5/0.33) spends degradation on encode size, fps drops only below the smallest step; the source pacer is removed (str0m paces egress) and forced IDRs no longer bypass it. Owner: Windows went slow when the service came in (lost the fast path → tipped the latent overshoot); Mac/Linux slow from the start |
 | W9 Alt+Tab on a service host | **blocked: need controller app.log** | host UIAccess granted + injects reserved shortcuts, yet Alt+Tab does not switch → controlling-side capture/forward issue (keyhook on a Windows controller, or the Mac tap) |
 | T4 Wayland CI | **done** (Haiku, Opus-reviewed; jobs unverified until pushed; GNOME portal tests are device-pass items) | `native-ci.yml` jobs `wayland-sway` (ubuntu-24.04: sway + xdg-desktop-portal-wlr + pipewire + wireplumber; runs L5 `wayland_surface`, L1 `portal_capture --ignored`, and L6 `input::tests` minus uinput and `xtest_*`) and `wayland-gnome` (ubuntu-24.04: mutter 46 + xdg-desktop-portal-gnome; proves the stack, runs no test: the consent dialog has no headless pre-authorization, so the libei and GNOME portal-capture tests are device-pass items). Scripts in `.github/wayland/`. Local (lane, WSL): `wayland_surface` PASS (T4-02); `input::tests` wlroots and EIS pass, uinput fails under REQUIRED as designed (T4-03). Owner verification after the push: see the T4 card |
 | L5 video surface | **done** (Opus, Opus-reviewed; device-pending per checklists/L5.md) | X11: child window of the GTK toplevel on our own x11rb connection, XShape reveal clip, XDND drops via `XdndProxy`, Expose → redraw of the last frame. Wayland: the spike's area+video subsurface tree on GDK's connection (re-attached when GDK re-creates the toplevel surface), `wp_viewporter` crop + fractional scale, drops through GDK's own data device (sink window); decision-#3 separate window when there is no `wp_viewporter` or `SHARECTRL_VIDEO_WINDOW=separate`. Keys from the GTK toplevel on both (keymap: XKB − 8 = evdev). One wgpu presenter (Vulkan, GL fallback) over `surface-wgpu`. Headless tests: `tests/x11_surface.rs` (Xvfb), `tests/wayland_surface.rs` (headless sway). **Device-pending** (checklists/L5.md) |
@@ -599,6 +601,158 @@ I1..I4 after all lanes (hardware validation)
       `adapters::access_denials_are_recoverable_backend_errors_are_terminal`. Device-only (W8.md): that a
       service install uses DuplicateOutput1 AND the hardware encoder (no "software encoder (CPU)" line), the
       session is smooth, and capture recovers across a UAC/lock transition.
+
+### M13 — macOS: the toolbar drawer does not appear although the reveal fires  (size S–M, macOS; owner report + Mac app.log 2026-11-02)
+* Problem: on the macOS viewer the top-edge drawer (the web UI toolbar with End Session / Disconnect) never
+  comes down, although M12's reveal instrumentation proves the NATIVE side works. Mac app.log
+  (`/Users/avrumy/Library/Logs/ShareCtrlScreen/app.log`, 2026-11-02, connected to a Linux host):
+    - `platform_macos::view: video view: pointer events arrive (first move at y=526.1px)` — events DO reach the view.
+    - `toolbar reveal: Reveal at y=-9.3px (scale 2, system cover 0px); view frame … height 894.0, layer frame …
+      height 894.0` then `Hide at y=161.2px; view frame … height 934.0, layer frame … height 934.0`.
+  So on Reveal BOTH the video view AND its layer shrink by 40 px (934→894) to open the strip, and Hide restores
+  it. The native reveal + layer-frame sync (M12) are correct. Yet the user sees no drawer. => The 40 px strip the
+  reveal opens is NOT showing the web toolbar underneath on macOS. This is the "layer does not reveal the webview"
+  gap, macOS-specific; on Windows the same web drawer works.
+* Likely cause (builder to confirm against the view hierarchy): the native video child view sits over wry's
+  `WryWebViewParent`; when it shrinks 40 px from the top, the webview (which renders the toolbar) must be visible
+  in that strip. It is not — candidates: the video view/layer is not actually the TOP-most in that strip (z-order),
+  or its background is opaque where it shrank, or the webview's toolbar is positioned/clipped so nothing shows in
+  the first 40 px on macOS, or the shrink happens on the wrong axis (macOS is bottom-left origin — the 40 px may be
+  opening at the BOTTOM, not the top, so the drawer region is exposed where the toolbar isn't). The last is the
+  strongest suspect: y is bottom-origin on macOS; confirm the strip opens at the visual TOP, not the bottom.
+* Deliverable: on macOS, a reveal actually exposes the web toolbar at the visual top of the video. Whatever the
+  cause: fix the axis/origin if the strip opens at the wrong edge; ensure the webview (toolbar) is drawn in the
+  revealed strip (z-order / clear background there); make Hide restore it exactly. The End Session / Disconnect
+  buttons must be clickable in the revealed strip. Keep the Windows/Linux reveal behaviour unchanged (M12/surface
+  reveal.rs is shared — scope the change to the macOS view/layout only, or prove the shared change is safe on all).
+* Secondary (same log, lower priority, fold in if cheap): spurious reveals at extreme y (`Reveal at y=-470px`,
+  `y=-1025px`; `Hide at y=568px`) — the pointer-y maps to large out-of-range values when near/over the top edge, so
+  the bar sometimes toggles on a flick far from the edge. Clamp/validate the mapped y (the `exited_through_top`
+  band) so only a genuine top-edge hover toggles. Do not let this delay the main fix.
+* Tests: pure reveal/axis math unit-tested in surface-wgpu/view where possible; the real proof is on a Mac
+  (checklist M13.md: connect, hover the top edge, the drawer with End Session comes down and is clickable, moving
+  away hides it; windowed and full-screen; the extreme-y flick no longer toggles spuriously).
+* Acceptance (device, Mac viewer): the drawer appears on a top-edge hover and End Session works; app.log still
+  shows the Reveal/Hide lines (unchanged) but now the user SEES the bar. Checklist plans/checklists/M13.md.
+* Note: this is independent of the Mac→Linux video lag (that is a TURN-relay bandwidth problem, ~220 kbps, tracked
+  separately — NOT this card).
+* **As built (branch `task/M13`, in review; type-checked + clippy-clean for aarch64-apple-darwin, the workspace
+  suite passes on Windows and WSL; device-pending, checklists/M13.md):**
+  * Root cause (macOS-specific, in `platform-macos/src/view.rs::apply_layout`): the strip is removed from the
+    VISUAL top, and M12 computed one frame — origin from `parent.isFlipped()` — and used it for BOTH the view's
+    frame and the hosted layer's frame. But a view's frame lives in the parent VIEW's coordinate system while a
+    hosted layer's frame lives in the parent LAYER's, and their vertical flips are independent: wry hosts the
+    `WKWebView` in a content view that is unflipped (bottom-left) whose backing layer is geometry-flipped
+    (top-left, how web content lays out). With the view's origin (y=0, bottom-left) the layer's 40px gap opened at
+    the layer's maxY — the VISUAL BOTTOM — so the Metal video kept covering the toolbar at the top and only a
+    useless strip opened at the bottom. The owner's app.log was consistent (both frames shrank 934→894) because
+    only the *edge* the gap came off was wrong, not its size — which is why the reveal and the M12 layer-frame
+    sync looked correct.
+  * Fix: `apply_layout` now computes the layer's frame separately from the view's, taking its origin from the
+    parent LAYER's own `isGeometryFlipped()` (objc2-quartz-core `CALayer::isGeometryFlipped`, safe in 0.3.2), so
+    the gap is always at the visual top whatever the parent layer's flip. The view's frame still uses
+    `parent.isFlipped()` (correct for views). A shared `top_inset_frame(flipped)` closure builds both. A no-op
+    when the two flips agree, so it cannot regress a platform whose view and layer share a flip.
+  * **Device fallback:** if the on-device log shows the parent layer's geometry-flip EQUALS the parent view's
+    flip (the flips agree) and the drawer is STILL hidden, then this fix changed nothing and the cause is NOT the
+    axis — it is elsewhere: z-order (the video view/layer is not top-most in the strip) or the `WKWebView` toolbar
+    not filling the top 40 px. Look there, not at the axis, before another round.
+  * **Shared `surface-wgpu/src/reveal.rs` is untouched** — Windows and Linux reveal exactly as before. The whole
+    change is in the macOS view/layout. `contentsGravity` (pin the picture to the visual bottom so the crop is off
+    the top) is unchanged.
+  * Secondary (app.log spurious toggles `Reveal at y=-470/-1025px`): `mouseExited` now ignores a top exit mapped
+    more than one bar height (`BAR_CSS_PX`) above the edge — a fast-flick coordinate artifact, not a genuine
+    top-edge departure. Exits at or below the edge, and the shared `exited_through_top` flick handling, are
+    unchanged; macOS-scoped (view.rs).
+  * M12's reveal logging is intact (the once-per-show "pointer events arrive" line and the per-transition
+    "toolbar reveal: …" line with the view and layer frames); the layer-sync line now also prints the parent
+    layer's geometry-flip so the owner can confirm the branch taken.
+  * platform-api: no change.
+  * Cannot run on macOS in the lane (no AppKit): type-checked and clippy-clean for aarch64-apple-darwin; the real
+    proof is the owner's Mac (checklists/M13.md).
+
+### V1 — Stop the host overshooting a congested link (restore smooth video, keep it sharp)  (size M, all OSes; owner report 2026-11-02 "mouse stays behind", investigation ac7be488)
+* Problem (ROOT CAUSE, high confidence, diagnosed read-only from two hosts' app.logs + git history):
+  commit 78cd049 (2026-07-27 "video: fix the blur at its source") made the host NOT follow the
+  bandwidth estimate down, creating a self-reinforcing loss loop that stutters on any constrained
+  link (both Windows and Linux hosts show it; the Mac→Linux relay and the Windows software-encode
+  are only amplifiers). Evidence:
+    - `tuning.rs:10` MIN_BITRATE raised 400_000 → **2_500_000**, and `driver.rs:580`
+      `next = bps.clamp(MIN_BITRATE, TARGET_BITRATE)` pins the encoder CBR target at 2.5 Mbps even
+      when BWE reports 65 kbps (logs: `applied ~2500 while bwe 65`).
+    - `tuning.rs:13` DESIRED_BITRATE raised 3_500_000 → **9_000_000** → over-aggressive str0m probe
+      padding on a capacity-limited relay, itself a loss source.
+    - `media/host.rs:240-251` re-introduced a hand-rolled source pacer draining against the RAW BWE
+      estimate (`link`, floored 100 kbps in two places: `driver.rs:572`, `host.rs:240`); because
+      egress is pinned to the current estimate, GCC/TWCC never sees the link could carry more, so a
+      dipped estimate self-sustains (Linux sat ~220 kbps for minutes). At the 100 kbps floor
+      `max_debt≈3125 B` vs a ~10 KB CBR frame → ~1 fps.
+    - `media/host.rs:248` forced keyframes BYPASS the debt gate (`… && !force_key`) → an unpaced
+      multi-second IDR burst into a ~65 kbps link → GCC spikes up then slashes down (the 65↔3778
+      oscillation), loss → PLI (`driver.rs:540-547, 562-565`) → another forced keyframe → loop.
+  The LAST coherent design was commit 352d56d (MIN_BITRATE 400 k, DESIRED 3.5 M, encoder follows BWE
+  down, NO source pacer — str0m's own pacer metered egress). That era was smooth. 78cd049 traded
+  smoothness for sharpness; this card restores smoothness WITHOUT going back to mushy full-res.
+  Keep the one GOOD part of 78cd049: `fps_num = MAX_FPS = 30` (host.rs:117) is correct — do NOT revert it.
+* Deliverable (the complete fix — smooth AND sharp):
+  (1) **Let the encoder follow BWE down.** Lower `MIN_BITRATE` (tuning.rs:10) to ~500_000 (justify the
+      exact value; 400 k was the proven-smooth 352d56d value) so the `driver.rs:580` clamp lets the
+      target track BWE; lower `DESIRED_BITRATE` (tuning.rs:13) to ~`TARGET_BITRATE` (8 M) to stop the
+      padding overshoot. Confirm the encoder-apply path and the `applied {N}`/`bwe {M}` log now TRACK.
+  (2) **Spend the degradation on RESOLUTION, not a bitrate floor, so text stays sharp on a bad link.**
+      Drive a BWE-derived scale into the encoder's `want`/`fit_within()` resolution computation
+      (`media/host.rs:409`, and the live encoder-rebuild path at ~host.rs:185-219 that today reacts
+      only to `view_size`): as `link`/BWE falls, step the encode resolution DOWN (a small ladder, e.g.
+      full → 0.75 → 0.5 → 0.33, with hysteresis so it doesn't flap) and rebuild the encoder at the new
+      size; step back up as BWE recovers. A 600 kbps stream becomes a sharp smaller image, not a mushy
+      full-res one. Reuse the existing rebuild machinery; keep MAX_FPS=30 but allow fps to fall toward
+      MIN_FPS=4 only as a last resort below the smallest resolution step.
+  (3) **Do not let forced keyframes bypass the pacer / overshoot.** `media/host.rs:248`: let str0m pace
+      the IDR packets (it already can) instead of dumping the whole IDR at once; with (1) the IDR is
+      small anyway. Keep the 1/s force-key rate limit and PLI handling.
+  (4) **Reconsider the raw-BWE source pacer.** Prefer leaning on str0m's own pacer (the 352d56d model)
+      rather than the hand-rolled debt pacer; if the hand-rolled pacer is kept for frame-dropping, it
+      must not pin egress so low that BWE can never probe upward (the self-sustain bug). Whatever the
+      choice, a dipped estimate MUST be able to recover.
+* Tests: the loopback harness (engine `--test loopback`) is the proof vehicle — add/extend a test that
+  drives a constrained-then-recovering link and asserts the encoder target TRACKS BWE down and back up
+  (not pinned at MIN_BITRATE) and that no unpaced keyframe burst is emitted; unit-test the pure
+  BWE→resolution-ladder mapping (monotonic, hysteretic). Keep all existing loopback/codec tests green.
+* Acceptance (device, the owner's real sessions): on a constrained link the host log shows
+  `applied` TRACKING `bwe` downward (not pinned ~2500) and the `bwe` value settling instead of the
+  65↔3700 oscillation, fps rising from ~1 to steady; the session feels smooth (no "mouse stays behind")
+  and text is sharp via the smaller resolution, on BOTH a Windows and a Linux host. Checklist
+  plans/checklists/V1.md. Quick one-knob pre-check the owner can eyeball first: with just MIN_BITRATE
+  lowered, `applied` should already start tracking `bwe`.
+* Risks: lowering MIN_BITRATE without the resolution ladder brings back the ORIGINAL blur complaint —
+  (1) and (2) MUST ship together. Slightly slower ramp to 8 M on a fast link (acceptable). Resolution
+  flapping if hysteresis is weak — tune it. No platform-api change expected; if one is needed, STOP and report.
+* **As built (branch `task/V1`, Opus; lane-proven on Windows + WSL, device-pending per checklists/V1.md; NO platform-api change):**
+  All four deliverables shipped together in the engine crate only.
+  (1) `tuning.rs`: `MIN_BITRATE` 2_500_000 → **500_000** (just above the proven-smooth 352d56d 400 k;
+      comfortably carries the smallest ladder step), `DESIRED_BITRATE` 9_000_000 → **8_000_000**
+      (= `TARGET_BITRATE`, no probe padding above the ceiling). The driver's BWE handler was extracted
+      to a pure `tuning::encoder_target(bwe) = bwe.clamp(MIN, TARGET)` + `driver::apply_bwe`, shared by
+      the real and injected estimate; `applied` now TRACKS `bwe` down to the floor (loopback asserts it
+      reaches ≤ 600 k at a 300 k link — never the old 2.5 M — and tracks 2 M and 6 M back up).
+  (2) Resolution ladder in `tuning.rs` (`RESOLUTION_LADDER [1.0, 0.75, 0.5, 0.33]`, `resolution_step`
+      with a down/up hysteresis band, `target_fps` which keeps 30 fps until the smallest step on a
+      sub-floor link then scales to `MIN_FPS`). `media/host.rs` reads the RAW `link` estimate, scales the
+      viewer-sized `want` through `fit_within`, and rebuilds the encoder via the existing resize machinery;
+      fps drives the frame-rate cap. All three functions are pure and unit-tested (monotonic + hysteretic).
+  (3) The `&& !force_key` pacer bypass is gone (the pacer is gone); forced IDRs ride str0m's pacer like any
+      frame. The 1/s `MIN_KEYFRAME_GAP` rate limit + PLI handling are unchanged.
+  (4) The hand-rolled debt source pacer is REMOVED (the 352d56d model: str0m's pacer meters egress). Both
+      100-kbps `link` floors (`driver.rs`, `host.rs`) are removed so a dipped estimate can recover; the raw
+      estimate now flows straight to the ladder.
+  Tests: `tuning.rs` unit tests (clamp tracks + caps; ladder monotonic + hysteretic; fps floor + recovery).
+  A new loopback test `constrained_link_tracks_bwe_down_and_recovers` drives a 300 k → 2 M → 6 M link via a
+  `test-hooks`-gated BWE injector (`Engine::test_*`, cfg'd out of shipping builds) and asserts `applied`
+  tracks down below the old floor and back up, the encode size steps down and recovers, and frames keep
+  flowing with no link-trouble. Resolution is asserted from the host's configured encode size, not the
+  viewer's pixels: the MOCK encoder passes the source frame's dimensions through unchanged (a real encoder
+  resamples to the configured size), so the on-screen resolution drop is device-only (checklists/V1.md).
+  The existing 7 loopback tests and the full workspace suite stay green on Windows and WSL.
 
 ## Lane M — macOS backend (`crates/platform-macos`)
 

@@ -9,6 +9,13 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Loopback-test-only observation + bandwidth injection (see `Engine::test_*`).
+# Off by default, so a shipping build never carries the hooks or the injection
+# path. The engine loopback's constrained-link test requires it:
+#   cargo test -p engine --test loopback --features test-hooks
+test-hooks = []
+
 [dependencies]
 protocol = { path = "../protocol" }
 signaling = { path = "../signaling" }

@@ -773,6 +773,140 @@ async fn windows_viewer_ctrl_c_is_cmd_c_on_a_mac_host() {
     viewer.engine.end_session();
 }
 
+// ---- V1: the host follows the bandwidth estimate down, and back up -------------
+
+/// Drive a constrained-then-recovering link over the real str0m session (via the
+/// `test-hooks` bandwidth injector, since loopback has no congestion of its own)
+/// and prove the V1 fix end to end:
+///   * the encoder's CBR target TRACKS the estimate down to the floor instead of
+///     pinning at the old 2.5 Mbps (the regression) — and tracks a mid value and
+///     back up;
+///   * degradation is spent on RESOLUTION: the host's encode size steps DOWN as
+///     the link falls and back UP as it recovers;
+///   * frames keep flowing throughout (no stall) and neither side reports link
+///     trouble — i.e. no self-sustaining collapse.
+///
+/// Resolution is asserted from the HOST's configured encode size (the ladder's
+/// real output), not the viewer's presented pixels: the mock encoder passes the
+/// captured frame's dimensions straight through (it does not resample to the
+/// configured size the way a real H.264 encoder does), so the viewer always
+/// decodes at the capture size. The viewer side is therefore checked only for
+/// liveness (frames keep arriving); the actual on-screen resolution drop is
+/// covered by the device checklist (plans/checklists/V1.md).
+#[cfg(feature = "test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn constrained_link_tracks_bwe_down_and_recovers() {
+    let relay = start_relay().await;
+    let host = start_peer("bwe-host", &relay);
+    let viewer = start_peer("bwe-viewer", &relay);
+    let t = Duration::from_secs(20);
+    eventually("both registered", t, || {
+        host.engine.server_connected() && viewer.engine.server_connected()
+    })
+    .await;
+    viewer.engine.connect_to(host.uuid.clone());
+
+    // Up and running at full resolution, with frames reaching the viewer, before
+    // we touch the link.
+    eventually("video flowing at full size", t, || {
+        host.engine.test_encode_dims() == Some((640, 360))
+            && !viewer.platform.surface.state().presented.is_empty()
+    })
+    .await;
+    let observe = |phase: &str| {
+        eprintln!(
+            "V1 {phase}: applied={:?} bps, bwe={:?} bps, encode_dims={:?}",
+            host.engine.test_encoder_target_bps(),
+            host.engine.test_raw_link_bps(),
+            host.engine.test_encode_dims(),
+        );
+    };
+
+    // --- constrained: 300 kbps. The target must track DOWN to the ~500 kbps floor
+    // (NOT pin at the old 2.5 Mbps), and the encode size must shrink.
+    host.engine.test_inject_bwe(300_000);
+    eventually(
+        "encoder target tracks the link down to the floor",
+        t,
+        || {
+            host.engine
+                .test_encoder_target_bps()
+                .is_some_and(|b| b <= 600_000)
+        },
+    )
+    .await;
+    assert_eq!(host.engine.test_raw_link_bps(), Some(300_000));
+    assert!(
+        host.engine.test_encoder_target_bps().unwrap() < 2_500_000,
+        "regression: target pinned at the old floor instead of tracking BWE"
+    );
+    eventually("encode resolution steps down", t, || {
+        host.engine.test_encode_dims().is_some_and(|(w, _)| w < 400)
+    })
+    .await;
+    let small = host.engine.test_encode_dims().unwrap();
+    observe("constrained");
+    // Frames keep flowing while constrained — no stall, no self-sustaining
+    // collapse. Count progress from here.
+    let presented_before = viewer.platform.surface.state().presented.len();
+    eventually("frames keep flowing while constrained", t, || {
+        viewer.platform.surface.state().presented.len() >= presented_before + 15
+    })
+    .await;
+
+    // --- mid link: 2 Mbps. The target TRACKS the value (proving it is not pinned
+    // at either extreme) and the encode size climbs partway back.
+    host.engine.test_inject_bwe(2_000_000);
+    eventually("target tracks a mid estimate", t, || {
+        host.engine
+            .test_encoder_target_bps()
+            .is_some_and(|b| b.abs_diff(2_000_000) <= 100_000)
+    })
+    .await;
+    eventually("resolution climbs partway back", t, || {
+        host.engine
+            .test_encode_dims()
+            .is_some_and(|(w, _)| w > small.0)
+    })
+    .await;
+    observe("mid");
+
+    // --- recovered: 6 Mbps. Target and encode size both return to full.
+    host.engine.test_inject_bwe(6_000_000);
+    eventually("encoder target tracks back up", t, || {
+        host.engine
+            .test_encoder_target_bps()
+            .is_some_and(|b| b.abs_diff(6_000_000) <= 100_000)
+    })
+    .await;
+    eventually("encode resolution returns to full", t, || {
+        host.engine.test_encode_dims() == Some((640, 360))
+    })
+    .await;
+    observe("recovered");
+    // The recovered link keeps delivering frames to the viewer too.
+    let presented_recovered = viewer.platform.surface.state().presented.len();
+    eventually("frames keep flowing after recovery", t, || {
+        viewer.platform.surface.state().presented.len() >= presented_recovered + 15
+    })
+    .await;
+
+    // No link trouble was ever reported — the fix is smooth, not a collapse.
+    for (who, p) in [("viewer", &viewer), ("host", &host)] {
+        assert_eq!(
+            p.link_trouble.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{who} reported link trouble"
+        );
+    }
+
+    viewer.engine.end_session();
+    eventually("both idle", t, || {
+        host.engine.role() == Role::Idle && viewer.engine.role() == Role::Idle
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn same_os_and_linux_windows_pairs_are_untouched() {
     let literal = [

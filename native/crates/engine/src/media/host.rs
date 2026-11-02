@@ -1,6 +1,24 @@
 //! Host media thread: capture → encode → hand AUs to the transport, with
-//! viewer-size encoding, source pacing against the measured link, and
+//! viewer-size encoding, a bandwidth-driven resolution/fps ladder, and
 //! rate-limited on-demand keyframes.
+//!
+//! The encoder follows str0m's bandwidth estimate down (the driver clamps it to
+//! the bitrate floor); this thread spends the rest of the degradation on the
+//! ENCODE RESOLUTION, stepping down a hysteretic ladder as the link falls and
+//! back up as it recovers, so a constrained link yields a sharp SMALL image
+//! rather than a mushy full-res one. Only once the smallest step still cannot fit
+//! the link does the frame rate drop. str0m's own pacer meters egress; there is
+//! no hand-rolled source pacer (it was what pinned egress to the raw estimate and
+//! kept the bandwidth estimate from ever probing back up — the self-sustaining
+//! stutter this replaced).
+//!
+//! ## References
+//! * str0m 0.21 `Writer::write` paces RTP egress and NACK-repairs from its send
+//!   buffer; the encoder need only produce frames sized to the estimate.
+//! * Commit 352d56d: the proven-smooth precedent — encoder follows BWE down, no
+//!   source pacer, frame size (here, resolution) absorbs congestion.
+//! * `crate::tuning`: the pure [`resolution_step`](crate::tuning::resolution_step)
+//!   / [`target_fps`](crate::tuning::target_fps) / `encoder_target` policy.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -9,7 +27,7 @@ use std::sync::Arc;
 use platform_api::{CaptureError, Codec, EncoderConfig, Platform, ScreenCapture};
 
 use crate::session::Shared;
-use crate::tuning::{MAX_FPS, MAX_FPS_INTERVAL, MIN_FPS};
+use crate::tuning::{self, MAX_FPS, RESOLUTION_LADDER};
 
 /// What the host media thread needs.
 pub(crate) struct HostMedia {
@@ -130,6 +148,11 @@ pub(crate) fn host_media_loop(
     encoder.force_keyframe();
     let mut applied_bitrate = cfg.bitrate_bps;
     let mut encoder_size = (cfg.width, cfg.height);
+    #[cfg(feature = "test-hooks")]
+    shared.encode_dims.store(
+        (u64::from(encoder_size.0) << 32) | u64::from(encoder_size.1),
+        Ordering::SeqCst,
+    );
     // A viewer size the encoder refused — don't retry it every frame.
     let mut rejected_size: Option<(u32, u32)> = None;
     let mut sent: u64 = 0;
@@ -139,16 +162,12 @@ pub(crate) fn host_media_loop(
     // the loss once and the recovery once rather than on every 250 ms retry.
     let mut capture_down_since: Option<std::time::Instant> = None;
 
-    // Source pacing = the "readable but slower" trade, made explicit. The encoder
-    // now has a hard QUALITY floor (its max-QP floor), so when the screen needs more
-    // bits than the link can carry it OVERSHOOTS the bitrate instead of blurring.
-    // This token bucket absorbs that: we track the bytes actually produced and,
-    // when we're ahead of what the link can drain, we skip capturing the next
-    // frame rather than let the encoder degrade. Sharpness is preserved; frame
-    // rate is what gives. (Bucket is capped at ~1s of credit so an idle screen
-    // can still burst a full keyframe out immediately when something changes.)
-    let mut debt_bytes: i64 = 0;
-    let mut last_debt_at = std::time::Instant::now();
+    // Degradation is spent on RESOLUTION first (a sharp small image), then frame
+    // rate as a last resort — never on a bitrate floor that would overshoot the
+    // link. `res_step` indexes the hysteretic resolution ladder; it rises as the
+    // link falls and recovers as it climbs (see `crate::tuning`). str0m's own
+    // pacer meters egress, so there is no hand-rolled source pacer here.
+    let mut res_step: usize = 0;
 
     // Keyframe rate limiting + attribution (see the emit site below). The first
     // keyframe must not be delayed, so start the clock a full gap in the past.
@@ -160,12 +179,21 @@ pub(crate) fn host_media_loop(
     let mut last_key_log = std::time::Instant::now();
 
     while !stop.load(Ordering::SeqCst) {
-        // Frame-rate cap: never encode faster than MAX_FPS_INTERVAL. The pacing
-        // sleep only bites when we're running FASTER than the cap (a busy screen);
-        // a slow software encoder or an idle screen sets the real rate.
+        // Read the raw link estimate once and update the resolution ladder from
+        // it. The ladder index then drives both the encode size (below) and, at
+        // the smallest step, the frame rate.
+        let link_bps = link.load(Ordering::SeqCst);
+        res_step = tuning::resolution_step(res_step, link_bps);
+
+        // Frame-rate cap: never encode faster than the ladder's current rate
+        // (MAX_FPS everywhere except the smallest step on a sub-floor link). The
+        // pacing sleep only bites when we're running FASTER than the cap (a busy
+        // screen); a slow software encoder or an idle screen sets the real rate.
+        let fps = tuning::target_fps(res_step, link_bps);
+        let interval = std::time::Duration::from_millis(1000 / u64::from(fps.max(1)));
         let since = last_frame_at.elapsed();
-        if since < MAX_FPS_INTERVAL {
-            std::thread::sleep(MAX_FPS_INTERVAL - since);
+        if since < interval {
+            std::thread::sleep(interval - since);
         }
         last_frame_at = std::time::Instant::now();
 
@@ -182,13 +210,22 @@ pub(crate) fn host_media_loop(
         // converter already scales, so this costs nothing extra — and encoding
         // fewer pixels puts more bits into each one. Rebuild only on a material
         // change; the viewer debounces, and every rebuild costs a keyframe.
-        let want = match shared.view_size.load(Ordering::SeqCst) {
+        let base = match shared.view_size.load(Ordering::SeqCst) {
             0 => (cap_w, cap_h),
             v => {
                 let (vw, vh) = ((v >> 32) as u32, v as u32);
                 fit_within((vw, vh), (cap_w, cap_h))
             }
         };
+        // Spend congestion on resolution: scale the viewer-sized target down the
+        // ladder. `fit_within` keeps the source aspect, forbids upscaling and
+        // rounds to even dimensions. At index 0 the scale is 1.0 (a no-op).
+        let scale = RESOLUTION_LADDER[res_step];
+        let scaled = (
+            (base.0 as f32 * scale).round() as u32,
+            (base.1 as f32 * scale).round() as u32,
+        );
+        let want = fit_within(scaled, (cap_w, cap_h));
         if want != encoder_size && want.0 >= 2 && want.1 >= 2 && rejected_size != Some(want) {
             tracing::info!(
                 "host: re-encoding at {}x{} (was {}x{})",
@@ -206,6 +243,11 @@ pub(crate) fn host_media_loop(
                     applied_bitrate = cfg.bitrate_bps;
                     encoder_size = want;
                     rejected_size = None;
+                    #[cfg(feature = "test-hooks")]
+                    shared.encode_dims.store(
+                        (u64::from(encoder_size.0) << 32) | u64::from(encoder_size.1),
+                        Ordering::SeqCst,
+                    );
                 }
                 Err(e) => {
                     // Keep streaming at the working size; remember the bad one so
@@ -231,23 +273,6 @@ pub(crate) fn host_media_loop(
             requested_idr = 0;
             encoder_idr = 0;
             deferred_keys = 0;
-        }
-
-        // Drain the bucket by what the LINK (not the encoder target) could have
-        // carried since the last pass. These differ on a bad link: the encoder is
-        // floored at MIN_BITRATE to stay legible, so if real capacity is below
-        // that, the difference has to come out of the frame rate.
-        let link_bps = link.load(Ordering::SeqCst).max(100_000);
-        let elapsed = last_debt_at.elapsed();
-        last_debt_at = std::time::Instant::now();
-        let drained = (link_bps as f64 / 8.0 * elapsed.as_secs_f64()) as i64;
-        debt_bytes = (debt_bytes - drained).max(0);
-        // More than MIN_FPS's worth of unsent credit? Skip this capture rather
-        // than pile more onto a link that hasn't drained the last frame yet.
-        let max_debt = (link_bps as i64 / 8) / MIN_FPS as i64;
-        if debt_bytes > max_debt && !force_key.load(Ordering::SeqCst) {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            continue;
         }
 
         let acquired = cap.acquire(std::time::Duration::from_millis(16));
@@ -294,15 +319,18 @@ pub(crate) fn host_media_loop(
                 // a loss gap (it drops deltas and requests an IDR — see the
                 // transport driver), so on-demand recovery covers everything:
                 // connect, RTCP PLI, ctl KeyframeRequest, capture AccessLost.
-                // RATE-LIMITED. Field logs showed 3-5 IDRs every 5 seconds on
-                // idle content, and each one is a burst big enough to spike the
-                // relay's queuing delay — which congestion control reads as
-                // congestion, collapsing the estimate from ~5 Mbps to ~150 kbps.
-                // The pacer then starves the viewer, the starved viewer asks for
-                // a keyframe, and the loop feeds itself. Honouring at most one
-                // request per MIN_KEYFRAME_GAP breaks it at the narrowest point.
-                // A request is never dropped, only deferred: `force_key` stays
-                // set and fires as soon as the gap has elapsed.
+                // RATE-LIMITED, and NEVER bypasses pacing. Field logs showed 3-5
+                // IDRs every 5 seconds on idle content, and each one is a burst
+                // big enough to spike the relay's queuing delay — which congestion
+                // control reads as congestion, collapsing the estimate from ~5
+                // Mbps to ~150 kbps, which then feeds a PLI → another IDR loop. We
+                // break it at two points: at most one IDR per MIN_KEYFRAME_GAP,
+                // and the IDR is handed to str0m like any other frame so ITS pacer
+                // meters the packets onto the wire — the IDR is never dumped out
+                // at once (the old `&& !force_key` pacer bypass is gone). With the
+                // encoder following BWE down the IDR is small anyway. A request is
+                // never dropped, only deferred: `force_key` stays set and fires as
+                // soon as the gap has elapsed.
                 let want_key = force_key.load(Ordering::SeqCst);
                 let key_now = want_key && last_keyframe_at.elapsed() >= MIN_KEYFRAME_GAP;
                 if want_key && !key_now {
@@ -335,10 +363,6 @@ pub(crate) fn host_media_loop(
                                     encoder_idr += 1;
                                 }
                             }
-                            // Charge the pacing bucket with what we actually
-                            // produced — with a QP floor this can exceed the CBR
-                            // target, and paying for it in frames is the point.
-                            debt_bytes += u.data.len() as i64;
                             if sent == 1 || sent.is_multiple_of(120) {
                                 tracing::info!(
                                     "host: encoded+sent AU #{sent} ({} bytes, keyframe={}, bitrate={}kbps)",

@@ -30,7 +30,7 @@ use crate::media::viewer::{viewer_media_loop, ViewerMedia};
 use crate::modifiers::{KeyTranslator, OsFamily};
 use crate::{Engine, Role};
 
-pub(crate) use crate::tuning::{DESIRED_BITRATE, MIN_BITRATE, TARGET_BITRATE};
+pub(crate) use crate::tuning::{DESIRED_BITRATE, TARGET_BITRATE};
 
 /// State shared by one session's threads. Per session (not process-wide) so two
 /// engines in one process — the loopback test — never see each other's state.
@@ -43,6 +43,16 @@ pub(crate) struct Shared {
     pub cursor: Mutex<Option<ViewerPointer>>,
     /// Viewer: the host's cursor images received so far (task D9).
     pub cursor_images: Mutex<crate::media::cursor::ViewerCursors>,
+    /// Test hook (`test-hooks` feature only): the host's current encode size,
+    /// `w << 32 | h`, so the loopback can watch the resolution ladder step.
+    #[cfg(feature = "test-hooks")]
+    pub encode_dims: AtomicU64,
+    /// Test hook (`test-hooks` feature only): a forced bandwidth estimate in bps
+    /// (0 = none). While set, the driver re-applies it every tick and ignores
+    /// str0m's real estimate, so a loopback test can drive a constrained-then-
+    /// recovering link deterministically. Never written in a shipping build.
+    #[cfg(feature = "test-hooks")]
+    pub bwe_inject: AtomicU32,
 }
 
 /// The pointer as the last position message described it.
@@ -74,6 +84,19 @@ pub(crate) struct Session {
     /// The user's clipboard-sync setting at session start.
     clipboard_setting: bool,
     threads: Vec<JoinHandle<()>>,
+    /// Test hooks (`test-hooks` feature only): the host's rate state, so the
+    /// loopback can observe the encoder target / raw link and inject estimates.
+    /// `None` on a viewer session.
+    #[cfg(feature = "test-hooks")]
+    hooks: Option<TestHooks>,
+}
+
+/// Host-side rate state exposed to tests under the `test-hooks` feature.
+#[cfg(feature = "test-hooks")]
+pub(crate) struct TestHooks {
+    pub bitrate: Arc<AtomicU32>,
+    pub link: Arc<AtomicU32>,
+    pub shared: Arc<Shared>,
 }
 
 pub(crate) fn serialize(msg: &ControlMsg) -> Vec<u8> {
@@ -242,6 +265,11 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission) 
         driver::transport_driver(driver)
     });
 
+    // Clone the host's rate state for the test hooks before the Arcs are moved
+    // into the media loop (no-op without the `test-hooks` feature).
+    #[cfg(feature = "test-hooks")]
+    let (hooks_bitrate, hooks_link, hooks_shared) = (bitrate.clone(), link.clone(), shared.clone());
+
     {
         let media = HostMedia {
             platform,
@@ -277,6 +305,12 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission) 
         clip_on,
         clipboard_setting: cfg.clipboard_sync,
         threads,
+        #[cfg(feature = "test-hooks")]
+        hooks: Some(TestHooks {
+            bitrate: hooks_bitrate,
+            link: hooks_link,
+            shared: hooks_shared,
+        }),
     });
     let _ = engine.signaling().send(SignalMsg::Signal {
         to: Some(peer),
@@ -490,6 +524,8 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
         clip_on,
         clipboard_setting: cfg.clipboard_sync,
         threads,
+        #[cfg(feature = "test-hooks")]
+        hooks: None,
     });
     let _ = engine.signaling().send(SignalMsg::Signal {
         to: Some(peer),
@@ -666,6 +702,35 @@ pub(crate) fn teardown(engine: &Engine) {
     }
     if let Some(s) = &surface {
         s.hide();
+    }
+}
+
+/// Host-side rate observation + bandwidth injection for the loopback test. Never
+/// compiled into a shipping build.
+#[cfg(feature = "test-hooks")]
+impl Session {
+    /// The encoder's current CBR target (bps), or `None` on a viewer session.
+    pub(crate) fn encoder_target_bps(&self) -> Option<u32> {
+        self.hooks
+            .as_ref()
+            .map(|h| h.bitrate.load(Ordering::SeqCst))
+    }
+    /// The raw bandwidth estimate (bps) driving the ladder, or `None` (viewer).
+    pub(crate) fn raw_link_bps(&self) -> Option<u32> {
+        self.hooks.as_ref().map(|h| h.link.load(Ordering::SeqCst))
+    }
+    /// The host's current encode size `(w, h)`, or `None` on a viewer session.
+    pub(crate) fn encode_dims(&self) -> Option<(u32, u32)> {
+        self.hooks.as_ref().map(|h| {
+            let v = h.shared.encode_dims.load(Ordering::SeqCst);
+            ((v >> 32) as u32, v as u32)
+        })
+    }
+    /// Force the bandwidth estimate to `bps` (0 = release to the real estimate).
+    pub(crate) fn inject_bwe(&self, bps: u32) {
+        if let Some(h) = &self.hooks {
+            h.shared.bwe_inject.store(bps, Ordering::SeqCst);
+        }
     }
 }
 

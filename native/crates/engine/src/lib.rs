@@ -866,3 +866,41 @@ impl Engine {
         self.role.clone()
     }
 }
+
+/// Loopback test hooks (the `test-hooks` feature). They expose the host's live
+/// rate state and let a test drive a synthetic bandwidth estimate, so the
+/// end-to-end congestion behaviour can be asserted over real str0m without a
+/// network shaper. Never compiled into a shipping build.
+#[cfg(feature = "test-hooks")]
+impl Engine {
+    /// The host session's current encoder CBR target (bps), if a host session is
+    /// live. This TRACKS the bandwidth estimate (clamped), it is not pinned.
+    #[doc(hidden)]
+    pub fn test_encoder_target_bps(&self) -> Option<u32> {
+        self.session
+            .lock()
+            .as_ref()
+            .and_then(|s| s.encoder_target_bps())
+    }
+
+    /// The host session's raw bandwidth estimate (bps) driving the ladder.
+    #[doc(hidden)]
+    pub fn test_raw_link_bps(&self) -> Option<u32> {
+        self.session.lock().as_ref().and_then(|s| s.raw_link_bps())
+    }
+
+    /// The host session's current encode size `(w, h)`.
+    #[doc(hidden)]
+    pub fn test_encode_dims(&self) -> Option<(u32, u32)> {
+        self.session.lock().as_ref().and_then(|s| s.encode_dims())
+    }
+
+    /// Force the host's bandwidth estimate to `bps` (0 releases it back to the
+    /// real str0m estimate). No effect on a viewer session.
+    #[doc(hidden)]
+    pub fn test_inject_bwe(&self, bps: u32) {
+        if let Some(s) = self.session.lock().as_ref() {
+            s.inject_bwe(bps);
+        }
+    }
+}

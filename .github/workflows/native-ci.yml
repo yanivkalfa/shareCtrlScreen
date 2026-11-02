@@ -11,11 +11,13 @@ on:
     paths:
       - "native/**"
       - ".github/workflows/native-ci.yml"
+      - ".github/workflows/build-assets.yml"
       - ".github/wayland/**"
   pull_request:
     paths:
       - "native/**"
       - ".github/workflows/native-ci.yml"
+      - ".github/workflows/build-assets.yml"
       - ".github/wayland/**"
 
 defaults:
@@ -352,6 +354,107 @@ jobs:
             tail -n 200 "$f" || true
             echo "::endgroup::"
           done
+
+  # ---------------------------------------------------------------------------
+  # Windows installer (plan task W4). The NSIS installer must leave a host fully
+  # set up: sharectrl-service.exe next to sharectrl.exe in Program Files, the
+  # SYSTEM service registered and RUNNING; its uninstaller must remove both.
+  #
+  # The installer under test is built by build-assets.yml, the same reusable
+  # workflow (and so the same native/scripts/release-assets.sh recipe) the
+  # Release workflow uses, so this tests the file users download. release-build
+  # below is a plain `cargo build`, which makes no installer, so there is no
+  # artifact to reuse; a release build of the bundle costs ~30 min.
+  windows-installer-build:
+    uses: ./.github/workflows/build-assets.yml
+    with:
+      platform: windows
+      artifact-name: ci-windows-installer
+      retention-days: 3
+
+  windows-installer:
+    needs: windows-installer-build
+    # Hosted runners run jobs as an administrator, which the perMachine
+    # installer and the service manager need (runner-images: Windows runners).
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      SERVICE: ShareCtrlScreenHost
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: .
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ci-windows-installer
+          path: assets
+      # NSIS: /S = silent; the exit code is 0 on success and 2 when a hook aborts
+      # (installer-hooks.nsh), which is what this step checks.
+      - name: Install silently (/S)
+        run: |
+          $setup = @(Get-ChildItem assets -Filter 'ShareCtrlScreen_*_x64-setup.exe')
+          if ($setup.Count -ne 1) { throw "expected one installer in assets/, found $($setup.Count)" }
+          "SETUP=$($setup[0].FullName)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          $p = Start-Process -FilePath $setup[0].FullName -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "installer exited with $($p.ExitCode)" }
+      - name: "Service is registered, RUNNING, and points at Program Files"
+        run: |
+          sc.exe query $env:SERVICE
+          if ($LASTEXITCODE -ne 0) { throw "sc query exited with $LASTEXITCODE (1060 = no such service)" }
+          $svc = Get-CimInstance Win32_Service -Filter "Name='$env:SERVICE'"
+          $svc | Format-List Name, State, StartMode, StartName, PathName, ProcessId
+          if ($svc.State -ne 'Running') { throw "service state is $($svc.State), expected Running" }
+          if ($svc.StartMode -ne 'Auto') { throw "start mode is $($svc.StartMode), expected Auto" }
+          $want = "`"$env:ProgramFiles\ShareCtrlScreen\sharectrl-service.exe`" --run-service"
+          if ($svc.PathName -ne $want) { throw "service path is '$($svc.PathName)', expected '$want'" }
+          "SERVICE_PID=$($svc.ProcessId)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: sharectrl-service.exe sits next to sharectrl.exe
+        run: |
+          $dir = "$env:ProgramFiles\ShareCtrlScreen"
+          Get-ChildItem $dir | Format-Table Name, Length
+          foreach ($f in 'sharectrl.exe', 'sharectrl-service.exe', 'uninstall.exe') {
+            if (-not (Test-Path -PathType Leaf "$dir\$f")) { throw "$dir\$f is missing" }
+          }
+          # Informational: whether the service could start the host in this
+          # runner's console session (the runner image decides if one exists).
+          Get-Process sharectrl -ErrorAction SilentlyContinue | Format-Table Id, SessionId, Path
+      # The upgrade path: the same installer over a running service. The
+      # PREINSTALL hook must stop it before the files are replaced and
+      # POSTINSTALL must start it again, so the service runs in a new process.
+      - name: Reinstall over the running service (upgrade path)
+        run: |
+          $p = Start-Process -FilePath $env:SETUP -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "re-install exited with $($p.ExitCode)" }
+          $svc = Get-CimInstance Win32_Service -Filter "Name='$env:SERVICE'"
+          if ($svc.State -ne 'Running') { throw "after re-install the service is $($svc.State)" }
+          if ("$($svc.ProcessId)" -eq $env:SERVICE_PID) { throw "the service was not restarted (pid $env:SERVICE_PID)" }
+          "service restarted: pid $env:SERVICE_PID -> $($svc.ProcessId)"
+      # An NSIS uninstaller copies itself to %TEMP% and returns at once, so
+      # -Wait cannot wait for it; poll for the end state instead.
+      - name: Uninstall silently; the service and the folder are gone
+        run: |
+          $dir = "$env:ProgramFiles\ShareCtrlScreen"
+          $p = Start-Process -FilePath "$dir\uninstall.exe" -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "uninstaller exited with $($p.ExitCode)" }
+          $deadline = (Get-Date).AddSeconds(180)
+          do {
+            Start-Sleep -Seconds 3
+            sc.exe query $env:SERVICE | Out-Null
+            $gone = ($LASTEXITCODE -eq 1060) -and -not (Test-Path $dir)
+          } until ($gone -or (Get-Date) -gt $deadline)
+          sc.exe query $env:SERVICE
+          if ($LASTEXITCODE -ne 1060) { throw "service still present (sc query exit $LASTEXITCODE)" }
+          if (Test-Path $dir) {
+            Get-ChildItem -Recurse $dir | Format-Table FullName
+            throw "$dir was not removed"
+          }
+          $global:LASTEXITCODE = 0
+      - name: Service Control Manager events (failure)
+        if: failure()
+        run: |
+          Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager'; StartTime = (Get-Date).AddHours(-1) } -ErrorAction SilentlyContinue |
+            Format-Table TimeCreated, Id, Message -Wrap
 
   release-build:
     # The optimized Windows build the dev/test pipelines ship.

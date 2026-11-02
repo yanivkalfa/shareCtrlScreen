@@ -25,14 +25,24 @@ and they are checked on real hardware before each release (see
 
 ### Windows
 
-Unchanged from earlier releases: run the installer from the Releases page.
+Run the installer from the Releases page.
 
 - The build is not code-signed, so Windows SmartScreen warns on the first install.
   Click **More info**, then **Run anyway**. This is expected.
-- For UAC prompts, the lock screen and the sign-in screen, install the Windows service
-  once from a terminal opened as administrator:
-  `sharectrl-service.exe --install-service` (and `--uninstall-service` to remove it).
-  Details are in [`native/README.md`](native/README.md).
+- The installer **sets up the Windows service for you**. It installs
+  `sharectrl-service.exe` next to the app in `C:\Program Files\ShareCtrlScreen\`, then
+  registers and starts the `ShareCtrlScreenHost` service (one administrator consent). The
+  service launches the host at every sign-in and reaches the lock screen and UAC prompts.
+  Uninstalling removes the service.
+- Because the service already starts the host at sign-in, the installed app does **not**
+  add its own "Start at sign-in" entry (one host, not two). The setting has no effect while
+  the service is installed.
+- One instance only: launching the app again brings the running window to the front instead
+  of starting a second copy.
+- The standalone `sharectrl-service.exe` download is only for a **manual** install — put it
+  next to a portable `sharectrl.exe` and run `sharectrl-service.exe --install-service` from
+  a terminal opened as administrator (`--uninstall-service` removes it). The regular
+  installer does this for you. Details are in [`native/README.md`](native/README.md).
 
 ### macOS 13 (Ventura) or later
 
@@ -113,21 +123,21 @@ been tested on hardware.
 | Feature | Windows | macOS 13+ | Linux, X11 | Linux, Wayland |
 |---|---|---|---|---|
 | Screen capture | Yes (DXGI) | Yes, with Screen Recording permission (ScreenCaptureKit) | Yes, no prompt | Yes, after the portal consent dialog (ScreenCast) |
-| Remote mouse and keyboard | Yes. Elevated windows and UAC prompts need the Windows service or a host run as administrator | Yes, with Accessibility permission | Yes (XTest) | Yes on GNOME 46+ and KDE Plasma 6 (RemoteDesktop portal). Sway and Hyprland: through wlroots virtual input, no dialog (unverified). Others, such as Weston: view only unless the uinput setting is on |
+| Remote mouse and keyboard | Yes. The installer sets up the Windows service, which runs the host as the signed-in user. That host still **cannot** control UAC prompts or elevated apps (the UIPI boundary — see Known limitations; run the host as administrator for those), and the secure desktop is out of reach. Alt+Tab / Windows-key passthrough is a separate feature (W5) | Yes, with Accessibility permission | Yes (XTest) | Yes on GNOME 46+ and KDE Plasma 6 (RemoteDesktop portal). Sway and Hyprland: through wlroots virtual input, no dialog (unverified). Others, such as Weston: view only unless the uinput setting is on |
 | The remote computer's real mouse pointer (arrow, I-beam, hand, resize), drawn on the viewer | Yes (pointer images from DXGI) | Yes (pointer images from AppKit) | Yes (XFixes) | Yes, when the portal sends pointer images (cursor metadata) |
 | Clipboard text, both ways | Yes | Yes | Yes. The clipboard lives only while the app runs | Yes, same as X11 |
 | Clipboard files, pasted on this side | Yes | Yes | Yes | Yes |
 | File push, controller to controlled | Yes | Yes | Yes | Yes |
 | Drop a file on a remote window | Yes | Yes, with Accessibility permission | Yes | No. The file stays on the clipboard and a notice shows |
-| Shortcut passthrough (Alt+Tab, Cmd+Tab, Super) | Experimental, off by default. Ctrl+Alt+Del and Win+L cannot be captured | Every Cmd shortcut (Cmd+C/V, Cmd+Tab, Cmd+Space, Cmd+Shift+4, Cmd+Option+D…) and Ctrl+arrows (Spaces, Mission Control) while the remote picture has the keyboard; clicking anywhere else gives them back at once. **Cmd+Q always quits the viewer** (the escape hatch). Cannot be taken: Force Quit (Cmd+Option+Esc), Lock Screen (Cmd+Ctrl+Q), Touch ID / power and the media keys, and anything while Secure Input is on (password fields). With "Translate modifiers" on (Settings → Advanced) Cmd arrives on a Windows/Linux host as Ctrl; with it off, as the Win/Super key | Yes, the window grabs the keyboard | Depends on the compositor. If refused, the app says shortcuts are unsupported here |
+| Shortcut passthrough (Alt+Tab, Cmd+Tab, Super) | Experimental, off by default. Alt+Tab and the Windows key take effect on the host only when it runs under the Windows service (installed by the installer) — a host you start yourself captures them but the host's shell ignores them. Ctrl+Alt+Del and Win+L can never be captured | Every Cmd shortcut (Cmd+C/V, Cmd+Tab, Cmd+Space, Cmd+Shift+4, Cmd+Option+D…) and Ctrl+arrows (Spaces, Mission Control) while the remote picture has the keyboard; clicking anywhere else gives them back at once. **Cmd+Q always quits the viewer** (the escape hatch). Cannot be taken: Force Quit (Cmd+Option+Esc), Lock Screen (Cmd+Ctrl+Q), Touch ID / power and the media keys, and anything while Secure Input is on (password fields). With "Translate modifiers" on (Settings → Advanced) Cmd arrives on a Windows/Linux host as Ctrl; with it off, as the Win/Super key | Yes, the window grabs the keyboard | Depends on the compositor. If refused, the app says shortcuts are unsupported here |
 | Modifier translation for the remote OS (default on, Settings → Advanced) | From a Mac viewer: Cmd is sent as Ctrl, Cmd+Tab as Alt+Tab, Mac Control as Win. To a Mac host: Ctrl is sent as Cmd, Win as Control, Alt+Tab as Cmd+Tab | Same | Same | Same |
-| Lock screen (a user is logged in) | Yes, with the Windows service | In scope. Unverified | In scope. Unverified | In scope. Unverified |
-| Login window (nobody logged in) | Yes, with the Windows service | No | No | No |
+| Lock screen (a user is logged in) | Through the Windows service the installer sets up (SYSTEM + desktop-follow). Unverified on a device | In scope. Unverified | In scope. Unverified | In scope. Unverified |
+| Login window (nobody logged in) | Yes, through the Windows service the installer sets up | No | No | No |
 | Hardware video encode | Yes (Media Foundation, H.264 and HEVC) | Yes (VideoToolbox, H.264 and HEVC) | Intel and AMD via VA-API, when libva is 2.20 or newer. NVIDIA via NVENC (optional) | Same as X11 |
 | Hardware video decode | Yes (Direct3D 11) | Yes (VideoToolbox). AV1 on M3 and later | Intel and AMD via VA-API, when libva is 2.20 or newer. NVIDIA via NVDEC (optional) | Same as X11 |
 | Software video (OpenH264) | Not yet (planned: downloaded from Cisco on first use) | Yes, downloaded from Cisco on first use | Yes, downloaded from Cisco on first use | Yes, downloaded from Cisco on first use |
 | Saved passwords | Yes (Windows DPAPI) | Yes (Keychain) | Yes with a Secret Service keyring (GNOME Keyring or KWallet). Without one, nothing is saved | Same as X11 |
-| Start at sign-in | Yes | Yes (LaunchAgent) | Yes (XDG autostart) | Yes (XDG autostart) |
+| Start at sign-in | Yes (per-user; the installed app leaves this to the service instead, which starts the host at every sign-in) | Yes (LaunchAgent) | Yes (XDG autostart) | Yes (XDG autostart) |
 
 Software video is used whenever no hardware codec is available. Its download needs an
 internet connection, and it can be switched off in Settings under Advanced.
@@ -196,7 +206,7 @@ GitHub Release with these assets:
 |---|---|
 | `ShareCtrlScreen_<version>_x64-setup.exe` | Windows installer (not code-signed: SmartScreen warns, More info → Run anyway) |
 | `sharectrl.exe` | Windows portable app, the same binary the installer puts in Program Files; run it from any folder (needs the WebView2 runtime, present on Windows 10/11) |
-| `sharectrl-service.exe` | Windows service for UAC prompts and the lock screen; place it next to `sharectrl.exe` before `--install-service` (it launches the host from its own folder) |
+| `sharectrl-service.exe` | Windows service for UAC prompts and the lock screen. The installer already bundles, registers and starts it; this standalone copy is only for a manual install beside a portable `sharectrl.exe` (`--install-service`, it launches the host from its own folder) |
 | `ShareCtrlScreen_<version>_universal.dmg` | macOS 13+, Apple Silicon and Intel |
 | `ShareCtrlScreen_<version>_amd64.deb` / `ShareCtrlScreen-<version>-1.x86_64.rpm` / `ShareCtrlScreen_<version>_amd64.AppImage` | Linux |
 | `THIRD-PARTY-LICENSES-<os>.html` | Licences of the open-source code in that OS's build (also inside each installer) |
@@ -245,6 +255,24 @@ publishes nothing. To build this machine's assets locally the same way, run
   losing window focus releases it). Still **cannot** be captured, by Windows
   design: **Ctrl+Alt+Del** and **Win+L** (kernel/secure-desktop level). F11 is
   deliberately left alone so local fullscreen still works.
+  Whether the **host** acts on a forwarded Alt+Tab or Windows key depends on the
+  host having the Windows **UIAccess** token flag: Windows silently drops those
+  shell shortcuts from a process without it. The SYSTEM service (installed by the
+  installer) sets that flag on the host it launches, so Alt+Tab switches windows
+  and the Windows key opens Start on a service-installed host. A host you start
+  yourself — from Program Files or the portable copy — does not get the flag; the
+  shortcuts are still captured locally but the host's shell ignores them. The
+  running host logs which case applies on startup (`UIAccess: granted` / `UIAccess:
+  not granted — <reason>` in `app.log`) — that is the readout for the host instance
+  the service started. `sharectrl.exe --print-uiaccess` is a separate self-check that
+  **prints** that same line for the one invocation you run; a `sharectrl.exe` you run by
+  hand is a fresh non-service process, so it always prints `not granted` — useful to
+  confirm "not granted", a positive self-check only under the signed build (a later
+  release); to confirm a service host is granted, read its `app.log`. Read the printed
+  line, not an exit code from `cmd … & echo %errorlevel%`: `sharectrl.exe` is a GUI-
+  subsystem binary, so cmd does not wait and reports `0` regardless. For the numeric code
+  use PowerShell `(Start-Process sharectrl.exe -ArgumentList '--print-uiaccess' -Wait
+  -PassThru).ExitCode` (0 granted / 1 not).
 - **Modifier translation** (default on, ⚙ Settings → Advanced → "Translate modifiers for
   the remote OS"): Mac → Windows/Linux sends Cmd as Ctrl and Cmd+Tab as Alt+Tab, Mac
   Control as Win/Super; Windows/Linux → Mac sends Ctrl as Cmd, Win/Super as Control,

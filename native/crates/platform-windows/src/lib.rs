@@ -1,7 +1,8 @@
 //! Windows implementation of `platform-api`: DXGI Desktop Duplication capture,
 //! Media Foundation codecs, the D3D11 child-window surface, `SendInput`
-//! injection, the `WH_KEYBOARD_LL` shortcut hook, the Win32 clipboard, DPAPI and
-//! the per-user Run key.
+//! injection, the `WH_KEYBOARD_LL` shortcut hook, the Win32 clipboard, DPAPI,
+//! the per-user Run key and the one-host-per-session rule of the SYSTEM service
+//! ([`instance`]).
 //!
 //! The media crates (`capture`, `codec`, `render`, `input`, `elevation`) keep
 //! their Windows types; this crate adapts them to the OS-neutral traits. GPU
@@ -41,6 +42,7 @@
 
 pub mod autostart;
 pub mod clipboard;
+pub mod instance;
 pub mod secret;
 
 mod adapters;

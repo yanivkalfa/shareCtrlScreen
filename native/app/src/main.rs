@@ -16,7 +16,10 @@
 // On Windows release builds, don't spawn a console window.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod uiaccess;
+
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -389,10 +392,17 @@ async fn openh264_download(state: tauri::State<'_, AppState>) -> Result<String, 
     Ok(state.openh264.availability().describe())
 }
 
-/// Log to `app.log` in the platform's log directory, since release builds have
-/// no console. `RUST_LOG` still overrides the level.
-fn init_logging(log_dir: &Path) {
-    let path = log_dir.join("app.log");
+/// The running app's log file.
+const APP_LOG: &str = "app.log";
+/// Where a launch that hands over to the running host logs why (Windows, W4).
+/// Not `app.log`: opening that would truncate the running host's log.
+#[cfg(windows)]
+const HANDOVER_LOG: &str = "app-handover.log";
+
+/// Log to `file_name` in the platform's log directory, since release builds
+/// have no console. `RUST_LOG` still overrides the level.
+fn init_logging(log_dir: &Path, file_name: &str) {
+    let path = log_dir.join(file_name);
     let _ = std::fs::create_dir_all(log_dir);
     // Verbose for our own media/transport crates so a black screen leaves a
     // trail (encode/decode errors, ICE state); quiet for noisy dependencies.
@@ -465,10 +475,64 @@ fn attach_video_surface(engine: &Engine, win: &tauri::WebviewWindow) {
     }
 }
 
+/// Bring the main window up for a launch that handed over to this host.
+#[cfg(windows)]
+fn raise_main_window(app: &tauri::AppHandle) {
+    let Some(win) = app.get_webview_window("main") else {
+        return;
+    };
+    for (what, result) in [
+        ("unminimize", win.unminimize()),
+        ("show", win.show()),
+        ("focus", win.set_focus()),
+    ] {
+        if let Err(e) = result {
+            tracing::warn!("raising the window: {what} failed: {e}");
+        }
+    }
+}
+
 fn main() {
+    // `--print-uiaccess` answers and exits before anything else exists: no
+    // window, no network, no logging (which truncates app.log) and no instance
+    // gate — it reports the status of THIS invocation and nothing more (W5).
+    if uiaccess::wants_print(std::env::args().skip(1)) {
+        let status = uiaccess::probe();
+        // A release build is a GUI-subsystem exe: stdout reaches the caller
+        // only when it is redirected or piped; a write error is not fatal.
+        let _ = writeln!(std::io::stdout(), "{}", status.line());
+        std::process::exit(status.exit_code());
+    }
+
+    // One host per session when the Windows service is installed (task W4).
+    // Decided before logging, so a launch that hands over never opens (and
+    // truncates) the running host's app.log.
+    #[cfg(windows)]
+    let (mut service_host, gate_note) = match platform_windows::instance::gate(std::env::args()) {
+        platform_windows::instance::Gate::Exit { reason } => {
+            let (platform, _, _) = make_platform();
+            init_logging(&platform.paths().log_dir, HANDOVER_LOG);
+            tracing::info!("{reason}");
+            return;
+        }
+        platform_windows::instance::Gate::Run { marker, note } => (marker, note),
+    };
+
     let (platform, openh264, h264_problem) = make_platform();
-    init_logging(&platform.paths().log_dir);
+    init_logging(&platform.paths().log_dir, APP_LOG);
     tracing::info!("platform: {}", platform.info().name);
+    #[cfg(windows)]
+    {
+        if let Some(note) = gate_note {
+            tracing::warn!("{note}");
+        }
+        if service_host.is_some() {
+            tracing::info!("started by the ShareCtrlScreen service as this session's host");
+        }
+        // W5: whether remote Alt+Tab / the Windows key can reach this host's
+        // shell. UIAccess is a Windows token flag, so other OSes log nothing.
+        tracing::info!("{}", uiaccess::probe().line());
+    }
 
     // The engine spawns its signaling task with `tokio::spawn`, so a Tokio
     // runtime must exist *and be entered* before `Engine::start`. Hand the same
@@ -521,6 +585,14 @@ fn main() {
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
+
+            // Another launch in this session asks the service host to show
+            // its window instead of starting a second host.
+            #[cfg(windows)]
+            if let Some(marker) = service_host.take() {
+                let raise_handle = handle.clone();
+                marker.listen(move || raise_main_window(&raise_handle));
+            }
 
             // Bridge engine UiEvents → WebView2 events (replaces ipcRenderer.on).
             tauri::async_runtime::spawn(async move {

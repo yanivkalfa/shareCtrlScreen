@@ -1,11 +1,17 @@
 //! The SYSTEM Windows service binary (Plan 04 §4, §8b). Thin: it wires the
 //! `elevation` primitives into the SCM dispatcher and the session-follow launch
 //! loop. It does NOT host UI (Microsoft warns against it) — it launches the
-//! engine into the active user session and relaunches on session change.
+//! host app into the active user session and relaunches on session change.
 //!
-//! Usage:
-//!   sharectrl-service --install-service   (admin, once)
-//!   sharectrl-service --uninstall-service (admin)
+//! The NSIS installer ships this binary next to `sharectrl.exe` and drives it
+//! from its hooks (`native/app/installer-hooks.nsh`, task W4); the same
+//! commands serve a manual install of the standalone release asset.
+//!
+//! Usage (all but `--run-service` need an elevated terminal):
+//!   sharectrl-service --install-service   register (or re-point) at this exe, start
+//!   sharectrl-service --start-service     start, wait until running
+//!   sharectrl-service --stop-service      stop, wait until the process exits
+//!   sharectrl-service --uninstall-service stop, then remove
 //!   sharectrl-service --run-service       (invoked by the SCM)
 
 // The service is a Windows concept (SCM, sessions, the secure desktop). On other
@@ -26,33 +32,114 @@ mod windows_service {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
-    pub fn main() {
-        tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .init();
+    use elevation::service::{Installed, Stopped, Uninstalled, SERVICE_NAME};
 
+    const USAGE: &str = "usage: sharectrl-service \
+        [--install-service|--start-service|--stop-service|--uninstall-service|--run-service]";
+
+    /// The management commands print one line saying what happened and exit 0,
+    /// or print the reason and exit 1, because the NSIS installer hooks
+    /// (`native/app/installer-hooks.nsh`) run them through `nsExec::ExecToLog`:
+    /// the line lands in the installer's details pane and the exit code decides
+    /// whether the install goes on. Unknown arguments exit 2.
+    pub fn main() {
         let arg = std::env::args().nth(1).unwrap_or_default();
-        match arg.as_str() {
-            "--install-service" => {
-                let exe = std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.to_str().map(String::from))
-                    .unwrap_or_default();
-                match elevation::service::install(&exe) {
-                    Ok(()) => println!("installed"),
-                    Err(e) => eprintln!("install failed: {e}"),
-                }
+        init_logging(arg == "--run-service");
+        let outcome = match arg.as_str() {
+            "--install-service" => install(),
+            "--start-service" => elevation::service::start()
+                .map(|()| format!("service '{SERVICE_NAME}' is running"))
+                .map_err(|e| e.to_string()),
+            "--stop-service" => elevation::service::stop()
+                .map(|s| match s {
+                    Stopped::NotInstalled => format!("service '{SERVICE_NAME}' is not installed"),
+                    Stopped::WasNotRunning => format!("service '{SERVICE_NAME}' was not running"),
+                    Stopped::Stopped => format!("service '{SERVICE_NAME}' stopped"),
+                })
+                .map_err(|e| e.to_string()),
+            "--uninstall-service" => elevation::service::uninstall()
+                .map(|u| match u {
+                    Uninstalled::NotInstalled => {
+                        format!("service '{SERVICE_NAME}' was not installed")
+                    }
+                    Uninstalled::Removed => format!("service '{SERVICE_NAME}' stopped and removed"),
+                })
+                .map_err(|e| e.to_string()),
+            "--run-service" => {
+                run_dispatcher();
+                return;
             }
-            "--uninstall-service" => match elevation::service::uninstall() {
-                Ok(()) => println!("uninstalled"),
-                Err(e) => eprintln!("uninstall failed: {e}"),
-            },
-            "--run-service" => run_dispatcher(),
             _ => {
-                eprintln!(
-                    "usage: sharectrl-service [--install-service|--uninstall-service|--run-service]"
-                );
+                eprintln!("{USAGE}");
+                std::process::exit(2);
             }
+        };
+        match outcome {
+            Ok(line) => println!("{line}"),
+            Err(e) => {
+                eprintln!("sharectrl-service {arg}: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    /// Register (or re-point) the service at THIS executable and start it. The
+    /// service launches `sharectrl.exe` from its own folder (`engine_path`),
+    /// so this binary must sit next to the app before it is installed.
+    fn install() -> Result<String, String> {
+        let exe = std::env::current_exe()
+            .map_err(|e| format!("cannot determine this program's path: {e}"))?;
+        let exe = exe
+            .to_str()
+            .ok_or_else(|| format!("the path {} is not valid Unicode", exe.display()))?
+            .to_string();
+        let app = engine_path();
+        if !std::path::Path::new(&app).is_file() {
+            return Err(format!(
+                "{app} not found: put sharectrl-service.exe in the same folder as \
+                 sharectrl.exe (the service starts the app from its own folder)"
+            ));
+        }
+        let what = match elevation::service::install(&exe).map_err(|e| e.to_string())? {
+            Installed::Created => "registered",
+            Installed::Updated => "updated",
+        };
+        Ok(format!(
+            "service '{SERVICE_NAME}' {what} ({exe}) and running"
+        ))
+    }
+
+    /// Set up logging for this invocation (W5). `--run-service` has no console
+    /// under the SCM, so it logs to `sharectrl-service.log` next to the service
+    /// binary (truncated at each service start) at info — this is where the
+    /// per-launch line, including why a host did not get UIAccess, is recorded.
+    /// WHY there and not under ProgramData: the file is opened by SYSTEM, and
+    /// ProgramData lets standard users pre-create entries (a planted link would
+    /// turn the truncate into an arbitrary-file overwrite); the install folder
+    /// under Program Files is writable only by admins. If the file cannot be
+    /// created it falls back to stdout. The management commands
+    /// (install/start/stop/uninstall) carry their result on stdout/stderr for
+    /// the NSIS details pane, so they stay quiet (`RUST_LOG` only), as before.
+    fn init_logging(service_run: bool) {
+        if !service_run {
+            tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .init();
+            return;
+        }
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        let log_file = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|d| d.join("sharectrl-service.log")))
+            .and_then(|path| std::fs::File::create(path).ok());
+        match log_file {
+            Some(file) => tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .with_env_filter(filter)
+                .init(),
+            None => tracing_subscriber::fmt().with_env_filter(filter).init(),
         }
     }
 
@@ -141,10 +228,25 @@ mod windows_service {
         dispatcher::run();
     }
 
+    /// The host's command-line arguments. `--autostart`: the service instance
+    /// IS the sign-in autostart (the app removes its own Run entry while the
+    /// service is installed, task W4), so it comes up minimized exactly like
+    /// the Run-key instance did. `--service-host`: marks it as the session's
+    /// one host, so other launches in the session defer to it
+    /// (`platform_windows::instance`).
+    fn host_args() -> String {
+        format!(
+            "{} {}",
+            platform_api::AUTOSTART_FLAG,
+            elevation::SERVICE_HOST_FLAG
+        )
+    }
+
     /// Follow the active session and keep the engine running there (§8b). Relaunch
     /// whenever the active console session changes (login, fast-user-switch, RDP).
     fn session_loop() {
         let engine_exe = engine_path();
+        let args = host_args();
         let mut last_session: Option<u32> = None;
 
         while !STOP.load(Ordering::SeqCst) {
@@ -152,11 +254,18 @@ mod windows_service {
                 Some(session) if Some(session) != last_session => {
                     match elevation::user_token(session) {
                         Ok(token) => {
-                            match elevation::launch_in_session(token, &engine_exe, "--engine") {
-                                Ok(pid) => {
-                                    tracing::info!(
-                                        "launched engine pid={pid} in session {session}"
-                                    );
+                            // Owned so the handle is closed after every launch
+                            // attempt — this loop runs for the life of the
+                            // machine and relaunches on every session change.
+                            // (W4 closed the raw handle here; OwnedToken does the
+                            // same by RAII, and the child has its own copy once
+                            // CreateProcessAsUser returns.)
+                            let token = elevation::OwnedToken::from_raw(token);
+                            // W4 launch args (`--autostart --service-host`); the
+                            // UIAccess flag is set inside launch_in_session (W5).
+                            match elevation::launch_in_session(token.handle(), &engine_exe, &args) {
+                                Ok(launched) => {
+                                    log_launch(&launched, session);
                                     last_session = Some(session);
                                 }
                                 Err(e) => tracing::warn!("launch failed: {e}"),
@@ -174,6 +283,22 @@ mod windows_service {
         }
     }
 
+    /// One line per launch, saying whether the host got the UIAccess flag and,
+    /// if not, the exact reason (W5 fallback: the host runs anyway, but remote
+    /// Alt+Tab and the Windows key will not reach the shell).
+    fn log_launch(launched: &elevation::Launched, session: u32) {
+        let pid = launched.pid;
+        match &launched.ui_access {
+            Ok(()) => {
+                tracing::info!("launched engine pid={pid} in session {session} with UIAccess")
+            }
+            Err(e) => tracing::warn!(
+                "launched engine pid={pid} in session {session} WITHOUT UIAccess \
+                 (remote Alt+Tab and the Windows key will not reach the host's shell): {e}"
+            ),
+        }
+    }
+
     /// Resolve the engine/app executable next to the service binary.
     fn engine_path() -> String {
         std::env::current_exe()
@@ -181,5 +306,48 @@ mod windows_service {
             .and_then(|p| p.parent().map(|d| d.join("sharectrl.exe")))
             .and_then(|p| p.to_str().map(String::from))
             .unwrap_or_else(|| "sharectrl.exe".to_string())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_host_is_launched_as_the_sign_in_service_host() {
+            let args = host_args();
+            let flags: Vec<&str> = args.split(' ').collect();
+            assert_eq!(flags, ["--autostart", "--service-host"]);
+            assert_eq!(flags[0], platform_api::AUTOSTART_FLAG);
+            assert_eq!(flags[1], elevation::SERVICE_HOST_FLAG);
+        }
+
+        #[test]
+        fn the_installer_hooks_match_this_binary() {
+            // The NSIS hooks name the service and call these commands; a rename
+            // on either side must fail here, not on a user's machine.
+            let hooks = include_str!("../../app/installer-hooks.nsh");
+            assert!(
+                hooks.contains(&format!("!define SCT_SERVICE_NAME \"{SERVICE_NAME}\"")),
+                "installer-hooks.nsh names another service"
+            );
+            for cmd in ["--stop-service", "--install-service", "--uninstall-service"] {
+                assert!(
+                    hooks.contains(cmd),
+                    "installer-hooks.nsh does not call {cmd}"
+                );
+                assert!(USAGE.contains(cmd), "{cmd} is not a command of this binary");
+            }
+        }
+
+        #[test]
+        fn the_host_is_the_app_next_to_the_service() {
+            let path = std::path::PathBuf::from(engine_path());
+            assert_eq!(
+                path.file_name().and_then(|n| n.to_str()),
+                Some("sharectrl.exe")
+            );
+            let here = std::env::current_exe().expect("test exe path");
+            assert_eq!(path.parent(), here.parent());
+        }
     }
 }

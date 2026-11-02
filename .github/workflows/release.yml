@@ -13,8 +13,10 @@
 #   (re)publish an existing tag by hand, run it from that tag with `dry_run` unticked.
 #
 # Assets (all from native/scripts/release-assets.sh, via build-assets.yml)
-#   ShareCtrlScreen_<v>_x64-setup.exe     Windows NSIS installer (unsigned; SmartScreen)
-#   sharectrl-service.exe                 Windows SYSTEM service (UAC / lock screen)
+#   ShareCtrlScreen_<v>_x64-setup.exe     Windows NSIS installer (unsigned; SmartScreen).
+#                                          Bundles, registers and starts the SYSTEM service.
+#   sharectrl-service.exe                 Windows SYSTEM service, standalone — only for a
+#                                          manual install (the installer already sets it up)
 #   ShareCtrlScreen_<v>_universal.dmg     macOS 13+, arm64 + x86_64 (self-signed)
 #   ShareCtrlScreen_<v>_amd64.AppImage    Linux, any distro with glibc >= 2.35
 #   ShareCtrlScreen_<v>_amd64.deb         Debian 12+ / Ubuntu 22.04+
@@ -251,7 +253,7 @@ jobs:
           cat >notes.md <<EOF
           ShareCtrlScreen $VERSION
 
-          - **Windows:** \`ShareCtrlScreen_${VERSION}_x64-setup.exe\` (installer) or \`sharectrl.exe\` (portable, run it from any folder). Not code-signed: SmartScreen warns on the first run (More info -> Run anyway). For UAC prompts and the lock screen, put \`sharectrl-service.exe\` next to \`sharectrl.exe\` and install the service once as administrator: \`sharectrl-service.exe --install-service\`.
+          - **Windows:** \`ShareCtrlScreen_${VERSION}_x64-setup.exe\` (installer) or \`sharectrl.exe\` (portable, run it from any folder). Not code-signed: SmartScreen warns on the first run (More info -> Run anyway). The installer sets up the SYSTEM service for you — it bundles \`sharectrl-service.exe\`, registers it and starts it (one administrator consent), so UAC prompts and the lock screen work, remote Alt+Tab and the Windows key pass through to the host, and the host starts at sign-in; uninstalling removes it. The standalone \`sharectrl-service.exe\` download is only for a manual install next to a portable \`sharectrl.exe\` (\`sharectrl-service.exe --install-service\` as administrator).
           - **macOS 13+ (Apple Silicon and Intel):** \`ShareCtrlScreen_${VERSION}_universal.dmg\`. Not notarized: the first launch needs System Settings -> Privacy & Security -> Open Anyway. $mac_line
           - **Linux (x86_64):** \`.deb\` (Ubuntu 22.04+, Debian 12+), \`.rpm\` (Fedora 40+) or \`.AppImage\`.
 

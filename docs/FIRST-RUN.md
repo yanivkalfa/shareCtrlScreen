@@ -15,12 +15,41 @@ is not code-signed. This is expected.
 1. Click **More info**.
 2. Click **Run anyway**. The installer then continues as usual.
 
-For UAC prompts, the lock screen and the sign-in screen, install the Windows service
-once. Open a terminal as administrator and run:
+The installer sets up the Windows service for you: it puts `sharectrl-service.exe` next to
+the app, then registers and starts the `ShareCtrlScreenHost` service after you approve one
+administrator prompt. That service is what lets the remote side reach UAC prompts, the lock
+screen and the sign-in screen, and it starts the app at every sign-in. Uninstalling removes
+it. You do not need to run anything by hand.
+
+If you run the **portable** `sharectrl.exe` instead of installing, and you want that same
+reach, put the standalone `sharectrl-service.exe` next to it and run this once from a
+terminal opened as administrator (`--uninstall-service` removes it):
 
 ```
 sharectrl-service.exe --install-service
 ```
+
+Running the host under this service also lets remote **Alt+Tab** and the **Windows key**
+reach it (the task switcher and the Start menu), which Windows otherwise blocks for
+injected input. The service grants the host the Windows UIAccess token flag at launch; a
+host you start yourself does not get it. To check which case you have, look at the top of
+`%APPDATA%\ShareCtrlScreen\app.log` for one of:
+
+- `UIAccess: granted` — the host runs under the service; Alt+Tab and the Windows key work.
+- `UIAccess: not granted — the host was not started by the service` — a host you started
+  yourself (Program Files or the portable copy). Everything else works; only those two
+  shell shortcuts stay on your own machine.
+
+`sharectrl.exe --print-uiaccess` is a separate self-check that **prints** that same line for
+the **invocation you run**, not for the running service host. A `sharectrl.exe` you start by
+hand is a fresh non-service process, so it prints `not granted` even on a working service
+host — read the service host's own `app.log` (above) to confirm it is granted. Read the
+printed line: `sharectrl.exe` is a GUI-subsystem binary, so `cmd /c "… --print-uiaccess" &
+echo %errorlevel%` prints `0` whatever the result (cmd does not wait for it). For the numeric
+code (0 granted / 1 not), use PowerShell `(Start-Process sharectrl.exe -ArgumentList
+'--print-uiaccess' -Wait -PassThru).ExitCode`. If the service could not set the flag for some
+reason, it still starts the host and records why in `sharectrl-service.log` next to the
+service executable.
 
 ## macOS (13 Ventura or later)
 

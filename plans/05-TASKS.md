@@ -52,7 +52,7 @@
 | M12 take every Cmd shortcut (macOS viewer) | **done** (Opus, Opus-reviewed, merged 99ed737; type-checked for aarch64-apple-darwin, device-pending) | M6 tap takes every Cmd chord + Ctrl+arrows while the video has the keyboard; Cmd+Q stays local (tap and key monitor); Force Quit / Lock Screen never claimed; every modifier synchronised before a taken key; hook keys now share the surface's FIFO input channel (D8 ordering risk closed); focus loss releases at once. Also: toolbar-reveal diagnostics + layer-frame sync + full-screen cover (owner's "top edge does nothing"). **Device-pending** (checklists/M6.md §6–§7) |
 | D9 host cursor sprite on the viewer | **done** (Opus, Opus-reviewed; device-pending I1–I3: real cursor images incl. I-beam in a terminal) | additive cursor-shape message, host sends on change, viewer draws the real sprite at position−hotspot in both presenters; replaces the synthetic triangle |
 | W4 installer bundles + registers the SYSTEM service | **in progress** (Opus) | NSIS hooks install/start/stop/uninstall `sharectrl-service.exe` next to `sharectrl.exe`; one host instance rule; CI silent install/uninstall job |
-| W5 UIAccess (Alt+Tab / Win key passthrough) | **in progress** (Opus; rebases onto W4) | service sets `TokenUIAccess` (SeTcb) and/or signed `uiAccess="true"` build with self-signed Authenticode + Trusted Root import by the installer; `--print-uiaccess`; startup log line |
+| W5 UIAccess (Alt+Tab / Win key passthrough) | **in progress** (Opus; rebases onto W4) | route (a) only: the service sets `TokenUIAccess` (SeTcb) on the host token; `--print-uiaccess`; startup log line. Signed route deferred to W6 (see the card) |
 | T4 Wayland CI | **done** (Haiku, Opus-reviewed; jobs unverified until pushed; GNOME portal tests are device-pass items) | `native-ci.yml` jobs `wayland-sway` (ubuntu-24.04: sway + xdg-desktop-portal-wlr + pipewire + wireplumber; runs L5 `wayland_surface`, L1 `portal_capture --ignored`, and L6 `input::tests` minus uinput and `xtest_*`) and `wayland-gnome` (ubuntu-24.04: mutter 46 + xdg-desktop-portal-gnome; proves the stack, runs no test: the consent dialog has no headless pre-authorization, so the libei and GNOME portal-capture tests are device-pass items). Scripts in `.github/wayland/`. Local (lane, WSL): `wayland_surface` PASS (T4-02); `input::tests` wlroots and EIS pass, uinput fails under REQUIRED as designed (T4-03). Owner verification after the push: see the T4 card |
 | L5 video surface | **done** (Opus, Opus-reviewed; device-pending per checklists/L5.md) | X11: child window of the GTK toplevel on our own x11rb connection, XShape reveal clip, XDND drops via `XdndProxy`, Expose → redraw of the last frame. Wayland: the spike's area+video subsurface tree on GDK's connection (re-attached when GDK re-creates the toplevel surface), `wp_viewporter` crop + fractional scale, drops through GDK's own data device (sink window); decision-#3 separate window when there is no `wp_viewporter` or `SHARECTRL_VIDEO_WINDOW=separate`. Keys from the GTK toplevel on both (keymap: XKB − 8 = evdev). One wgpu presenter (Vulkan, GL fallback) over `surface-wgpu`. Headless tests: `tests/x11_surface.rs` (Xvfb), `tests/wayland_surface.rs` (headless sway). **Device-pending** (checklists/L5.md) |
 | L1 Wayland capture | **done** (Opus, Opus-reviewed) | `portal_capture/`: portal ScreenCast (handshake shared with L12 in `portal_session.rs`, token scope kept: a combined token reopens a combined session) + pipewire-rs 0.10 stream thread, shared-memory BGRx/BGRA first (no modifiers → no DMA-BUF; L1b), cursor + damage metadata, pause/resize → `Lost` → resume; a stream-level failure → rebuild from the token on a background thread (reinit never blocks the host thread on a dialog); "Stop sharing" in the desktop indicator, a declined dialog or an unanswered one (120 s) end the hosted session (terminal, AnyDesk behaviour). The 120 s dialog wait on the host media thread happens only in the first `create_capture`. Monitor chosen in the portal dialog (Wayland `display` ids → `NoOutput`). Build needs `libpipewire-0.3-dev libspa-0.2-dev libclang-dev`. **Device-pending** (checklists/L1.md); acceptance test `tests/portal_capture.rs` (ignored) for T4. **Note for L6:** L6 layers a shared session slot over `portal_session::start(scope, previous, bound, abandon)` and extends `Granted` with the RemoteDesktop proxy; today the capture's `watch()` owns `granted.session` and closes it when the capture drops it. Once shared, that ownership moves into L6's slot, so only the last holder (capture or injector) closes the session. **Done in L6:** `portal_shared.rs` holds the combined session; the capture joins it (`Held::Shared`) when its token is combined, remote control already holds it, or remote control would use the portal, and owns only screen-only sessions itself |
@@ -220,6 +220,32 @@ I1..I4 after all lanes (hardware validation)
   instance exists, and uninstall removes the service. Orchestrator smoke on machine A.
 
 ### W5 — UIAccess for the Windows host: Alt+Tab / Win key passthrough  (size M, Windows; owner request 2026-11-02; after W4 merges, rebase onto it)
+* **Scope decision 2026-11-02 (orchestrator, after the first research pass):** W5 ships route (a)
+  only — the service route. Route (b), the signed `uiAccess="true"` build, moves to a
+  follow-up card (W6) because the research showed it is a different, larger job: Tauri signs
+  inside `cargo tauri build` (main exe, bundled .exe resources, uninstaller, installer) so
+  the secrets must reach the Build step through `bundle.windows.signCommand`; the manifest
+  is not embedded today at all (`build.rs` only calls `tauri_build::build()`, Tauri's default
+  Common-Controls manifest is used; `sharectrl.manifest` is unreferenced) and would go in via
+  `tauri_build::WindowsAttributes::app_manifest`; a `uiAccess="true"` exe cannot be started by
+  plain `CreateProcess` from a caller without UIAccess (error 740: installer "run after
+  install", CI smoke, and the service launch unless it sets the token flag first); the
+  portable copy would need its manifest reset to `false` and a re-sign or it may not start on
+  a machine without the certificate; and Microsoft does not document whether an out-of-path
+  or untrusted signed UIAccess exe still launches. The owner's two Windows hosts are
+  installed by W4 (service), so route (a) alone delivers Alt+Tab / Win key for them.
+* **Route (a) as scoped:** the SYSTEM service, which already holds the user's token from
+  `WTSQueryUserToken` and `SeTcbPrivilege`, sets `TokenUIAccess` on the token it hands to
+  `CreateProcessAsUserW` — the documented way Windows itself launches assistive tools (Ease
+  of Access / utilman) — then the host's existing `elevation::process_has_uiaccess()` reports
+  the flag. Deliver: the token step in `elevation::session` with the privilege enabled
+  explicitly and every failure mapped to an actionable error (the service falls back to a
+  launch WITHOUT the flag and logs why, never refuses to launch the host); the startup log
+  line and `--print-uiaccess` from the card; README / FIRST-RUN / release-notes wording "Alt+Tab
+  and the Windows key pass through when the host runs under the service"; checklist W5.md
+  (service mode: granted + Alt+Tab switches + Win opens Start; user-launched mode: `not
+  granted — the host was not started by the service`; portable: same). No manifest change, no
+  certificate, no signing in W5.
 * Problem: synthesized Alt+Tab and the Windows key are refused by the shell unless the
   injecting process has the UIAccess token flag (Microsoft, "Security Considerations for
   Assistive Technologies" / UIPI). Our manifest (`native/app/sharectrl.manifest`) is

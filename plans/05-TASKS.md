@@ -51,10 +51,12 @@
 | D8 modifier translation | **done** (Opus, Opus-reviewed; I2 device pass pending) | viewer-side `KeyTranslator` (`engine/src/modifiers.rs`): Cmd ↔ Ctrl swap and Cmd+Tab→Alt+Tab (Mac → PC), Ctrl ↔ Cmd and Alt+Tab→Cmd+Tab (PC → Mac), sent-code tracking; host OS via new optional `connect-response.os`; `translateModifiers` toggle (default on) in Settings → Advanced; unit + loopback-tested. **Device-pending** (I2 Mac↔Windows); closes M6's blocked Cmd+Tab line |
 | M12 take every Cmd shortcut (macOS viewer) | **done** (Opus, Opus-reviewed, merged 99ed737; type-checked for aarch64-apple-darwin, device-pending) | M6 tap takes every Cmd chord + Ctrl+arrows while the video has the keyboard; Cmd+Q stays local (tap and key monitor); Force Quit / Lock Screen never claimed; every modifier synchronised before a taken key; hook keys now share the surface's FIFO input channel (D8 ordering risk closed); focus loss releases at once. Also: toolbar-reveal diagnostics + layer-frame sync + full-screen cover (owner's "top edge does nothing"). **Device-pending** (checklists/M6.md §6–§7) |
 | D9 host cursor sprite on the viewer | **done** (Opus, Opus-reviewed; device-pending I1–I3: real cursor images incl. I-beam in a terminal) | additive cursor-shape message, host sends on change, viewer draws the real sprite at position−hotspot in both presenters; replaces the synthetic triangle |
+| D10 viewer cursor lag on a high-RTT link (draw at local pointer + hide OS cursor) | **in progress** (Opus) | capture already keeps the cursor out of the video; the drawn sprite follows the host out-of-band echo (a round trip behind) while the local OS cursor is instant → two cursors. Fix: draw the sprite at the LOCAL pointer when controlling + hide the OS cursor over the video |
 | W4 installer bundles + registers the SYSTEM service | **done** (Opus, Opus-reviewed, merged d0119b4; Rust lane-proven, installer by new CI job + machine-A smoke pending; device pass checklists/W4.md) | NSIS hooks install/start/stop/uninstall `sharectrl-service.exe` next to `sharectrl.exe`; one host instance rule; CI silent install/upgrade/uninstall job. Acceptance narrowed: service setup + one instance + standalone asset; elevated-window control is NOT a W4 claim |
 | W5 UIAccess (Alt+Tab / Win key passthrough) | **done** (Opus, Opus-reviewed; device-pending checklists/W5.md: Alt+Tab/Win via the service) | route (a) only: the service sets `TokenUIAccess` (SeTcb) on a duplicate of the host token; `--print-uiaccess`; startup log line; fallback launches without the flag and logs why. Signed route deferred to W6 (see the card) |
 | W7 uninstaller removes the whole install dir (service log leftover) | **done** (Opus, Opus-reviewed, merged 03d98af; proven by the windows-installer CI job on push) | first windows-installer CI run failed only on uninstall-clean: `sharectrl-service.log` left in Program Files; RMDir /r $INSTDIR in POSTUNINSTALL |
 | U1 in-app updater (check/download/install/restart) | **done** (Opus, Opus-reviewed; device-pending U1.md: real update loop needs two updater-enabled releases) | tauri-plugin-updater 2.14.1 + tauri-plugin-process 2.4.0, updater signing key (orchestrator-created secrets), latest.json generated on the release, Settings UI, service-aware install+restart; TOP priority |
+| U2 Settings/Update unreachable while hosting | **in progress** (Opus) | the gear that opens Settings→Updates is only on home + viewer screens; screen-host has none → cannot update mid-session. Fix: add the gear to the host sharing screen, wired to openSettings() |
 | W8 service-host fast path (DDA capture + HW encode) | **done** (Opus, Opus-reviewed, merged 0afabeb; capture fast-path implemented, HW-encode fix device-pending hypothesis — checklists/W8.md) | service-launched host loses the fast DDA path + HW encoder → software fallback + media-loop restarts = lag; attach the capture thread (and so the shared device the HW MFT uses) to the active input desktop + reclassify E_ACCESSDENIED as recoverable and retry instead of ending the loop; goal widened to restore capture AND HW encode (owner: was smooth self-launched) |
 | M13 macOS toolbar drawer not shown (reveal fires, strip empty) | **done** (Opus, Opus-reviewed, merged bcf7b6f; type-checked for aarch64-apple-darwin, device-pending checklists/M13.md) | Root cause: `apply_layout` positioned the hosted layer's 40px gap with the parent *view*'s `isFlipped`, but a hosted layer's frame lives in the parent *layer*'s coordinate space, whose geometry flip is independent (wry: unflipped view, geometry-flipped WKWebView layer) — so the gap opened at the wrong visual edge and the video kept covering the toolbar. Fix (view.rs only; shared reveal.rs untouched): drive the layer frame from the parent layer's own `isGeometryFlipped`, so the strip is always at the visual top. Secondary: ignore `mouseExited` reveals mapped more than one bar height above the top (the app.log's y≈-470/-1025 artifacts). M12 reveal logging kept |
 | V1 host overshoots a congested link (video stutter) | **done** (Opus, Opus-reviewed, merged 003fbf8; loopback proves encoder tracks BWE down+up; on-screen smoothness device-pending checklists/V1.md) | ROOT CAUSE (investigation): July 78cd049 raised MIN_BITRATE 400k→2.5M + DESIRED→9M + a raw-BWE source pacer → encoder wont follow BWE down → overshoot→loss→BWE collapse (65↔3700), unpaced keyframe bursts. Fix (As built): MIN_BITRATE→500k + DESIRED→8M so the encoder follows BWE down; a hysteretic resolution ladder (1.0/0.75/0.5/0.33) spends degradation on encode size, fps drops only below the smallest step; the source pacer is removed (str0m paces egress) and forced IDRs no longer bypass it. Owner: Windows went slow when the service came in (lost the fast path → tipped the latent overshoot); Mac/Linux slow from the start |
@@ -753,6 +755,75 @@ I1..I4 after all lanes (hardware validation)
   viewer's pixels: the MOCK encoder passes the source frame's dimensions through unchanged (a real encoder
   resamples to the configured size), so the on-screen resolution drop is device-only (checklists/V1.md).
   The existing 7 loopback tests and the full workspace suite stay green on Windows and WSL.
+
+### D10 — Viewer cursor feels laggy on a high-latency link: draw it at the LOCAL pointer, hide the OS cursor  (size M, all viewer OSes; owner report 2026-11-02)
+* Problem (diagnosed with the owner from the controller screen): when controlling over a relayed/high-RTT
+  link the pointer "lags behind". The controlled machine's own cursor moves smoothly (input arrives fine),
+  but the controller shows TWO cursors with a visible gap = the latency made visible:
+    1. the controller's own OS cursor, at the real mouse position (instant), NOT hidden over the video; and
+    2. the client-side cursor SPRITE the viewer draws (render/src/lib.rs `draw_cursor`, surface-wgpu
+       `cursor_rect`/`set_cursor_sprite`, D9 sprite) — drawn at the **host's out-of-band `PointerPosition`**
+       (render/src/lib.rs:88 claims this "feels instant", true only on a LAN; on a TURN relay the host echo
+       is a full round trip behind the real mouse).
+  The capture is NOT the cause: every host backend already keeps the cursor OUT of the video and reports it
+  out-of-band (capture/src/lib.rs "out-of-band cursor info", macOS `showsCursor=false`, Linux "Cursor never
+  part of the picture"). So the video has no baked cursor; the lag is purely that the DRAWN sprite follows
+  the host's delayed echo while the local OS cursor is instant.
+* Deliverable (make the pointer feel instant, one cursor, correct host shape):
+  (1) **Drive the drawn cursor from the LOCAL pointer when the viewer is controlling.** The viewer already
+      knows the local pointer position (it is the one being SENT to the host as input). When this session has
+      CONTROL and the local pointer is over the video, position the cursor sprite at that LOCAL position
+      (instant) instead of the host's out-of-band `PointerPosition`. Keep using the host's out-of-band
+      position when the viewer is VIEW-ONLY, or for host-initiated moves while the local pointer is not over
+      the surface (so the host's own cursor movement is still reflected). The sprite SHAPE stays the host's
+      (D9) — only the POSITION source changes. This is standard client-side cursor prediction (AnyDesk/RDP).
+  (2) **Hide the controller's OS cursor while the local pointer is over the video surface** so only the drawn
+      sprite shows (no duplicate). Per viewer OS: macOS `NSCursor::hide/unhide` (balance hide/unhide on
+      enter/exit and focus loss so the OS cursor can never get stuck hidden); Windows (the `render` D3D11
+      viewer) the tao/winit window cursor-visible API or `SetCursor(NULL)` within the client area; Linux the
+      same winit/tao path. Restore the OS cursor the instant the pointer leaves the video or the window loses
+      focus. If hiding the OS cursor is not reliable on a platform, fall back to keeping it but STILL draw the
+      sprite at the local position (so at least the two cursors coincide and there is no visible lag gap).
+  (3) Must not regress D9 (the real host cursor SHAPE still shows, I-beam in a terminal etc.), the fallback
+      arrow when no shape, `visible==false` hiding, the reveal/toolbar, or input. HiDPI/letterbox mapping of
+      the local pointer to the normalized video position must reuse the existing geometry (surface-wgpu
+      `geometry.rs` pointer→normalized map; render viewport mapping) so the sprite lands exactly under the
+      real mouse.
+* Non-goals: changing the host capture (cursor is already out-of-band); input/injection latency (fine);
+  video-frame latency.
+* Tests: unit-test the "which position source" selection (control+over-surface → local; view-only or
+  pointer-not-over → host out-of-band) and the local-pointer→normalized mapping (reuse/extend the geometry
+  tests). The OS-cursor hide/restore is platform UI — device-verified; add a checklist. Keep all existing
+  render/surface-wgpu/loopback tests green.
+* Acceptance (device, the owner's real relayed session): controlling over the relay, the pointer feels
+  immediate — ONE cursor that tracks the real mouse with no trailing second cursor and no visible lag gap,
+  with the correct host shape; view-only still shows the host's cursor moving; the OS cursor returns when the
+  pointer leaves the video; nothing stuck. Checklist plans/checklists/D10.md. This is the fix for the owner's
+  "mouse lags behind" even though input and video are fine.
+
+### U2 — Settings/Update is unreachable while hosting a session  (size XS–S, UI; owner report 2026-11-02)
+* Problem: the Updates control (U1) lives in the Settings modal, opened by the gear button. But the gear
+  exists only on `screen-home` (`btn-settings`, index.html:25) and on the viewer screen (`btn-view-settings`,
+  index.html:104). The HOST sharing screen `screen-host` (index.html:62, "Sharing screen with …", the
+  Permission dropdown + End session) has NO gear — so while this machine is hosting/being-controlled there is
+  no way to reach Settings → Updates without ending the session. The owner could not find the Update button
+  for exactly this reason (they were on the host sharing screen).
+* Deliverable: add a Settings gear to `screen-host`'s header (mirroring `btn-view-settings` on `screen-view`:
+  same ⚙ glyph, `btn-ghost btn-sm`, `title="Settings"`), wired in app.js to the SAME `openSettings()` the
+  other two gears use (add the id to the click-binding that currently binds btn-settings / btn-view-settings).
+  `openSettings()` already hides the native video surface so the modal paints above it and restores it on
+  close (app.js ~229/234) — confirm that path works from the host screen too (the host also has a native
+  video child window). The Updates section, "Check for updates", and the service-aware "Update & restart"
+  (U1) then work from an active host session; a live-session update still shows the U1 "this ends the
+  session" warning.
+* Non-goals: the controller-triggers-host remote update (that is a separate, larger feature — note it as a
+  follow-up "remote update", the owner asked for it earlier); any change to the updater logic itself (U1).
+* Tests: no Rust logic to unit-test; the change is index.html + app.js. Lane `cargo fmt --all --check` +
+  workspace check/clippy/test must stay green (no Rust touched, but run it to confirm the tree is clean).
+  Device/manual: from an active host session, the gear opens Settings, Updates is reachable, Check for
+  updates works, and closing Settings restores the video.
+* Acceptance: while hosting, the gear on the sharing screen opens Settings and the Update flow is reachable
+  without ending the session. Checklist note in plans/checklists (or fold into U1.md).
 
 ## Lane M — macOS backend (`crates/platform-macos`)
 

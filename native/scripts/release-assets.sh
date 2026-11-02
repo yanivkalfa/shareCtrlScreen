@@ -25,7 +25,7 @@
 #                      key set -> ad-hoc signature (development/fork builds) with a warning.
 #
 # Release assets in native/dist/
-#   windows  ShareCtrlScreen_<v>_x64-setup.exe, sharectrl-service.exe
+#   windows  ShareCtrlScreen_<v>_x64-setup.exe, sharectrl.exe (portable), sharectrl-service.exe
 #   macos    ShareCtrlScreen_<v>_universal.dmg
 #   linux    ShareCtrlScreen_<v>_amd64.AppImage, ShareCtrlScreen_<v>_amd64.deb,
 #            ShareCtrlScreen-<v>-1.x86_64.rpm
@@ -169,6 +169,10 @@ package_windows() {
     return 1
   }
   cp "$setup" "$dist/"
+  # The bare app binary ships too, under its build name: a portable copy for people who
+  # run it from a folder instead of installing (it is the same file the installer puts
+  # in Program Files; it needs the WebView2 runtime, present on Windows 10/11).
+  cp "$target_dir/release/sharectrl.exe" "$dist/"
   cp "$target_dir/release/sharectrl-service.exe" "$dist/"
 }
 

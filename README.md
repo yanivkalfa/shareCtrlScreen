@@ -195,7 +195,8 @@ GitHub Release with these assets:
 | Asset | For |
 |---|---|
 | `ShareCtrlScreen_<version>_x64-setup.exe` | Windows installer (not code-signed: SmartScreen warns, More info → Run anyway) |
-| `sharectrl-service.exe` | Windows service for UAC prompts and the lock screen |
+| `sharectrl.exe` | Windows portable app, the same binary the installer puts in Program Files; run it from any folder (needs the WebView2 runtime, present on Windows 10/11) |
+| `sharectrl-service.exe` | Windows service for UAC prompts and the lock screen; place it next to `sharectrl.exe` before `--install-service` (it launches the host from its own folder) |
 | `ShareCtrlScreen_<version>_universal.dmg` | macOS 13+, Apple Silicon and Intel |
 | `ShareCtrlScreen_<version>_amd64.deb` / `ShareCtrlScreen-<version>-1.x86_64.rpm` / `ShareCtrlScreen_<version>_amd64.AppImage` | Linux |
 | `THIRD-PARTY-LICENSES-<os>.html` | Licences of the open-source code in that OS's build (also inside each installer) |

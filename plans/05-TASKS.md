@@ -51,6 +51,8 @@
 | D8 modifier translation | **done** (Opus, Opus-reviewed; I2 device pass pending) | viewer-side `KeyTranslator` (`engine/src/modifiers.rs`): Cmd ↔ Ctrl swap and Cmd+Tab→Alt+Tab (Mac → PC), Ctrl ↔ Cmd and Alt+Tab→Cmd+Tab (PC → Mac), sent-code tracking; host OS via new optional `connect-response.os`; `translateModifiers` toggle (default on) in Settings → Advanced; unit + loopback-tested. **Device-pending** (I2 Mac↔Windows); closes M6's blocked Cmd+Tab line |
 | M12 take every Cmd shortcut (macOS viewer) | **done** (Opus, Opus-reviewed, merged 99ed737; type-checked for aarch64-apple-darwin, device-pending) | M6 tap takes every Cmd chord + Ctrl+arrows while the video has the keyboard; Cmd+Q stays local (tap and key monitor); Force Quit / Lock Screen never claimed; every modifier synchronised before a taken key; hook keys now share the surface's FIFO input channel (D8 ordering risk closed); focus loss releases at once. Also: toolbar-reveal diagnostics + layer-frame sync + full-screen cover (owner's "top edge does nothing"). **Device-pending** (checklists/M6.md §6–§7) |
 | D9 host cursor sprite on the viewer | **done** (Opus, Opus-reviewed; device-pending I1–I3: real cursor images incl. I-beam in a terminal) | additive cursor-shape message, host sends on change, viewer draws the real sprite at position−hotspot in both presenters; replaces the synthetic triangle |
+| W4 installer bundles + registers the SYSTEM service | **in progress** (Opus) | NSIS hooks install/start/stop/uninstall `sharectrl-service.exe` next to `sharectrl.exe`; one host instance rule; CI silent install/uninstall job |
+| W5 UIAccess (Alt+Tab / Win key passthrough) | **in progress** (Opus; rebases onto W4) | route (a) only: the service sets `TokenUIAccess` (SeTcb) on the host token; `--print-uiaccess`; startup log line. Signed route deferred to W6 (see the card) |
 | T4 Wayland CI | **done** (Haiku, Opus-reviewed; jobs unverified until pushed; GNOME portal tests are device-pass items) | `native-ci.yml` jobs `wayland-sway` (ubuntu-24.04: sway + xdg-desktop-portal-wlr + pipewire + wireplumber; runs L5 `wayland_surface`, L1 `portal_capture --ignored`, and L6 `input::tests` minus uinput and `xtest_*`) and `wayland-gnome` (ubuntu-24.04: mutter 46 + xdg-desktop-portal-gnome; proves the stack, runs no test: the consent dialog has no headless pre-authorization, so the libei and GNOME portal-capture tests are device-pass items). Scripts in `.github/wayland/`. Local (lane, WSL): `wayland_surface` PASS (T4-02); `input::tests` wlroots and EIS pass, uinput fails under REQUIRED as designed (T4-03). Owner verification after the push: see the T4 card |
 | L5 video surface | **done** (Opus, Opus-reviewed; device-pending per checklists/L5.md) | X11: child window of the GTK toplevel on our own x11rb connection, XShape reveal clip, XDND drops via `XdndProxy`, Expose → redraw of the last frame. Wayland: the spike's area+video subsurface tree on GDK's connection (re-attached when GDK re-creates the toplevel surface), `wp_viewporter` crop + fractional scale, drops through GDK's own data device (sink window); decision-#3 separate window when there is no `wp_viewporter` or `SHARECTRL_VIDEO_WINDOW=separate`. Keys from the GTK toplevel on both (keymap: XKB − 8 = evdev). One wgpu presenter (Vulkan, GL fallback) over `surface-wgpu`. Headless tests: `tests/x11_surface.rs` (Xvfb), `tests/wayland_surface.rs` (headless sway). **Device-pending** (checklists/L5.md) |
 | L1 Wayland capture | **done** (Opus, Opus-reviewed) | `portal_capture/`: portal ScreenCast (handshake shared with L12 in `portal_session.rs`, token scope kept: a combined token reopens a combined session) + pipewire-rs 0.10 stream thread, shared-memory BGRx/BGRA first (no modifiers → no DMA-BUF; L1b), cursor + damage metadata, pause/resize → `Lost` → resume; a stream-level failure → rebuild from the token on a background thread (reinit never blocks the host thread on a dialog); "Stop sharing" in the desktop indicator, a declined dialog or an unanswered one (120 s) end the hosted session (terminal, AnyDesk behaviour). The 120 s dialog wait on the host media thread happens only in the first `create_capture`. Monitor chosen in the portal dialog (Wayland `display` ids → `NoOutput`). Build needs `libpipewire-0.3-dev libspa-0.2-dev libclang-dev`. **Device-pending** (checklists/L1.md); acceptance test `tests/portal_capture.rs` (ignored) for T4. **Note for L6:** L6 layers a shared session slot over `portal_session::start(scope, previous, bound, abandon)` and extends `Granted` with the RemoteDesktop proxy; today the capture's `watch()` owns `granted.session` and closes it when the capture drops it. Once shared, that ownership moves into L6's slot, so only the last holder (capture or injector) closes the session. **Done in L6:** `portal_shared.rs` holds the combined session; the capture joins it (`Held::Shared`) when its token is combined, remote control already holds it, or remote control would use the portal, and owns only screen-only sessions itself |
@@ -177,6 +179,116 @@ I1..I4 after all lanes (hardware validation)
   to do: NumLock toggles the LED on the host and Pause does nothing.
 
 ---
+
+### W4 — Windows installer bundles, registers and starts the SYSTEM service  (size S–M, Windows; owner request 2026-11-02)
+* Problem: the NSIS installer puts only `sharectrl.exe` in Program Files. The SYSTEM service
+  (`sharectrl-service.exe`, lane §8b) is a separate download and a manual admin step, the
+  service launches the host from ITS OWN folder (`service/src/main.rs` joins
+  `sharectrl.exe` to `current_exe().parent()`), and nothing says so. Result in the owner's
+  live test: the service was mistaken for the app, and a plain install could neither see nor
+  control a UAC prompt or an elevated window (UIPI + secure desktop; README "Elevated
+  windows are not controllable").
+* Deliverable: one installer that leaves a host machine fully set up.
+  (1) `sharectrl-service.exe` ships INSIDE the NSIS bundle, installed next to
+  `sharectrl.exe` in `$INSTDIR` (Tauri `bundle.resources` or an equivalent that keeps the
+  file name; `scripts/release-assets.sh` already builds `-p service --release` before
+  `tauri build`; keep the standalone asset too for manual installs).
+  (2) Tauri NSIS installer hooks (`bundle.windows.nsis.installerHooks`, a `.nsh` file under
+  `native/app/`): post-install → stop an existing service if present, run
+  `"$INSTDIR\sharectrl-service.exe" --install-service`, start it; pre-uninstall → stop +
+  `--uninstall-service`; upgrade → service stopped before files are replaced and started
+  after, never leaving a stopped service behind. Installer stays `perMachine` (elevated).
+  Every hook step logs to the NSIS details pane and a failure aborts with a message that
+  names the step.
+  (3) Exactly one host instance: when the service is installed and running, the app's own
+  Start-with-Windows registration is not created / is removed (the service instance IS the
+  autostart), and a user-launched `sharectrl.exe` that finds the service instance running
+  exits with a log line and (if a single-instance mechanism exists) brings its window up
+  instead of silently dying. Document the rule in README.
+  (4) The service's launch of the host carries the host's working directory, environment
+  and `--autostart` semantics exactly as today (`elevation::session` invariants).
+* Research: Tauri v2 "Windows Installer" → Installer hooks; NSIS `nsExec::ExecToLog`
+  (bundled plugins only, no SimpleSC); Microsoft Service Control Manager docs for
+  stop/start ordering. Cite them in the `.nsh` header and the Rust `//! ## References`.
+* Tests / CI: a `windows-installer` job (native-ci, windows-latest) builds the NSIS bundle
+  (reuse the release-build job's artifact if cheaper), installs it silently (`/S`), asserts
+  the service exists and is RUNNING (`sc query`) and `sharectrl-service.exe` sits next to
+  `sharectrl.exe` under Program Files, then uninstalls silently and asserts the service is
+  gone. Unit tests for any new Rust (instance rule, autostart decision).
+* Acceptance: on a real Windows host, one installer run + one UAC consent; afterwards, from
+  the viewer, a UAC prompt and the lock screen are visible AND controllable, one tray
+  instance exists, and uninstall removes the service. Orchestrator smoke on machine A.
+
+### W5 — UIAccess for the Windows host: Alt+Tab / Win key passthrough  (size M, Windows; owner request 2026-11-02; after W4 merges, rebase onto it)
+* **Scope decision 2026-11-02 (orchestrator, after the first research pass):** W5 ships route (a)
+  only — the service route. Route (b), the signed `uiAccess="true"` build, moves to a
+  follow-up card (W6) because the research showed it is a different, larger job: Tauri signs
+  inside `cargo tauri build` (main exe, bundled .exe resources, uninstaller, installer) so
+  the secrets must reach the Build step through `bundle.windows.signCommand`; the manifest
+  is not embedded today at all (`build.rs` only calls `tauri_build::build()`, Tauri's default
+  Common-Controls manifest is used; `sharectrl.manifest` is unreferenced) and would go in via
+  `tauri_build::WindowsAttributes::app_manifest`; a `uiAccess="true"` exe cannot be started by
+  plain `CreateProcess` from a caller without UIAccess (error 740: installer "run after
+  install", CI smoke, and the service launch unless it sets the token flag first); the
+  portable copy would need its manifest reset to `false` and a re-sign or it may not start on
+  a machine without the certificate; and Microsoft does not document whether an out-of-path
+  or untrusted signed UIAccess exe still launches. The owner's two Windows hosts are
+  installed by W4 (service), so route (a) alone delivers Alt+Tab / Win key for them.
+* **Route (a) as scoped:** the SYSTEM service, which already holds the user's token from
+  `WTSQueryUserToken` and `SeTcbPrivilege`, sets `TokenUIAccess` on the token it hands to
+  `CreateProcessAsUserW` — the documented way Windows itself launches assistive tools (Ease
+  of Access / utilman) — then the host's existing `elevation::process_has_uiaccess()` reports
+  the flag. Deliver: the token step in `elevation::session` with the privilege enabled
+  explicitly and every failure mapped to an actionable error (the service falls back to a
+  launch WITHOUT the flag and logs why, never refuses to launch the host); the startup log
+  line and `--print-uiaccess` from the card; README / FIRST-RUN / release-notes wording "Alt+Tab
+  and the Windows key pass through when the host runs under the service"; checklist W5.md
+  (service mode: granted + Alt+Tab switches + Win opens Start; user-launched mode: `not
+  granted — the host was not started by the service`; portable: same). No manifest change, no
+  certificate, no signing in W5.
+* Problem: synthesized Alt+Tab and the Windows key are refused by the shell unless the
+  injecting process has the UIAccess token flag (Microsoft, "Security Considerations for
+  Assistive Technologies" / UIPI). Our manifest (`native/app/sharectrl.manifest`) is
+  `asInvoker uiAccess="false"`; `elevation::process_has_uiaccess()` already exists and the
+  host warns at `platform-windows/src/lib.rs:162` when it is missing.
+* Two routes; research both, implement both unless the docs rule one out, and say which
+  applies when:
+  (a) **Service route (no certificate):** the SYSTEM service holds `SeTcbPrivilege`, so when it
+  launches the host it can set `TokenUIAccess` on the user token it passes to
+  `CreateProcessAsUserW` (`SetTokenInformation(TokenUIAccess)`, documented to need TCB).
+  Verify in the docs that the runtime check for reserved shortcuts is the TOKEN flag, not the
+  manifest, and that the duplicated token keeps the flag. This makes Alt+Tab work for every
+  service-installed host (W4) with no signing at all.
+  (b) **Signed route (user-launched host from Program Files):** Windows grants UIAccess at
+  process start only when ALL hold: manifest `uiAccess="true"`, an Authenticode signature
+  chaining to a certificate in the machine's Trusted Root (self-signed is fine when the
+  installer imports the public cert into `LocalMachine\Root`, code-signing EKU only), and
+  the exe lives under a secure path (Program Files / System32).
+  HARD CONSTRAINT: an exe whose manifest says `uiAccess="true"` but is NOT validly signed
+  fails to launch ("A referral was returned from the server") — so the flag may only be
+  embedded in builds that will be signed (build-time switch via env/feature in
+  `native/app/build.rs`; dev and unsigned CI builds keep `uiAccess="false"`), and the
+  portable copy run from a Downloads folder keeps working (UIAccess simply not granted;
+  log says why). Certificate: `native/scripts/windows-make-signing-cert.ps1` mirroring
+  `macos-make-signing-cert.sh` (self-signed code-signing cert → PFX; secrets
+  `WIN_SIGN_PFX_B64` / `WIN_SIGN_PFX_PASS`; private key only in GitHub secrets, the
+  orchestrator creates it blind like the macOS one); `native/scripts/windows-sign.ps1`
+  (signtool from the Windows SDK on the runner, SHA-256) run in the package phase for
+  `sharectrl.exe`, `sharectrl-service.exe` and the installer; without the secrets:
+  unsigned, `uiAccess="false"`, loud `::warning`. The installer hook (W4's `.nsh`, separate
+  banner section) imports the public certificate into `LocalMachine\Root` and removes it
+  on uninstall.
+* Host startup logs one line: `UIAccess: granted` or `UIAccess: not granted — <reason:
+  unsigned build | not under Program Files | service did not set the flag>`.
+* Tests / CI: unit tests for the manifest switch and reason text; the W4 installer job
+  extends to: import the cert, install silently, launch `sharectrl.exe --print-uiaccess`
+  (new diagnostic flag that prints the token flag and exits 0/1) and assert granted; also
+  assert the unsigned dev build still launches. Document in README (feature table "Alt+Tab
+  passthrough" row, SmartScreen note unchanged) and `docs/FIRST-RUN.md`.
+* Acceptance: on a real host installed by W4, `app.log` says `UIAccess: granted`, and from
+  the viewer Alt+Tab switches windows and the Win key opens Start — in service mode at
+  minimum; user-launched mode too when route (b) is implemented. Checklist
+  `plans/checklists/W5.md` with both modes.
 
 ## Lane M — macOS backend (`crates/platform-macos`)
 
@@ -658,6 +770,7 @@ to run (TCC). Use `objc2` 0.6-family crates throughout (`objc2-app-kit`,
     macOS secondary click (nothing maps it to a right-click).
 
 ### M12 — macOS: take every Cmd shortcut while the video has the keyboard  (size S–M; owner feedback 2026-11-01 from a Mac viewer on an Ubuntu host)
+* Live-test observation 2026-11-02 (2.1.3, Mac viewer → Ubuntu host, windowed): the toolbar never appears on hover, but after resizing the window to about half and then entering full screen it shows for a moment with no pointer near the top. Reading: the reveal state flips on layout changes (`apply_layout`) while `mouseMoved` never reaches the view — hypothesis 1 of §7. Confirm from the tester's `app.log` ("pointer events arrive" line absent) before the fix task.
 * Problem: M6's tap takes a fixed set (Cmd+Tab/`/Space, Ctrl+arrows). Everything else with Cmd
   goes through the app's responder chain first (`performKeyEquivalent`: menu bar, WebKit's
   own Cmd+C/V/W/Q…), so most Cmd combinations never reach the host at all ("Cmd key does

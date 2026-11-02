@@ -419,6 +419,13 @@ jobs:
           # Informational: whether the service could start the host in this
           # runner's console session (the runner image decides if one exists).
           Get-Process sharectrl -ErrorAction SilentlyContinue | Format-Table Id, SessionId, Path
+      # Exercise the POSTUNINSTALL RMDir /r cleanup deterministically: a file
+      # created AFTER install is not in the uninstaller's recorded-files list
+      # (like the service's runtime log), so only the directory cleanup can
+      # remove it — and with it the folder. See native/app/installer-hooks.nsh.
+      - name: Drop a runtime-created file the installer never recorded
+        run: |
+          New-Item -ItemType File "$env:ProgramFiles\ShareCtrlScreen\runtime-marker.txt" | Out-Null
       # The upgrade path: the same installer over a running service. The
       # PREINSTALL hook must stop it before the files are replaced and
       # POSTINSTALL must start it again, so the service runs in a new process.

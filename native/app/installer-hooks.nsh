@@ -35,8 +35,13 @@
 ;     the details pane and pushes its exit code, or "error"):
 ;     https://nsis.sourceforge.io/Docs/nsExec/nsExec.txt
 ;   - NSIS manual: File /oname, Abort (in a section: aborts the install; silent
-;     installs then exit with code 2), DetailPrint, ${__FILEDIR__}, InitPluginsDir:
+;     installs then exit with code 2), DetailPrint, ${__FILEDIR__}, InitPluginsDir,
+;     StrCpy (negative offset = from the end), StrLen:
 ;     https://nsis.sourceforge.io/Docs/Chapter4.html
+;   - NSIS manual: RMDir /r (recursive directory delete; sets the error flag for
+;     files it could not remove) and the standard safety warning never to
+;     RMDir /r an unchecked/user-supplied path — hence the guard below:
+;     https://nsis.sourceforge.io/Docs/Chapter4.html#instructions-rmdir
 ;   - Microsoft, Stopping / Starting a service (stop before replacing the binary,
 ;     wait for STOPPED; start, wait for RUNNING) — implemented in
 ;     native/crates/elevation/src/service.rs, which these hooks call:
@@ -118,6 +123,67 @@
   ${EndIf}
 !macroend
 
+; ---- install directory cleanup ----
+;
+; WHY: Tauri's NSIS uninstaller only deletes the files, registry values and
+; shortcuts it RECORDED at install time. It never records files created at
+; runtime, so the service's runtime log (sharectrl-service.log, written by
+; SYSTEM beside the exe under --run-service — native/service/src/main.rs) and
+; any future crash dump survive the uninstall, and the install directory
+; survives with them. This POSTUNINSTALL step removes $INSTDIR and whatever is
+; left in it, AFTER PREUNINSTALL stopped and removed the service and AFTER Tauri
+; deleted the recorded files.
+;
+; RMDir /r is recursive and unforgiving, so it is GUARDED and never runs on an
+; unchecked path (NSIS's own RMDir /r safety warning). It deletes $INSTDIR only
+; when that path is the real per-machine install dir: non-empty, ending in
+; "\ShareCtrlScreen", AND under "$PROGRAMFILES64\" or "$PROGRAMFILES\" — never a
+; drive root or a system path. The prefix test keeps the trailing backslash so
+; "C:\Program FilesX\..." cannot masquerade as being under Program Files.
+;
+; Best-effort: a file another process holds open is left behind but does NOT
+; abort the uninstall. RMDir /r sets the error flag for anything it could not
+; remove; we report that and clear it, and never Abort.
+
+!macro SCT_CLEANUP_POSTUNINSTALL
+  Push $0
+  Push $1
+  Push $2
+  StrCpy $0 "0"                        ; $0 = "is $INSTDIR a safe install dir?"
+  ${If} $INSTDIR != ""
+    StrCpy $1 $INSTDIR "" -16          ; last 16 chars = len("\ShareCtrlScreen")
+    ${If} $1 == "\ShareCtrlScreen"
+      StrLen $2 "$PROGRAMFILES64\"
+      StrCpy $1 $INSTDIR $2            ; prefix as long as "$PROGRAMFILES64\"
+      ${If} $1 == "$PROGRAMFILES64\"
+        StrCpy $0 "1"
+      ${Else}
+        StrLen $2 "$PROGRAMFILES\"
+        StrCpy $1 $INSTDIR $2          ; prefix as long as "$PROGRAMFILES\"
+        ${If} $1 == "$PROGRAMFILES\"
+          StrCpy $0 "1"
+        ${EndIf}
+      ${EndIf}
+    ${EndIf}
+  ${EndIf}
+  ${If} $0 == "1"
+    DetailPrint "ShareCtrlScreen: removing the install directory and any runtime files left in it ($INSTDIR)"
+    ClearErrors
+    RMDir /r "$INSTDIR"
+    ${If} ${Errors}
+      DetailPrint "ShareCtrlScreen: some files under $INSTDIR were in use and were left behind (uninstall continues)"
+      ClearErrors
+    ${Else}
+      DetailPrint "ShareCtrlScreen: install directory removed"
+    ${EndIf}
+  ${Else}
+    DetailPrint "ShareCtrlScreen: '$INSTDIR' is not the expected per-machine install path; skipping directory cleanup"
+  ${EndIf}
+  Pop $2
+  Pop $1
+  Pop $0
+!macroend
+
 ; ---- hooks ----
 
 !macro NSIS_HOOK_PREINSTALL
@@ -130,4 +196,8 @@
 
 !macro NSIS_HOOK_PREUNINSTALL
   !insertmacro SCT_SERVICE_PREUNINSTALL
+!macroend
+
+!macro NSIS_HOOK_POSTUNINSTALL
+  !insertmacro SCT_CLEANUP_POSTUNINSTALL
 !macroend

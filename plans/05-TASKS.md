@@ -53,6 +53,7 @@
 | D9 host cursor sprite on the viewer | **done** (Opus, Opus-reviewed; device-pending I1–I3: real cursor images incl. I-beam in a terminal) | additive cursor-shape message, host sends on change, viewer draws the real sprite at position−hotspot in both presenters; replaces the synthetic triangle |
 | W4 installer bundles + registers the SYSTEM service | **done** (Opus, Opus-reviewed, merged d0119b4; Rust lane-proven, installer by new CI job + machine-A smoke pending; device pass checklists/W4.md) | NSIS hooks install/start/stop/uninstall `sharectrl-service.exe` next to `sharectrl.exe`; one host instance rule; CI silent install/upgrade/uninstall job. Acceptance narrowed: service setup + one instance + standalone asset; elevated-window control is NOT a W4 claim |
 | W5 UIAccess (Alt+Tab / Win key passthrough) | **done** (Opus, Opus-reviewed; device-pending checklists/W5.md: Alt+Tab/Win via the service) | route (a) only: the service sets `TokenUIAccess` (SeTcb) on a duplicate of the host token; `--print-uiaccess`; startup log line; fallback launches without the flag and logs why. Signed route deferred to W6 (see the card) |
+| W7 uninstaller removes the whole install dir (service log leftover) | **in progress** (Opus) | first windows-installer CI run failed only on uninstall-clean: `sharectrl-service.log` left in Program Files; RMDir /r $INSTDIR in POSTUNINSTALL |
 | T4 Wayland CI | **done** (Haiku, Opus-reviewed; jobs unverified until pushed; GNOME portal tests are device-pass items) | `native-ci.yml` jobs `wayland-sway` (ubuntu-24.04: sway + xdg-desktop-portal-wlr + pipewire + wireplumber; runs L5 `wayland_surface`, L1 `portal_capture --ignored`, and L6 `input::tests` minus uinput and `xtest_*`) and `wayland-gnome` (ubuntu-24.04: mutter 46 + xdg-desktop-portal-gnome; proves the stack, runs no test: the consent dialog has no headless pre-authorization, so the libei and GNOME portal-capture tests are device-pass items). Scripts in `.github/wayland/`. Local (lane, WSL): `wayland_surface` PASS (T4-02); `input::tests` wlroots and EIS pass, uinput fails under REQUIRED as designed (T4-03). Owner verification after the push: see the T4 card |
 | L5 video surface | **done** (Opus, Opus-reviewed; device-pending per checklists/L5.md) | X11: child window of the GTK toplevel on our own x11rb connection, XShape reveal clip, XDND drops via `XdndProxy`, Expose → redraw of the last frame. Wayland: the spike's area+video subsurface tree on GDK's connection (re-attached when GDK re-creates the toplevel surface), `wp_viewporter` crop + fractional scale, drops through GDK's own data device (sink window); decision-#3 separate window when there is no `wp_viewporter` or `SHARECTRL_VIDEO_WINDOW=separate`. Keys from the GTK toplevel on both (keymap: XKB − 8 = evdev). One wgpu presenter (Vulkan, GL fallback) over `surface-wgpu`. Headless tests: `tests/x11_surface.rs` (Xvfb), `tests/wayland_surface.rs` (headless sway). **Device-pending** (checklists/L5.md) |
 | L1 Wayland capture | **done** (Opus, Opus-reviewed) | `portal_capture/`: portal ScreenCast (handshake shared with L12 in `portal_session.rs`, token scope kept: a combined token reopens a combined session) + pipewire-rs 0.10 stream thread, shared-memory BGRx/BGRA first (no modifiers → no DMA-BUF; L1b), cursor + damage metadata, pause/resize → `Lost` → resume; a stream-level failure → rebuild from the token on a background thread (reinit never blocks the host thread on a dialog); "Stop sharing" in the desktop indicator, a declined dialog or an unanswered one (120 s) end the hosted session (terminal, AnyDesk behaviour). The 120 s dialog wait on the host media thread happens only in the first `create_capture`. Monitor chosen in the portal dialog (Wayland `display` ids → `NoOutput`). Build needs `libpipewire-0.3-dev libspa-0.2-dev libclang-dev`. **Device-pending** (checklists/L1.md); acceptance test `tests/portal_capture.rs` (ignored) for T4. **Note for L6:** L6 layers a shared session slot over `portal_session::start(scope, previous, bound, abandon)` and extends `Granted` with the RemoteDesktop proxy; today the capture's `watch()` owns `granted.session` and closes it when the capture drops it. Once shared, that ownership moves into L6's slot, so only the last holder (capture or injector) closes the session. **Done in L6:** `portal_shared.rs` holds the combined session; the capture joins it (`Held::Shared`) when its token is combined, remote control already holds it, or remote control would use the portal, and owns only screen-only sessions itself |
@@ -387,6 +388,40 @@ I1..I4 after all lanes (hardware validation)
     user's token and reads it back.
   * Not verified by CI: a real host started by the service (the token call only does
     anything as SYSTEM). Verify with `plans/checklists/W5.md`.
+
+### W7 — Uninstaller removes the whole install directory, including the service's runtime log  (size XS, Windows; from the first windows-installer CI run 2026-11-02)
+
+* Problem: the new `windows-installer` CI job (native-ci, added by W4) FAILED its final check on the
+  first run on `main`. Install, service RUNNING/Auto/LocalSystem, and the reinstall/upgrade
+  (new PID) all PASSED. The uninstall check failed: after `uninstall.exe /S`, the service is
+  gone (`sc query` → 1060) but `C:\Program Files\ShareCtrlScreen\` still exists because it
+  holds one runtime-created file, `sharectrl-service.log` (W5's service log, deliberately
+  beside the exe in the admin-only Program Files dir — do NOT move it to ProgramData, W5's
+  reviewer established that is the safe location). The NSIS uninstaller only deletes files it
+  recorded at install time, so the log it never installed is left behind, and with it the
+  folder. The CI assertion `throw "$dir was not removed"` fires. A real user also sees the
+  leftover folder + log after uninstall.
+* Deliverable: the uninstaller removes the install directory and everything in it, including
+  runtime-created files (the service log, any crash dump), AFTER the service is stopped and
+  removed. In Tauri's NSIS uninstaller this is the POSTUNINSTALL hook in
+  `native/app/installer-hooks.nsh` (the service is already `--uninstall-service`'d in
+  PREUNINSTALL): add `RMDir /r "$INSTDIR"` guarded so it only runs when `$INSTDIR` is the real
+  per-machine install dir (never a root/system path — check it ends in `\ShareCtrlScreen` and
+  is under `$PROGRAMFILES64`/`$PROGRAMFILES`), logged via the same banner/ExecToLog style, and
+  it must not abort the uninstall if a file is locked (best-effort delete, then report). Keep
+  the existing service stop/remove ordering. Confirm the installer still lists the log for
+  removal is NOT required — RMDir /r covers it.
+* Research/cite: NSIS `RMDir /r` and the "do not blindly RMDir /r a user-supplied path" safety
+  note; Tauri v2 installer-hooks POSTUNINSTALL timing. Header comment says WHY (runtime files
+  the installer did not record).
+* Tests/CI: the existing `windows-installer` job already asserts the folder is gone after
+  uninstall — W7 is proven green when that job passes on push. Add, if cheap, an assertion
+  that a file CREATED after install (touch a dummy in $INSTDIR) is also removed, so the
+  RMDir /r path is exercised deterministically even if the service wrote no log yet. No Rust
+  change expected; if none, no lane cargo gate beyond `fmt --check`/`clippy`/`test` sanity.
+* Acceptance: the `windows-installer` CI job passes end to end on push (install → service
+  RUNNING → upgrade new PID → uninstall → `sc` 1060 AND folder gone); on a real machine,
+  uninstall leaves nothing under Program Files. Device line in plans/checklists/W4.md updated.
 
 ## Lane M — macOS backend (`crates/platform-macos`)
 

@@ -545,7 +545,8 @@ I1..I4 after all lanes (hardware validation)
       untouched — W4/W5 invariants intact, and elevation/session.rs (the launch) is unchanged. Because the
       attach is sticky for the thread and `host_media_loop` builds the HW H264 encoder from `cap.device()`
       on that **same** thread right after, the shared D3D11 device + the MFT activation also happen in the
-      input-desktop context — the expected fix for the `0x8000FFFF` HW-encode regression (device-confirmed).
+      input-desktop context — the expected fix for the `0x8000FFFF` HW-encode regression (device-pending —
+      hypothesis; see W8.md §3).
     - (2) **Error classification + retry.** `capture::Error::SecureDesktop` (every `E_ACCESSDENIED` → terminal)
       is replaced by `capture::Error::AccessDenied` (recoverable), now also returned by the `duplicate_output`
       creation path (previously an opaque `Backend` error that ended the loop). `adapters::capture_err` maps

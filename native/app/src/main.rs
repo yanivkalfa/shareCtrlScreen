@@ -17,6 +17,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod uiaccess;
+mod updater;
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -563,6 +564,12 @@ fn main() {
     };
 
     tauri::Builder::default()
+        // In-app updater (task U1): the updater checks the GitHub "latest" feed
+        // and verifies each download against `plugins.updater.pubkey`; the process
+        // plugin backs the webview's relaunch (the restart itself is Rust's core
+        // `AppHandle::restart`, see `updater.rs`).
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             get_config,
@@ -582,6 +589,8 @@ fn main() {
             request_permission,
             openh264_info,
             openh264_download,
+            updater::updater_check,
+            updater::updater_install,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();

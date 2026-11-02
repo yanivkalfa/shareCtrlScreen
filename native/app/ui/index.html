@@ -293,6 +293,28 @@
         </label>
 
         <fieldset class="field">
+          <legend>Updates</legend>
+          <div class="hint">
+            This copy is version <b id="update-current-version">&hellip;</b>.
+          </div>
+          <div class="row">
+            <button id="btn-update-check" type="button" class="btn btn-sm">Check for updates</button>
+            <span id="update-status" class="hint"></span>
+          </div>
+          <div id="update-available" class="hint hidden">
+            <b>Update available: <span id="update-new-version"></span></b>
+            <pre id="update-notes" class="hint mono licence-text"></pre>
+            <div id="update-session-warning" class="hint hidden">
+              You are in a session right now &mdash; updating ends it.
+            </div>
+            <div class="row">
+              <button id="btn-update-install" type="button" class="btn btn-sm btn-primary">Update &amp; restart</button>
+            </div>
+            <div id="update-progress" class="hint hidden"></div>
+          </div>
+        </fieldset>
+
+        <fieldset class="field">
           <legend>Advanced</legend>
           <label class="radio">
             <input type="checkbox" id="set-translate-modifiers" />

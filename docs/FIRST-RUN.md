@@ -7,6 +7,10 @@ control the screen. Find your system below.
 Dialog wording varies between OS versions, so match the meaning rather than the exact
 words. For installing, see the [Install section](../README.md#install) of the README.
 
+Once installed, ShareCtrlScreen keeps itself up to date: **⚙ Settings → Updates** has a
+**Check for updates** button, and the app checks quietly at startup. See
+[Updating](../README.md#updating).
+
 ## Windows
 
 The first time you run the installer, Windows SmartScreen shows a warning, because the build

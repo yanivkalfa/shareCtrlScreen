@@ -58,8 +58,15 @@ fn codec_err(e: codec::Error) -> CodecError {
 
 fn capture_err(e: capture::Error) -> CaptureError {
     match e {
-        capture::Error::AccessLost => CaptureError::Lost,
-        capture::Error::SecureDesktop => CaptureError::SecureDesktop,
+        // Both are recoverable by re-acquiring the duplication, which also
+        // re-attaches the capture thread to the active input desktop (see
+        // [`DdaCapture::reinit`]). The host media loop recovers from
+        // `CaptureError::Lost` and only from it, so a service host that starts
+        // (or lands) off the input desktop now retries instead of ending the
+        // session — the W8 regression. `AccessDenied` is deliberately NOT mapped
+        // to the terminal `SecureDesktop`/`Backend`: a secure-desktop transition
+        // and an off-desktop service host are the same recoverable denial.
+        capture::Error::AccessLost | capture::Error::AccessDenied => CaptureError::Lost,
         capture::Error::NoOutput => CaptureError::NoOutput,
         capture::Error::Win(e) => CaptureError::Backend(e.to_string()),
     }
@@ -203,10 +210,24 @@ pub struct DdaCapture {
     /// changes but the position on every move, and the position is the
     /// shape's top-left, so the hotspot must be remembered to convert it.
     hotspot: Point,
+    /// Attaches THIS (host-media / capture) thread to the active input desktop
+    /// before the duplication is (re)acquired. See [`attach_capture_desktop`].
+    desktop: elevation::InputDesktopFollower,
 }
 
 impl DdaCapture {
     pub fn new(output: u32) -> Result<Self, CaptureError> {
+        // Attach the capture thread to the active input desktop BEFORE creating
+        // the duplication (and the shared D3D11 device). A host the SYSTEM
+        // service launched with CreateProcessAsUserW is not reliably on that
+        // desktop, so DuplicateOutput1 would return E_ACCESSDENIED; a
+        // self-launched interactive host inherits it and succeeds. The attach is
+        // sticky for this thread, so the shared device the HW H264 MFT is built
+        // on (host_media_loop creates the encoder from `cap.device()` on this
+        // same thread, right after this) is also created in the right desktop
+        // context — restoring the full fast path, not just capture.
+        let mut desktop = elevation::InputDesktopFollower::new();
+        attach_capture_desktop(&mut desktop);
         let dup = capture::Duplicator::new(0, output).map_err(capture_err)?;
         let device = D3d11Device(dup.device().clone());
         Ok(Self {
@@ -214,7 +235,41 @@ impl DdaCapture {
             device,
             current: None,
             hotspot: Point::default(),
+            desktop,
         })
+    }
+}
+
+/// Re-attach the calling (capture) thread to the active input desktop via
+/// `OpenInputDesktop` + `SetThreadDesktop` (through [`elevation::InputDesktopFollower`],
+/// the same primitive the input injector uses on ITS thread). `SetThreadDesktop`
+/// is per-thread, so this never touches the injector thread (UIAccess control
+/// keeps working) or the UI window's thread; it is scoped to the capture thread.
+///
+/// Logs the desktop it moved onto (so a future lag report says which desktop the
+/// capture is reading — `Default`, `Winlogon`, `Screen-saver`), and warns, without
+/// failing, when the input desktop cannot be opened (the duplication attempt that
+/// follows then reports the denial, which the host loop retries).
+///
+/// ## References
+/// * `SetThreadDesktop` affects only the calling thread and fails if that thread
+///   already owns windows or hooks (the capture thread owns neither):
+///   <https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-setthreaddesktop>
+/// * `OpenInputDesktop` returns the desktop currently receiving user input:
+///   <https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-openinputdesktop>
+fn attach_capture_desktop(desktop: &mut elevation::InputDesktopFollower) {
+    match desktop.follow() {
+        Ok(true) => tracing::info!(
+            "capture: host thread attached to input desktop {:?}",
+            desktop.current()
+        ),
+        // Already on the current input desktop (self-launched host, or no switch
+        // since the last attach) — nothing to log.
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            "capture: could not attach to the input desktop ({e}); \
+             Desktop Duplication may be denied until it is reachable — will retry"
+        ),
     }
 }
 
@@ -299,6 +354,11 @@ impl ScreenCapture for DdaCapture {
 
     fn reinit(&mut self) -> Result<(), CaptureError> {
         self.current = None;
+        // Re-attach to whatever desktop now has input focus before re-acquiring:
+        // a `Lost`/`AccessDenied` is often a desktop switch (secure desktop up,
+        // lock, fast-user-switch), so the new duplication must be taken on the
+        // new input desktop. Logs the move; a no-op switch logs nothing.
+        attach_capture_desktop(&mut self.desktop);
         self.dup.reinit().map_err(capture_err)
     }
 
@@ -809,5 +869,34 @@ mod tests {
         for c in [Codec::H264, Codec::Hevc, Codec::Av1] {
             assert_eq!(from_mf_codec(to_mf_codec(c)), c);
         }
+    }
+
+    /// W8 error classification: a desktop/access denial is RECOVERABLE (maps to
+    /// `CaptureError::Lost`, the one error the host loop retries), while a genuine
+    /// backend failure stays terminal. Before W8, `E_ACCESSDENIED` at creation fell
+    /// through to `Backend`, which ended the host media loop — the lag regression.
+    #[test]
+    fn access_denials_are_recoverable_backend_errors_are_terminal() {
+        // Off the input desktop / secure-desktop transition → retry.
+        assert!(matches!(
+            capture_err(capture::Error::AccessDenied),
+            CaptureError::Lost
+        ));
+        // Mode change / display sleep → retry (unchanged).
+        assert!(matches!(
+            capture_err(capture::Error::AccessLost),
+            CaptureError::Lost
+        ));
+        // A real backend HRESULT stays terminal (not retried forever).
+        assert!(matches!(
+            capture_err(capture::Error::Win(windows::core::Error::from(
+                windows::Win32::Foundation::E_FAIL
+            ))),
+            CaptureError::Backend(_)
+        ));
+        assert!(matches!(
+            capture_err(capture::Error::NoOutput),
+            CaptureError::NoOutput
+        ));
     }
 }

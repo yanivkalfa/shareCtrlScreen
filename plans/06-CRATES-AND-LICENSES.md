@@ -13,6 +13,8 @@ every crate below.
 | `pollster` | 0.4 | MIT OR Apache-2.0 | block on wgpu's adapter/device futures (presenter setup, headless tests) |
 | `naga` (dev only) | 30 | MIT OR Apache-2.0 | GPU-less WGSL validation test in `surface-wgpu` |
 | `raw-window-handle` | 0.6 (what Tauri 2.11 re-exports) | MIT/Apache/Zlib | surface parent handles |
+| `tauri-plugin-updater` | 2.14.1 (2026-10-28, crates.io) | MIT OR Apache-2.0 | in-app updater (task U1): check the GitHub `latest.json` feed, verify + install signed update payloads |
+| `tauri-plugin-process` | 2.4.0 (2026-09-26, crates.io) | MIT OR Apache-2.0 | backs the webview relaunch the updater uses (the restart is core `AppHandle::restart`); task U1 |
 | `openh264` | 0.9.9 | BSD-2 (wrapper) / BSD-2 (lib) | software H.264, `libloading` feature only (Cisco binary downloaded at runtime; see 04 §5) |
 | `keyring` | 4.2.0 | MIT OR Apache-2.0 | Keychain / Secret Service (`macos`, `sync-secret-service` features) |
 | `arboard` | 3.6.1 | MIT OR Apache-2.0 | clipboard text on macOS/Linux (X11 + Wayland) |

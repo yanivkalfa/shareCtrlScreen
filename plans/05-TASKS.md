@@ -54,6 +54,9 @@
 | W4 installer bundles + registers the SYSTEM service | **done** (Opus, Opus-reviewed, merged d0119b4; Rust lane-proven, installer by new CI job + machine-A smoke pending; device pass checklists/W4.md) | NSIS hooks install/start/stop/uninstall `sharectrl-service.exe` next to `sharectrl.exe`; one host instance rule; CI silent install/upgrade/uninstall job. Acceptance narrowed: service setup + one instance + standalone asset; elevated-window control is NOT a W4 claim |
 | W5 UIAccess (Alt+Tab / Win key passthrough) | **done** (Opus, Opus-reviewed; device-pending checklists/W5.md: Alt+Tab/Win via the service) | route (a) only: the service sets `TokenUIAccess` (SeTcb) on a duplicate of the host token; `--print-uiaccess`; startup log line; fallback launches without the flag and logs why. Signed route deferred to W6 (see the card) |
 | W7 uninstaller removes the whole install dir (service log leftover) | **done** (Opus, Opus-reviewed, merged 03d98af; proven by the windows-installer CI job on push) | first windows-installer CI run failed only on uninstall-clean: `sharectrl-service.log` left in Program Files; RMDir /r $INSTDIR in POSTUNINSTALL |
+| U1 in-app updater (check/download/install/restart) | **done** (Opus, Opus-reviewed; device-pending U1.md: real update loop needs two updater-enabled releases) | tauri-plugin-updater 2.14.1 + tauri-plugin-process 2.4.0, updater signing key (orchestrator-created secrets), latest.json generated on the release, Settings UI, service-aware install+restart; TOP priority |
+| W8 service-host fast path (DDA capture + HW encode) | **done** (Opus, Opus-reviewed, merged 0afabeb; capture fast-path implemented, HW-encode fix device-pending hypothesis — checklists/W8.md) | service-launched host loses the fast DDA path + HW encoder → software fallback + media-loop restarts = lag; attach the capture thread (and so the shared device the HW MFT uses) to the active input desktop + reclassify E_ACCESSDENIED as recoverable and retry instead of ending the loop; goal widened to restore capture AND HW encode (owner: was smooth self-launched) |
+| W9 Alt+Tab on a service host | **blocked: need controller app.log** | host UIAccess granted + injects reserved shortcuts, yet Alt+Tab does not switch → controlling-side capture/forward issue (keyhook on a Windows controller, or the Mac tap) |
 | T4 Wayland CI | **done** (Haiku, Opus-reviewed; jobs unverified until pushed; GNOME portal tests are device-pass items) | `native-ci.yml` jobs `wayland-sway` (ubuntu-24.04: sway + xdg-desktop-portal-wlr + pipewire + wireplumber; runs L5 `wayland_surface`, L1 `portal_capture --ignored`, and L6 `input::tests` minus uinput and `xtest_*`) and `wayland-gnome` (ubuntu-24.04: mutter 46 + xdg-desktop-portal-gnome; proves the stack, runs no test: the consent dialog has no headless pre-authorization, so the libei and GNOME portal-capture tests are device-pass items). Scripts in `.github/wayland/`. Local (lane, WSL): `wayland_surface` PASS (T4-02); `input::tests` wlroots and EIS pass, uinput fails under REQUIRED as designed (T4-03). Owner verification after the push: see the T4 card |
 | L5 video surface | **done** (Opus, Opus-reviewed; device-pending per checklists/L5.md) | X11: child window of the GTK toplevel on our own x11rb connection, XShape reveal clip, XDND drops via `XdndProxy`, Expose → redraw of the last frame. Wayland: the spike's area+video subsurface tree on GDK's connection (re-attached when GDK re-creates the toplevel surface), `wp_viewporter` crop + fractional scale, drops through GDK's own data device (sink window); decision-#3 separate window when there is no `wp_viewporter` or `SHARECTRL_VIDEO_WINDOW=separate`. Keys from the GTK toplevel on both (keymap: XKB − 8 = evdev). One wgpu presenter (Vulkan, GL fallback) over `surface-wgpu`. Headless tests: `tests/x11_surface.rs` (Xvfb), `tests/wayland_surface.rs` (headless sway). **Device-pending** (checklists/L5.md) |
 | L1 Wayland capture | **done** (Opus, Opus-reviewed) | `portal_capture/`: portal ScreenCast (handshake shared with L12 in `portal_session.rs`, token scope kept: a combined token reopens a combined session) + pipewire-rs 0.10 stream thread, shared-memory BGRx/BGRA first (no modifiers → no DMA-BUF; L1b), cursor + damage metadata, pause/resize → `Lost` → resume; a stream-level failure → rebuild from the token on a background thread (reinit never blocks the host thread on a dialog); "Stop sharing" in the desktop indicator, a declined dialog or an unanswered one (120 s) end the hosted session (terminal, AnyDesk behaviour). The 120 s dialog wait on the host media thread happens only in the first `create_capture`. Monitor chosen in the portal dialog (Wayland `display` ids → `NoOutput`). Build needs `libpipewire-0.3-dev libspa-0.2-dev libclang-dev`. **Device-pending** (checklists/L1.md); acceptance test `tests/portal_capture.rs` (ignored) for T4. **Note for L6:** L6 layers a shared session slot over `portal_session::start(scope, previous, bound, abandon)` and extends `Granted` with the RemoteDesktop proxy; today the capture's `watch()` owns `granted.session` and closes it when the capture drops it. Once shared, that ownership moves into L6's slot, so only the last holder (capture or injector) closes the session. **Done in L6:** `portal_shared.rs` holds the combined session; the capture joins it (`Held::Shared`) when its token is combined, remote control already holds it, or remote control would use the portal, and owns only screen-only sessions itself |
@@ -422,6 +425,180 @@ I1..I4 after all lanes (hardware validation)
 * Acceptance: the `windows-installer` CI job passes end to end on push (install → service
   RUNNING → upgrade new PID → uninstall → `sc` 1060 AND folder gone); on a real machine,
   uninstall leaves nothing under Program Files. Device line in plans/checklists/W4.md updated.
+
+### U1 — In-app updater: check, download, install, restart  (size L, all OSes; owner request 2026-11-02, TOP priority)
+* Problem: there is no updater. The app is Tauri v2 (`tauri = "2"`), no `tauri-plugin-updater`, no
+  updater block in `tauri.conf.json`. The owner wants: an in-app "Check for updates" and, when one
+  exists, a one-click Update that downloads, installs, **closes and restarts the app** so they can
+  reconnect and never get stuck outside. Must work when the owner is mid-session (controlling side).
+* Deliverable:
+  (1) **Plugin + config:** add `tauri-plugin-updater` (and `tauri-plugin-process` for relaunch) at an
+      exact version from a crate the reviewer can confirm; register in `main.rs`
+      (`tauri::Builder … .plugin(tauri_plugin_updater::Builder::new().build())`). `tauri.conf.json`:
+      `plugins.updater` with `endpoints` = the GitHub "latest" static file
+      `https://github.com/yanivkalfa/shareCtrlScreen/releases/latest/download/latest.json`, `pubkey`
+      = the updater public key (see 3), and `bundle.createUpdaterArtifacts = true`.
+  (2) **Updater signing keypair (separate from code signing):** `native/scripts/updater-make-key.sh`
+      (wraps `tauri signer generate`, writes private key + password to files, prints nothing secret) —
+      the ORCHESTRATOR runs it blind like the macOS cert and sets repo secrets `TAURI_SIGNING_PRIVATE_KEY`
+      and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`; the public key goes in `tauri.conf.json` (committed,
+      public by design). Document in the card which secrets are needed so the orchestrator can create them.
+  (3) **Release artifacts:** `release-assets.sh` build phase passes the signing env so the Tauri CLI emits
+      the per-bundle `.sig` files alongside the installer/AppImage/.app(.tar.gz). The release workflow
+      (`build-assets.yml`/`release.yml`) uploads the `.sig` files AND generates/uploads a `latest.json`
+      (version, pub_date, notes, and per-target `{ url, signature }` pointing at the release assets).
+      Windows updater target = the NSIS installer; macOS = the `.app.tar.gz`; Linux = the AppImage. Decide
+      and document which bundles get updater artifacts (Windows nsis + macOS app + Linux appimage; .deb/.rpm
+      are not self-updating — the UI says "download from releases" for those, no silent update).
+  (4) **In-app UI + flow:** a Settings → About/Updates control and a non-blocking check at startup (and a
+      manual "Check for updates" button). When an update is found: show version + notes and an "Update &
+      restart" button. On click: `update.downloadAndInstall()` with progress, then restart. RESTART must
+      actually reconnect the user: after install, relaunch the app (tauri-plugin-process `restart()` /
+      updater's relaunch) so they land back in the app ready to reconnect. If a session is live, warn that
+      updating ends the current session.
+  (5) **SERVICE INTERACTION (Windows, critical):** on a service-installed host the exe is owned/launched by
+      the Windows service, and W4's NSIS installer hooks already `--stop-service` in PREINSTALL and
+      `--install-service` (start) in POSTINSTALL. So the updater running the NSIS installer silently will
+      naturally stop the service, replace files, and restart it — the service then relaunches the host.
+      The card must: detect a service-managed install (the host runs with `--service-host`, or
+      `elevation::service::query` says the service owns sign-in) and, in that case, let the SERVICE bring
+      the host back after the installer runs (do not also self-`relaunch`, which would double-launch or
+      race the one-instance rule); on a non-service / portable install, the app relaunches itself. Verify
+      the updater's silent NSIS run uses the same install dir and does not strip the service. State clearly
+      what is proven by CI vs needs a device.
+  (6) **Non-goals:** auto-apply without consent (always ask), delta updates, rollback. Just safe
+      check → consent → download → install → restart.
+* Research/cite (`//! ## References` + config comments): Tauri v2 "Updater" plugin + "Updater Artifacts"
+  and signing (`https://v2.tauri.app/plugin/updater/`), `createUpdaterArtifacts`, the `latest.json`
+  schema, `tauri signer generate`, tauri-plugin-process `restart`. The GitHub "releases/latest/download"
+  static-URL pattern.
+* Tests/CI: unit-test the version-compare / latest.json parsing where it is pure Rust or TS; a CI step that
+  validates the generated `latest.json` schema and that `.sig` files exist for each updater target in the
+  release run (dry-run path). Keep README (an "Updating" section) and docs/FIRST-RUN truthful.
+* Acceptance (device I-level): from a published updater-enabled release, the running app detects a newer
+  release, shows it, and on "Update & restart" downloads, installs, closes and reopens into a usable app;
+  on a service install the service brings the host back and no duplicate instance results; a session that
+  was live is cleanly ended with a warning. Note: full end-to-end needs TWO updater-enabled releases (this
+  one to ship the mechanism, the next to update TO) — say so. Checklist `plans/checklists/U1.md`.
+* **As built (branch `task/U1`, done + Opus-reviewed; Rust/TS lane-proven, end-to-end needs a published release):**
+  * **Plugins + config:** `tauri-plugin-updater = "2.14.1"`, `tauri-plugin-process = "2.4.0"`
+    (plans/06), registered in `app/src/main.rs` (`.plugin(tauri_plugin_updater::Builder::new().build())`,
+    `.plugin(tauri_plugin_process::init())`). `tauri.conf.json` → `plugins.updater` with the
+    `releases/latest/download/latest.json` endpoint, `windows.installMode = "passive"`, and a
+    **placeholder `pubkey`** (`REPLACE_WITH_UPDATER_PUBLIC_KEY_FROM_native-scripts-updater-make-key-sh`)
+    the orchestrator substitutes. `createUpdaterArtifacts` is in a separate overlay
+    `tauri.updater.conf.json`, applied by `release-assets.sh` ONLY when `TAURI_SIGNING_PRIVATE_KEY`
+    is set — so native-ci's unsigned installer build is untouched. Capabilities gain
+    `updater:default` + `process:default`.
+  * **Flow in Rust** (`app/src/updater.rs`, so the UI stays a thin invoke/listen shell): commands
+    `updater_check` (version + notes, no download) and `updater_install` (ends the live session,
+    `download_and_install` with `updater-progress` events, then the restart). UI: an "Updates"
+    fieldset in Settings with the current version, "Check for updates", and, when one exists,
+    notes + "Update & restart" (relabelled "End session & update" + an inline warning when a
+    session is live). A non-blocking check runs at startup.
+  * **Service-aware restart (W4):** `restart_plan(is_windows, service_managed)` →
+    `ServiceRelaunches` | `InstallerRelaunches` | `SelfRelaunch` (unit-tested). `service_managed`
+    is the `--service-host` launch flag or `elevation::service::query().owns_sign_in()`. On every
+    Windows path the app does NOT self-relaunch (the installer, and on a service install the
+    POSTINSTALL `--install-service` restart, bring the host back; W4's one-instance gate is the
+    backstop against a double-launch); only macOS/Linux self-relaunch via `AppHandle::restart`.
+  * **Release:** `release-assets.sh` layers the updater overlay and copies the per-bundle `.sig`
+    files; macOS rebuilds + `tauri signer sign`s the `.app.tar.gz` from the **signed** app (so an
+    update keeps the certificate signature). `release.yml` exposes `TAURI_SIGNING_PRIVATE_KEY` /
+    `_PASSWORD` to the build (and, on macOS, package) step, then the checksums job runs
+    `updater-latest-json.sh` (discovers `.sig` files → `windows-x86_64`, `darwin-universal`/`-aarch64`/`-x86_64`,
+    `linux-x86_64`; .deb/.rpm are not updater targets) and `updater-check-latest-json.py`, and
+    uploads `latest.json` with the release. `updater-make-key.sh` wraps `tauri signer generate`.
+  * **Secrets the orchestrator creates** (then substitutes the public key in `tauri.conf.json`):
+    `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
+  * **Proven in the lane:** the Rust (plugins resolve, commands + `restart_plan` tests, clippy, fmt,
+    cargo-deny licences) and the `latest.json` generator's target mapping. **Needs a published
+    release:** the actual check/download/install/restart, the silent NSIS run through W4's hooks,
+    and the service bringing the host back with no duplicate — and the full loop needs TWO
+    updater-enabled releases (this one ships the mechanism, the next is what it updates TO).
+  * **platform-api:** unchanged (no trait touched).
+
+### W8 — Service-launched host: restore the fast screen-capture path (fix the input/video lag)  (size M, Windows; owner report 2026-11-02, host app.log attached)
+* Problem: after the W4 installer started launching the host from the SYSTEM service, screen capture on
+  the host degrades and the whole session feels very laggy (mouse + typing), because the user sees their
+  actions through a slow, stuttering video. Host app.log (one live instance, `UIAccess: granted`, service
+  log "launched engine pid=… in session 1 with UIAccess") shows the real cause:
+    - `capture: DuplicateOutput1 failed (Access is denied. (0x80070005)); falling back`
+    - `engine::session: host media loop ended: capture backend: Access is denied. (0x80070005)`
+    - then HW H264 encoder fails `0x8000FFFF` → `no hardware H264 encoder — using the software encoder (CPU)`.
+  So the Desktop Duplication (DXGI) path is denied for the service-launched process and the media loop
+  ENDS and restarts, and encoding falls to CPU software — together that is the lag. Note the HW-encoder
+  `0x8000FFFF` is machine A's known NVIDIA-MFT quirk (pre-existing, not caused by W4); the NEW regression
+  is the capture Access-denied, which did not happen when the host was launched by the user directly.
+* Root-cause hypotheses to confirm (the builder must verify against Microsoft docs and the code, not guess):
+    1. A process launched by a LocalSystem service with `WTSQueryUserToken` + `CreateProcessAsUserW` on
+       `winsta0\default` (elevation/session.rs) is not reliably associated with the active INPUT desktop,
+       so `IDXGIOutput5::DuplicateOutput1` / `IDXGIOutput1::DuplicateOutput` returns E_ACCESSDENIED. A
+       self-launched interactive host inherits the right desktop/station and succeeds.
+    2. capture/src/lib.rs maps EVERY `E_ACCESSDENIED` to `Error::SecureDesktop` ("only the SYSTEM helper
+       can duplicate it") and the media loop treats it as terminal and ENDS — so a transient denial during
+       a desktop switch (UAC secure desktop up, session transition) kills capture instead of retrying.
+* Deliverable:
+    (1) Make the service-launched host attach to the active input desktop before duplicating: set the
+        process/thread to the interactive desktop (e.g. `SetThreadDesktop(OpenInputDesktop(...))` on the
+        capture thread, or launch with the correct `lpDesktop`/window station so DDA is permitted), so
+        DuplicateOutput1 succeeds for the service host exactly as for a self-launched one. Research the
+        exact requirement (Desktop Duplication API access rules; service-to-session launch + desktop).
+    (2) Make capture resilient: distinguish a genuine secure-desktop/denied state from a TRANSIENT
+        E_ACCESSDENIED (desktop switch), and RETRY/re-acquire the duplication with backoff instead of
+        ending the host media loop. The loop must recover on its own when the input desktop returns.
+    (3) Keep/confirm the HW→software encoder fallback (that path is correct); only note in the card that on
+        machine A the HW MFT fails 0x8000FFFF and software is expected there — W8 does not fix that box's
+        encoder, but with the fast capture path restored the software-encode lag should match the
+        pre-service baseline. If feasible, log one line distinguishing "software encoder (no HW)" from
+        "capture restarting" so a future lag report is unambiguous.
+    (4) Add/adjust logging so the capture-desktop state is visible: which desktop the capture thread is on,
+        and a single explanatory line when it re-acquires after a denial.
+* Tests: unit-test the error-classification change (transient vs terminal) and any pure desktop-name logic;
+  the real proof is on the owner's machine (checklist W8.md: install via the service, connect, confirm
+  capture uses DuplicateOutput1 and the session is smooth, and that a UAC prompt / lock screen transition
+  recovers capture instead of ending it).
+* Acceptance (device): a service-launched host on the owner's machine captures via the fast DDA path (no
+  repeating "Access is denied"/"media loop ended"), and input/typing feel as responsive as a self-launched
+  host did; capture recovers after a secure-desktop transition. Checklist plans/checklists/W8.md.
+* Risk/interaction: this touches elevation/session (how the service launches) and capture (desktop + error
+  handling). Coordinate with W4's launch invariants — do NOT regress the elevated-window control that now
+  works (UIAccess granted must stay). If a platform-api change is needed, STOP and report it.
+* **Goal widened (owner, 2026-11-02):** the owner confirms the session ran "like a charm" self-launched on
+  this exact machine BEFORE the service change. So the HW-encoder `0x8000FFFF` is NOT assumed to be a
+  permanent box quirk — it is treated as the SAME service-context regression as the DXGI denial. Target:
+  restore the FULL fast path (fast DXGI capture **and** hardware H264 encode) for the service host, to match
+  the self-launched baseline. Root-cause them together: what a self-launched interactive host has that the
+  service host lacks is the active-input-desktop association of its threads; the capture thread creates the
+  **shared** D3D11 device that the HW MFT is then built on, so attaching that thread to the input desktop
+  before the device is created is expected to fix BOTH. Only if HW encode still fails after that, on proof
+  it is service-independent, is it documented as a machine-specific fallback.
+* **As built (2026-11-02):**
+    - (1) **Desktop attach, scoped to the capture thread.** `platform_windows::adapters::DdaCapture::new`
+      now calls `attach_capture_desktop` (an `elevation::InputDesktopFollower` →
+      `OpenInputDesktop`+`SetThreadDesktop`, the same primitive the input injector uses on ITS thread)
+      BEFORE `capture::Duplicator::new`, so `DuplicateOutput1` is permitted for a service-launched host.
+      `SetThreadDesktop` is per-thread, so the injector thread (UIAccess control) and the UI thread are
+      untouched — W4/W5 invariants intact, and elevation/session.rs (the launch) is unchanged. Because the
+      attach is sticky for the thread and `host_media_loop` builds the HW H264 encoder from `cap.device()`
+      on that **same** thread right after, the shared D3D11 device + the MFT activation also happen in the
+      input-desktop context — the expected fix for the `0x8000FFFF` HW-encode regression (device-pending —
+      hypothesis; see W8.md §3).
+    - (2) **Error classification + retry.** `capture::Error::SecureDesktop` (every `E_ACCESSDENIED` → terminal)
+      is replaced by `capture::Error::AccessDenied` (recoverable), now also returned by the `duplicate_output`
+      creation path (previously an opaque `Backend` error that ended the loop). `adapters::capture_err` maps
+      both `AccessLost` and `AccessDenied` → `CaptureError::Lost`, the one error `host_media_loop` recovers
+      from; `reinit` re-attaches to the (possibly new) input desktop. The initial `create_capture` is retried
+      with capped backoff (`open_capture`) so a startup race / secure-desktop-up self-heals instead of ending
+      the session. No `platform-api` signature change (reused `CaptureError::Lost`; `SecureDesktop` variant
+      kept but no longer produced on Windows).
+    - (3)/(4) **Logging.** `capture:` logs the input desktop it attached to; `host:` logs capture loss and a
+      single re-acquire line, both worded "capture restart, not an encoder change" so a future lag report
+      is unambiguous against the existing codec "software encoder (CPU)" line.
+    - Lane-proven: `cargo fmt/check/clippy -D warnings/test` on Windows + WSL; unit test
+      `adapters::access_denials_are_recoverable_backend_errors_are_terminal`. Device-only (W8.md): that a
+      service install uses DuplicateOutput1 AND the hardware encoder (no "software encoder (CPU)" line), the
+      session is smooth, and capture recovers across a UAC/lock transition.
 
 ## Lane M — macOS backend (`crates/platform-macos`)
 

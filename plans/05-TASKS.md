@@ -57,7 +57,7 @@
 | U1 in-app updater (check/download/install/restart) | **done** (Opus, Opus-reviewed; device-pending U1.md: real update loop needs two updater-enabled releases) | tauri-plugin-updater 2.14.1 + tauri-plugin-process 2.4.0, updater signing key (orchestrator-created secrets), latest.json generated on the release, Settings UI, service-aware install+restart; TOP priority |
 | W8 service-host fast path (DDA capture + HW encode) | **done** (Opus, Opus-reviewed, merged 0afabeb; capture fast-path implemented, HW-encode fix device-pending hypothesis — checklists/W8.md) | service-launched host loses the fast DDA path + HW encoder → software fallback + media-loop restarts = lag; attach the capture thread (and so the shared device the HW MFT uses) to the active input desktop + reclassify E_ACCESSDENIED as recoverable and retry instead of ending the loop; goal widened to restore capture AND HW encode (owner: was smooth self-launched) |
 | M13 macOS toolbar drawer not shown (reveal fires, strip empty) | **in progress** (Opus) | Mac app.log: pointer events arrive, Reveal fires, view+layer shrink 40px — but the web toolbar does not show in the strip (macOS bottom-origin axis suspect); drawer/End Session invisible |
-| V1 host overshoots a congested link (video stutter) | **in progress** (Opus) | ROOT CAUSE (investigation): July 78cd049 raised MIN_BITRATE 400k→2.5M + DESIRED→9M + a raw-BWE source pacer → encoder wont follow BWE down → overshoot→loss→BWE collapse (65↔3700), unpaced keyframe bursts. Fix: follow BWE down + step RESOLUTION not bitrate + pace IDRs. Owner: Windows went slow when the service came in (lost the fast path → tipped the latent overshoot); Mac/Linux slow from the start |
+| V1 host overshoots a congested link (video stutter) | **in review** (branch `task/V1`, Opus; lane-proven on Windows + WSL, device-pending per checklists/V1.md) | ROOT CAUSE (investigation): July 78cd049 raised MIN_BITRATE 400k→2.5M + DESIRED→9M + a raw-BWE source pacer → encoder wont follow BWE down → overshoot→loss→BWE collapse (65↔3700), unpaced keyframe bursts. Fix (As built): MIN_BITRATE→500k + DESIRED→8M so the encoder follows BWE down; a hysteretic resolution ladder (1.0/0.75/0.5/0.33) spends degradation on encode size, fps drops only below the smallest step; the source pacer is removed (str0m paces egress) and forced IDRs no longer bypass it. Owner: Windows went slow when the service came in (lost the fast path → tipped the latent overshoot); Mac/Linux slow from the start |
 | W9 Alt+Tab on a service host | **blocked: need controller app.log** | host UIAccess granted + injects reserved shortcuts, yet Alt+Tab does not switch → controlling-side capture/forward issue (keyhook on a Windows controller, or the Mac tap) |
 | T4 Wayland CI | **done** (Haiku, Opus-reviewed; jobs unverified until pushed; GNOME portal tests are device-pass items) | `native-ci.yml` jobs `wayland-sway` (ubuntu-24.04: sway + xdg-desktop-portal-wlr + pipewire + wireplumber; runs L5 `wayland_surface`, L1 `portal_capture --ignored`, and L6 `input::tests` minus uinput and `xtest_*`) and `wayland-gnome` (ubuntu-24.04: mutter 46 + xdg-desktop-portal-gnome; proves the stack, runs no test: the consent dialog has no headless pre-authorization, so the libei and GNOME portal-capture tests are device-pass items). Scripts in `.github/wayland/`. Local (lane, WSL): `wayland_surface` PASS (T4-02); `input::tests` wlroots and EIS pass, uinput fails under REQUIRED as designed (T4-03). Owner verification after the push: see the T4 card |
 | L5 video surface | **done** (Opus, Opus-reviewed; device-pending per checklists/L5.md) | X11: child window of the GTK toplevel on our own x11rb connection, XShape reveal clip, XDND drops via `XdndProxy`, Expose → redraw of the last frame. Wayland: the spike's area+video subsurface tree on GDK's connection (re-attached when GDK re-creates the toplevel surface), `wp_viewporter` crop + fractional scale, drops through GDK's own data device (sink window); decision-#3 separate window when there is no `wp_viewporter` or `SHARECTRL_VIDEO_WINDOW=separate`. Keys from the GTK toplevel on both (keymap: XKB − 8 = evdev). One wgpu presenter (Vulkan, GL fallback) over `surface-wgpu`. Headless tests: `tests/x11_surface.rs` (Xvfb), `tests/wayland_surface.rs` (headless sway). **Device-pending** (checklists/L5.md) |
@@ -693,6 +693,32 @@ I1..I4 after all lanes (hardware validation)
 * Risks: lowering MIN_BITRATE without the resolution ladder brings back the ORIGINAL blur complaint —
   (1) and (2) MUST ship together. Slightly slower ramp to 8 M on a fast link (acceptable). Resolution
   flapping if hysteresis is weak — tune it. No platform-api change expected; if one is needed, STOP and report.
+* **As built (branch `task/V1`, Opus; lane-proven on Windows + WSL, device-pending per checklists/V1.md; NO platform-api change):**
+  All four deliverables shipped together in the engine crate only.
+  (1) `tuning.rs`: `MIN_BITRATE` 2_500_000 → **500_000** (just above the proven-smooth 352d56d 400 k;
+      comfortably carries the smallest ladder step), `DESIRED_BITRATE` 9_000_000 → **8_000_000**
+      (= `TARGET_BITRATE`, no probe padding above the ceiling). The driver's BWE handler was extracted
+      to a pure `tuning::encoder_target(bwe) = bwe.clamp(MIN, TARGET)` + `driver::apply_bwe`, shared by
+      the real and injected estimate; `applied` now TRACKS `bwe` down to the floor (loopback asserts it
+      reaches ≤ 600 k at a 300 k link — never the old 2.5 M — and tracks 2 M and 6 M back up).
+  (2) Resolution ladder in `tuning.rs` (`RESOLUTION_LADDER [1.0, 0.75, 0.5, 0.33]`, `resolution_step`
+      with a down/up hysteresis band, `target_fps` which keeps 30 fps until the smallest step on a
+      sub-floor link then scales to `MIN_FPS`). `media/host.rs` reads the RAW `link` estimate, scales the
+      viewer-sized `want` through `fit_within`, and rebuilds the encoder via the existing resize machinery;
+      fps drives the frame-rate cap. All three functions are pure and unit-tested (monotonic + hysteretic).
+  (3) The `&& !force_key` pacer bypass is gone (the pacer is gone); forced IDRs ride str0m's pacer like any
+      frame. The 1/s `MIN_KEYFRAME_GAP` rate limit + PLI handling are unchanged.
+  (4) The hand-rolled debt source pacer is REMOVED (the 352d56d model: str0m's pacer meters egress). Both
+      100-kbps `link` floors (`driver.rs`, `host.rs`) are removed so a dipped estimate can recover; the raw
+      estimate now flows straight to the ladder.
+  Tests: `tuning.rs` unit tests (clamp tracks + caps; ladder monotonic + hysteretic; fps floor + recovery).
+  A new loopback test `constrained_link_tracks_bwe_down_and_recovers` drives a 300 k → 2 M → 6 M link via a
+  `test-hooks`-gated BWE injector (`Engine::test_*`, cfg'd out of shipping builds) and asserts `applied`
+  tracks down below the old floor and back up, the encode size steps down and recovers, and frames keep
+  flowing with no link-trouble. Resolution is asserted from the host's configured encode size, not the
+  viewer's pixels: the MOCK encoder passes the source frame's dimensions through unchanged (a real encoder
+  resamples to the configured size), so the on-screen resolution drop is device-only (checklists/V1.md).
+  The existing 7 loopback tests and the full workspace suite stay green on Windows and WSL.
 
 ## Lane M — macOS backend (`crates/platform-macos`)
 

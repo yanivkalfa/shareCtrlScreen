@@ -12,7 +12,54 @@ use parking_lot::Mutex;
 use platform_api::{InputInjector, Platform, Rect, VideoSurface};
 use protocol::SignalData;
 
-use super::{serialize, Shared, DESIRED_BITRATE, MIN_BITRATE, TARGET_BITRATE};
+use super::{serialize, Shared, DESIRED_BITRATE};
+
+/// Apply one bandwidth estimate to the host's rate state. Shared by the real
+/// str0m estimate and (under the `test-hooks` feature) an injected one, so both
+/// take exactly the same path.
+///
+/// Two outputs come from the one estimate:
+/// * `link` — the RAW capacity, unfloored, for the resolution/fps ladder in the
+///   media thread: it needs the true estimate to decide how small an image the
+///   link can carry (see [`crate::tuning::resolution_step`]).
+/// * `bitrate` — the encoder's CBR target, the estimate clamped into
+///   `[MIN_BITRATE, TARGET_BITRATE]` (see [`crate::tuning::encoder_target`]), so
+///   the encoder FOLLOWS the estimate down instead of overshooting a slow link.
+///
+/// A 15% hysteresis on the target keeps estimate jitter from becoming visible
+/// quality flicker.
+fn apply_bwe(
+    bps: u32,
+    bitrate: &Option<Arc<std::sync::atomic::AtomicU32>>,
+    link: &Option<Arc<std::sync::atomic::AtomicU32>>,
+) {
+    if let Some(lk) = link {
+        lk.store(bps, Ordering::SeqCst);
+    }
+    if let Some(br) = bitrate {
+        let next = crate::tuning::encoder_target(bps);
+        let cur = br.load(Ordering::SeqCst);
+        if next.abs_diff(cur) * 100 > cur * 15 {
+            tracing::info!(
+                "bwe: link {} kbps → encoder {} kbps",
+                bps / 1000,
+                next / 1000
+            );
+            br.store(next, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Whether a test is currently forcing the bandwidth estimate (so the real str0m
+/// estimate must be ignored). Always `false` without the `test-hooks` feature.
+#[cfg(feature = "test-hooks")]
+fn bwe_overridden(shared: &Shared) -> bool {
+    shared.bwe_inject.load(Ordering::Relaxed) != 0
+}
+#[cfg(not(feature = "test-hooks"))]
+fn bwe_overridden(_shared: &Shared) -> bool {
+    false
+}
 
 /// Bundle of the role-specific channels/flags handed to [`transport_driver`].
 pub(super) struct Driver {
@@ -43,13 +90,15 @@ pub(super) struct Driver {
     /// viewer `KeyframeRequest`). Frames sent before the channel opened are lost
     /// on the wire, so the first *deliverable* frame must restart the decoder.
     pub(super) force_key: Option<Arc<AtomicBool>>,
-    /// Host: the encoder's CBR target — BWE clamped to [MIN_BITRATE, TARGET].
-    /// Floored on purpose: below MIN a 1080p desktop can't stay legible.
+    /// Host: the encoder's CBR target — the BWE estimate clamped to
+    /// `[MIN_BITRATE, TARGET_BITRATE]`. It FOLLOWS the estimate down to a low
+    /// floor; sharpness on a constrained link is kept by shrinking the encode
+    /// resolution, not by holding the bitrate up (see `crate::tuning`).
     pub(super) bitrate: Option<Arc<std::sync::atomic::AtomicU32>>,
-    /// Host: the RAW measured link capacity from BWE, unfloored. The source pacer
-    /// drains against THIS, not `bitrate` — if the link genuinely carries less
-    /// than the quality floor we must send fewer FRAMES, not pretend the capacity
-    /// exists and sit in permanent congestion.
+    /// Host: the RAW measured link capacity from BWE, unfloored. The media thread
+    /// drives the resolution/fps ladder from THIS — the true capacity decides how
+    /// small an image the link can carry, and below the smallest step how far the
+    /// frame rate must drop so egress matches the link instead of overshooting.
     pub(super) link: Option<Arc<std::sync::atomic::AtomicU32>>,
     /// Notify the UI + reset the role when the transport dies unexpectedly (the
     /// driver thread has no `&Engine`). This is the fix for "you get disconnected
@@ -405,6 +454,17 @@ pub(super) fn transport_driver(d: Driver) {
             alloc.tick(&socket);
         }
 
+        // 2.6) Test hook: a forced bandwidth estimate, re-applied every tick so it
+        // sticks (the real str0m estimate is ignored while it is set). Never
+        // compiled into a shipping build.
+        #[cfg(feature = "test-hooks")]
+        {
+            let forced = shared.bwe_inject.load(Ordering::Relaxed);
+            if forced != 0 {
+                apply_bwe(forced, &bitrate, &link_bw);
+            }
+        }
+
         // 3) Drive str0m: emit transmits, handle timeouts, surface events.
         match tp.poll_output() {
             Ok(str0m::Output::Transmit(t)) => {
@@ -566,27 +626,12 @@ pub(super) fn transport_driver(d: Driver) {
                         }
                         Inbound::BweEstimate(bps) => {
                             last_est = bps;
-                            // The pacer needs the RAW capacity to decide how many
-                            // frames the link can actually carry.
-                            if let Some(lk) = &link_bw {
-                                lk.store(bps.max(100_000), Ordering::SeqCst);
-                            }
-                            // The encoder's target is the estimate FLOORED at
-                            // MIN_BITRATE: quality never drops below legible, even
-                            // when that means the link can't take every frame.
-                            // 15% hysteresis stops estimate jitter from becoming
-                            // visible quality flicker.
-                            if let Some(br) = &bitrate {
-                                let next = bps.clamp(MIN_BITRATE, TARGET_BITRATE);
-                                let cur = br.load(Ordering::SeqCst);
-                                if next.abs_diff(cur) * 100 > cur * 15 {
-                                    tracing::info!(
-                                        "bwe: link {} kbps → encoder {} kbps",
-                                        bps / 1000,
-                                        next / 1000
-                                    );
-                                    br.store(next, Ordering::SeqCst);
-                                }
+                            // Steer the encoder (clamped) and the ladder (raw) from
+                            // the one estimate. While a test is holding the link at
+                            // a fixed value, the real estimate is ignored so the
+                            // scenario is deterministic (see `apply_bwe`).
+                            if !bwe_overridden(&shared) {
+                                apply_bwe(bps, &bitrate, &link_bw);
                             }
                         }
                         Inbound::Ctl(bytes) => {

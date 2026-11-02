@@ -6,15 +6,29 @@
 //! only); state other threads need lives in the shared [`SurfaceState`].
 //!
 //! ## Toolbar reveal
-//! The view's frame is shrunk from the top by the bar height, so the strip is
-//! outside the view: AppKit hit-tests it to the web view underneath (the bar's
-//! buttons work) and nothing of ours paints there. The Metal drawable keeps the
-//! **full** surface size and the layer's `contentsGravity` pins it to the
-//! bottom edge, so the picture is cropped, not moved or rescaled — and that
-//! holds even when no new frame arrives (a static remote screen sends none).
+//! The view's frame is shrunk from the VISUAL top by the bar height, so the
+//! strip is outside the view: AppKit hit-tests it to the web view underneath
+//! (the bar's buttons work) and nothing of ours paints there. The Metal
+//! drawable keeps the **full** surface size and the layer's `contentsGravity`
+//! pins it to the bottom edge, so the picture is cropped, not moved or
+//! rescaled — and that holds even when no new frame arrives (a static remote
+//! screen sends none).
+//!
+//! Which frame edge the inset comes off depends on the coordinate system, and
+//! the view and its layer live in **different** ones: the view's frame is in
+//! the parent *view*'s system (bottom-left unless `isFlipped`), the hosted
+//! layer's frame is in the parent *layer*'s system (`isGeometryFlipped`). Those
+//! two flips are independent — wry's `WKWebView` host is an unflipped view with
+//! a geometry-flipped backing layer — so `apply_layout` computes each origin
+//! from its own space (M13); using one flip for both opened the layer's gap at
+//! the wrong visual edge and left the toolbar covered.
 //!
 //! ## References
 //! * `NSView`: <https://developer.apple.com/documentation/appkit/nsview>
+//! * `NSView.isFlipped` (bottom-left default vs top-left coordinate system):
+//!   <https://developer.apple.com/documentation/appkit/nsview/isflipped>
+//! * `CALayer.isGeometryFlipped` (the layer's sublayer coordinate flip, set
+//!   independently of the hosting view): <https://developer.apple.com/documentation/quartzcore/calayer/isgeometryflipped>
 //! * Layer-hosting vs layer-backed views (`setLayer:` before `setWantsLayer:`):
 //!   <https://developer.apple.com/documentation/appkit/nsview/wantslayer>
 //! * `CALayer.contentsGravity` ("bottom" = minimum Y in layer space):
@@ -61,7 +75,7 @@ use objc2_foundation::{
 use objc2_quartz_core::{kCAGravityBottom, kCAGravityTop, CAMetalLayer, CATransaction};
 use platform_api::{FileDrop, SurfaceError};
 use surface_wgpu::input::WheelAccumulator;
-use surface_wgpu::reveal::{exited_through_top, Reveal, RevealChange};
+use surface_wgpu::reveal::{exited_through_top, Reveal, RevealChange, BAR_CSS_PX};
 use surface_wgpu::SurfaceState;
 
 use crate::{keymap, shortcut_filter};
@@ -265,7 +279,14 @@ define_class!(
             self.note_pointer("exit", py);
             let (w, h) = self.ivars().state.size();
             let scale = self.ivars().state.scale();
-            if exited_through_top(px, py, f64::from(w), f64::from(h), scale) {
+            // An exit mapped far ABOVE the top edge is a coordinate artifact of
+            // a fast flick, not a genuine top-edge departure: the owner's
+            // app.log showed such exits at y ≈ -470 / -1025 px, each toggling
+            // the bar from nowhere. A real flick's last sample sits just above
+            // the edge, so trust a top exit only within one bar height above it
+            // (M13 secondary). Exits at or below the edge are unaffected.
+            let above_limit = -(BAR_CSS_PX * scale.max(1.0));
+            if py >= above_limit && exited_through_top(px, py, f64::from(w), f64::from(h), scale) {
                 // Counts as reaching the edge, wherever exactly it was seen.
                 self.feed_reveal(py.min(0.0));
             }
@@ -772,45 +793,65 @@ impl VideoView {
         let bounds = parent.bounds();
         let scale = self.backing_scale();
         let inset = (self.ivars().reveal.get().inset_px(scale) / scale).min(bounds.size.height);
-        let origin_y = if parent.isFlipped() {
-            // Flipped parent: y grows downwards, so the top strip is skipped
-            // by moving the origin down.
-            bounds.origin.y + inset
-        } else {
-            // Unflipped (AppKit default): the origin is the bottom edge,
-            // which stays; only the height shrinks.
-            bounds.origin.y
+        // The strip is always removed from the VISUAL top (where the web
+        // toolbar is). How a frame expresses that depends on the coordinate
+        // system it is measured in: in a top-left (flipped) space the origin
+        // moves DOWN by the inset and the height shrinks; in a bottom-left
+        // (unflipped, AppKit default) space the origin is the bottom edge and
+        // stays put, only the height shrinks. WHY a closure and not one branch:
+        // the view's frame lives in the parent VIEW's coordinate system, but
+        // the layer's frame lives in the parent LAYER's — and those two need
+        // not share a flip (see the layer block below), so each picks its own.
+        let top_inset_frame = |flipped: bool| {
+            let origin_y = if flipped {
+                bounds.origin.y + inset
+            } else {
+                bounds.origin.y
+            };
+            NSRect::new(
+                NSPoint::new(bounds.origin.x, origin_y),
+                NSSize::new(bounds.size.width, bounds.size.height - inset),
+            )
         };
-        let frame = NSRect::new(
-            NSPoint::new(bounds.origin.x, origin_y),
-            NSSize::new(bounds.size.width, bounds.size.height - inset),
-        );
+        let frame = top_inset_frame(parent.isFlipped());
         let layer = &self.ivars().layer;
+        let parent_layer = parent.layer();
         without_animation(|| {
             if self.frame() != frame {
                 self.setFrame(frame);
             }
-            // WHY set the layer's frame too: this is a layer-hosting view
-            // (we own the layer), and the shrink only uncovers the toolbar if
-            // the layer shrinks with the view. AppKit normally keeps a view's
-            // root layer at the view's frame; if it ever does not, the strip
-            // stays painted by us while hit-testing already goes to the page
-            // below (bar invisible but clickable). The parent's layer uses
-            // its view's coordinates (AppKit flips layer geometry to match),
-            // so the view's frame is also the layer's — but only when our
-            // layer sits directly in the parent's layer (AppKit may insert a
-            // container layer, whose coordinates we do not know). A no-op
-            // when AppKit already did it.
+            // WHY set the layer's frame too: this is a layer-hosting view (we
+            // own the layer), and the shrink only uncovers the toolbar if the
+            // layer shrinks with the view. AppKit does not manage a hosted
+            // layer's frame, so we set it — but only when our layer sits
+            // directly in the parent's layer (AppKit may insert a container
+            // layer, whose coordinates we do not know).
+            //
+            // M13: the layer's frame is measured in the PARENT LAYER's
+            // coordinate space, whose vertical flip is independent of the
+            // parent VIEW's `isFlipped`. M12 assumed the two always agree and
+            // reused the view's frame for the layer; on the owner's Mac they
+            // do not — wry hosts the `WKWebView` in a content view that is
+            // unflipped (bottom-left) while its backing layer is geometry-
+            // flipped (top-left, the way web content is laid out). With the
+            // view's origin the layer's 40 px gap opened at the wrong visual
+            // edge, so the video kept covering the toolbar at the top and a
+            // useless strip opened at the bottom. Drive the layer frame by the
+            // parent layer's own `isGeometryFlipped` so the gap is always at
+            // the visual top. A no-op when the two flips happen to agree.
+            let parent_layer_flipped = parent_layer.as_ref().is_some_and(|l| l.isGeometryFlipped());
+            let layer_frame = top_inset_frame(parent_layer_flipped);
             let in_parent_layer = layer
                 .superlayer()
-                .zip(parent.layer())
-                .is_some_and(|(sup, own)| Retained::as_ptr(&sup) == Retained::as_ptr(&own));
-            if in_parent_layer && layer.frame() != frame {
+                .zip(parent_layer.as_ref())
+                .is_some_and(|(sup, own)| Retained::as_ptr(&sup) == Retained::as_ptr(own));
+            if in_parent_layer && layer.frame() != layer_frame {
                 tracing::debug!(
-                    "video view: layer frame {:?} did not follow the view frame {frame:?}; set it",
+                    "video view: layer frame {:?} did not follow {layer_frame:?} \
+                     (parent layer geometry flipped: {parent_layer_flipped}); set it",
                     layer.frame()
                 );
-                layer.setFrame(frame);
+                layer.setFrame(layer_frame);
             }
             layer.setContentsScale(scale);
             // "bottom" is the layer's minimum Y. Unflipped layer geometry

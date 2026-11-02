@@ -56,7 +56,7 @@
 | W7 uninstaller removes the whole install dir (service log leftover) | **done** (Opus, Opus-reviewed, merged 03d98af; proven by the windows-installer CI job on push) | first windows-installer CI run failed only on uninstall-clean: `sharectrl-service.log` left in Program Files; RMDir /r $INSTDIR in POSTUNINSTALL |
 | U1 in-app updater (check/download/install/restart) | **done** (Opus, Opus-reviewed; device-pending U1.md: real update loop needs two updater-enabled releases) | tauri-plugin-updater 2.14.1 + tauri-plugin-process 2.4.0, updater signing key (orchestrator-created secrets), latest.json generated on the release, Settings UI, service-aware install+restart; TOP priority |
 | W8 service-host fast path (DDA capture + HW encode) | **done** (Opus, Opus-reviewed, merged 0afabeb; capture fast-path implemented, HW-encode fix device-pending hypothesis — checklists/W8.md) | service-launched host loses the fast DDA path + HW encoder → software fallback + media-loop restarts = lag; attach the capture thread (and so the shared device the HW MFT uses) to the active input desktop + reclassify E_ACCESSDENIED as recoverable and retry instead of ending the loop; goal widened to restore capture AND HW encode (owner: was smooth self-launched) |
-| M13 macOS toolbar drawer not shown (reveal fires, strip empty) | **in progress** (Opus) | Mac app.log: pointer events arrive, Reveal fires, view+layer shrink 40px — but the web toolbar does not show in the strip (macOS bottom-origin axis suspect); drawer/End Session invisible |
+| M13 macOS toolbar drawer not shown (reveal fires, strip empty) | **done** (Opus, Opus-reviewed, merged bcf7b6f; type-checked for aarch64-apple-darwin, device-pending checklists/M13.md) | Root cause: `apply_layout` positioned the hosted layer's 40px gap with the parent *view*'s `isFlipped`, but a hosted layer's frame lives in the parent *layer*'s coordinate space, whose geometry flip is independent (wry: unflipped view, geometry-flipped WKWebView layer) — so the gap opened at the wrong visual edge and the video kept covering the toolbar. Fix (view.rs only; shared reveal.rs untouched): drive the layer frame from the parent layer's own `isGeometryFlipped`, so the strip is always at the visual top. Secondary: ignore `mouseExited` reveals mapped more than one bar height above the top (the app.log's y≈-470/-1025 artifacts). M12 reveal logging kept |
 | V1 host overshoots a congested link (video stutter) | **done** (Opus, Opus-reviewed, merged 003fbf8; loopback proves encoder tracks BWE down+up; on-screen smoothness device-pending checklists/V1.md) | ROOT CAUSE (investigation): July 78cd049 raised MIN_BITRATE 400k→2.5M + DESIRED→9M + a raw-BWE source pacer → encoder wont follow BWE down → overshoot→loss→BWE collapse (65↔3700), unpaced keyframe bursts. Fix (As built): MIN_BITRATE→500k + DESIRED→8M so the encoder follows BWE down; a hysteretic resolution ladder (1.0/0.75/0.5/0.33) spends degradation on encode size, fps drops only below the smallest step; the source pacer is removed (str0m paces egress) and forced IDRs no longer bypass it. Owner: Windows went slow when the service came in (lost the fast path → tipped the latent overshoot); Mac/Linux slow from the start |
 | W9 Alt+Tab on a service host | **blocked: need controller app.log** | host UIAccess granted + injects reserved shortcuts, yet Alt+Tab does not switch → controlling-side capture/forward issue (keyhook on a Windows controller, or the Mac tap) |
 | T4 Wayland CI | **done** (Haiku, Opus-reviewed; jobs unverified until pushed; GNOME portal tests are device-pass items) | `native-ci.yml` jobs `wayland-sway` (ubuntu-24.04: sway + xdg-desktop-portal-wlr + pipewire + wireplumber; runs L5 `wayland_surface`, L1 `portal_capture --ignored`, and L6 `input::tests` minus uinput and `xtest_*`) and `wayland-gnome` (ubuntu-24.04: mutter 46 + xdg-desktop-portal-gnome; proves the stack, runs no test: the consent dialog has no headless pre-authorization, so the libei and GNOME portal-capture tests are device-pass items). Scripts in `.github/wayland/`. Local (lane, WSL): `wayland_surface` PASS (T4-02); `input::tests` wlroots and EIS pass, uinput fails under REQUIRED as designed (T4-03). Owner verification after the push: see the T4 card |
@@ -636,6 +636,40 @@ I1..I4 after all lanes (hardware validation)
   shows the Reveal/Hide lines (unchanged) but now the user SEES the bar. Checklist plans/checklists/M13.md.
 * Note: this is independent of the Mac→Linux video lag (that is a TURN-relay bandwidth problem, ~220 kbps, tracked
   separately — NOT this card).
+* **As built (branch `task/M13`, in review; type-checked + clippy-clean for aarch64-apple-darwin, the workspace
+  suite passes on Windows and WSL; device-pending, checklists/M13.md):**
+  * Root cause (macOS-specific, in `platform-macos/src/view.rs::apply_layout`): the strip is removed from the
+    VISUAL top, and M12 computed one frame — origin from `parent.isFlipped()` — and used it for BOTH the view's
+    frame and the hosted layer's frame. But a view's frame lives in the parent VIEW's coordinate system while a
+    hosted layer's frame lives in the parent LAYER's, and their vertical flips are independent: wry hosts the
+    `WKWebView` in a content view that is unflipped (bottom-left) whose backing layer is geometry-flipped
+    (top-left, how web content lays out). With the view's origin (y=0, bottom-left) the layer's 40px gap opened at
+    the layer's maxY — the VISUAL BOTTOM — so the Metal video kept covering the toolbar at the top and only a
+    useless strip opened at the bottom. The owner's app.log was consistent (both frames shrank 934→894) because
+    only the *edge* the gap came off was wrong, not its size — which is why the reveal and the M12 layer-frame
+    sync looked correct.
+  * Fix: `apply_layout` now computes the layer's frame separately from the view's, taking its origin from the
+    parent LAYER's own `isGeometryFlipped()` (objc2-quartz-core `CALayer::isGeometryFlipped`, safe in 0.3.2), so
+    the gap is always at the visual top whatever the parent layer's flip. The view's frame still uses
+    `parent.isFlipped()` (correct for views). A shared `top_inset_frame(flipped)` closure builds both. A no-op
+    when the two flips agree, so it cannot regress a platform whose view and layer share a flip.
+  * **Device fallback:** if the on-device log shows the parent layer's geometry-flip EQUALS the parent view's
+    flip (the flips agree) and the drawer is STILL hidden, then this fix changed nothing and the cause is NOT the
+    axis — it is elsewhere: z-order (the video view/layer is not top-most in the strip) or the `WKWebView` toolbar
+    not filling the top 40 px. Look there, not at the axis, before another round.
+  * **Shared `surface-wgpu/src/reveal.rs` is untouched** — Windows and Linux reveal exactly as before. The whole
+    change is in the macOS view/layout. `contentsGravity` (pin the picture to the visual bottom so the crop is off
+    the top) is unchanged.
+  * Secondary (app.log spurious toggles `Reveal at y=-470/-1025px`): `mouseExited` now ignores a top exit mapped
+    more than one bar height (`BAR_CSS_PX`) above the edge — a fast-flick coordinate artifact, not a genuine
+    top-edge departure. Exits at or below the edge, and the shared `exited_through_top` flick handling, are
+    unchanged; macOS-scoped (view.rs).
+  * M12's reveal logging is intact (the once-per-show "pointer events arrive" line and the per-transition
+    "toolbar reveal: …" line with the view and layer frames); the layer-sync line now also prints the parent
+    layer's geometry-flip so the owner can confirm the branch taken.
+  * platform-api: no change.
+  * Cannot run on macOS in the lane (no AppKit): type-checked and clippy-clean for aarch64-apple-darwin; the real
+    proof is the owner's Mac (checklists/M13.md).
 
 ### V1 — Stop the host overshooting a congested link (restore smooth video, keep it sharp)  (size M, all OSes; owner report 2026-11-02 "mouse stays behind", investigation ac7be488)
 * Problem (ROOT CAUSE, high confidence, diagnosed read-only from two hosts' app.logs + git history):

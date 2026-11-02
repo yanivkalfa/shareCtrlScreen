@@ -48,6 +48,15 @@ on:
         required: false
       MAC_SIGN_P12_PASS:
         required: false
+      # Updater signing key (task U1), optional for the same reason. Present (release,
+      # and the owner's dry-run) -> createUpdaterArtifacts is layered in and the build
+      # emits the per-bundle `.sig` files the feed needs. Absent -> installers only, no
+      # self-update. native-ci's windows-installer-build calls this WITHOUT them, so that
+      # job never needs the key.
+      TAURI_SIGNING_PRIVATE_KEY:
+        required: false
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD:
+        required: false
     outputs:
       version:
         description: Version the assets carry (cargo metadata)
@@ -150,7 +159,12 @@ jobs:
           echo "RELEASE_VERSION=$version" >>"$GITHUB_ENV"
           echo "::notice::ShareCtrlScreen $version ($PLATFORM)"
 
+      # The updater signing key is exposed to this one step (task U1): with it set,
+      # `cargo tauri build` emits the signed per-bundle `.sig` updater artifacts.
       - name: Build (cargo)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: scripts/release-assets.sh build "$PLATFORM"
 
       # Signing secrets are exposed to this one step only. MAC_SIGN_WORKDIR puts the
@@ -161,6 +175,10 @@ jobs:
           MAC_SIGN_P12_B64: ${{ inputs.platform == 'macos' && secrets.MAC_SIGN_P12_B64 || '' }}
           MAC_SIGN_P12_PASS: ${{ inputs.platform == 'macos' && secrets.MAC_SIGN_P12_PASS || '' }}
           MAC_SIGN_WORKDIR: ${{ runner.temp }}/mac-sign
+          # macOS rebuilds + signs the updater .app.tar.gz from the signed app here
+          # (task U1, package_macos); the key is exposed to this step on macOS only.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ inputs.platform == 'macos' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ inputs.platform == 'macos' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
         run: scripts/release-assets.sh package "$PLATFORM"
 
       # macos-sign.sh deletes the keychain from its EXIT trap; this covers a run that was

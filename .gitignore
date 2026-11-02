@@ -51,3 +51,10 @@ native/app/gen/schemas/
 *openh264*.so.*
 *openh264*.dylib
 *openh264*.bz2
+
+# Updater signing key material (task U1): the private key, its password and the
+# .pub must never be committed, even if updater-make-key.sh is pointed at an
+# in-repo directory. Only the PUBLIC key belongs in git, pasted by hand into
+# tauri.conf.json (plugins.updater.pubkey).
+updater.key*
+native/**/updater.key*

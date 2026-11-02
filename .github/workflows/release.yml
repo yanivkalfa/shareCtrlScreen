@@ -153,6 +153,10 @@ jobs:
     with:
       platform: windows
       artifact-name: release-windows
+    # The updater signing key so the NSIS installer gets its `.sig` (task U1).
+    secrets:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
   macos:
     needs: meta
@@ -162,10 +166,12 @@ jobs:
     with:
       platform: macos
       artifact-name: release-macos
-    # Named, not `inherit`: the called workflow sees these two secrets and no others.
+    # Named, not `inherit`: the called workflow sees these secrets and no others.
     secrets:
       MAC_SIGN_P12_B64: ${{ secrets.MAC_SIGN_P12_B64 }}
       MAC_SIGN_P12_PASS: ${{ secrets.MAC_SIGN_P12_PASS }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
   linux:
     needs: meta
@@ -175,6 +181,9 @@ jobs:
     with:
       platform: linux
       artifact-name: release-linux
+    secrets:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
   # Gathers every OS's assets and writes SHA256SUMS.txt. Runs on dry runs too, so the
   # checksum step is exercised before a real release needs it.
@@ -206,13 +215,39 @@ jobs:
           pattern: release-*
           merge-multiple: true
           path: assets
+      # The updater feed (task U1), built BEFORE the checksums so it is summed too.
+      # It reads the per-bundle `.sig` files the signed builds produced and points each
+      # updater target at its release-download URL. No `.sig` (a fork with no signing
+      # secret) -> it warns and writes nothing, so a non-updater release still succeeds.
+      - name: "Generate latest.json (updater feed)"
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          native/scripts/updater-latest-json.sh assets "$VERSION" \
+            "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+      # Fail the run if a signed release produced a feed that is malformed or missing a
+      # signature/url for a target — better here than on a user's machine. Skipped when
+      # no feed was written (unsigned fork build).
+      - name: "Validate latest.json"
+        run: |
+          if [ -f assets/latest.json ]; then
+            python3 native/scripts/updater-check-latest-json.py assets/latest.json
+          else
+            echo "::notice::no latest.json (build was not updater-signed); skipping validation"
+          fi
       - name: SHA256SUMS.txt
         run: native/scripts/release-assets.sh checksums assets
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-checksums
-          path: assets/SHA256SUMS.txt
-          if-no-files-found: error
+          # latest.json rides with the checksums so the publish job (which downloads
+          # every release-* artifact) uploads it to the Release. `warn`: it is absent
+          # on an unsigned fork build, which must not fail the run.
+          path: |
+            assets/SHA256SUMS.txt
+            assets/latest.json
+          if-no-files-found: warn
           retention-days: 14
 
   publish:

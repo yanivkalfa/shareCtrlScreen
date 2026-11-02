@@ -20,6 +20,11 @@ tauri-build = { version = "2", features = [] }
 engine = { path = "../crates/engine" }
 protocol = { path = "../crates/protocol" }
 tauri = { version = "2", features = [] }
+# In-app updater (task U1). Pinned to the versions verified in
+# plans/06-CRATES-AND-LICENSES.md; both are desktop-only and the app is
+# desktop-only. tauri-plugin-process backs the webview relaunch the updater uses.
+tauri-plugin-updater = "2.14.1"
+tauri-plugin-process = "2.4.0"
 serde = { workspace = true }
 serde_json.workspace = true
 tokio = { workspace = true }

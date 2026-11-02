@@ -54,7 +54,7 @@
 | W4 installer bundles + registers the SYSTEM service | **done** (Opus, Opus-reviewed, merged d0119b4; Rust lane-proven, installer by new CI job + machine-A smoke pending; device pass checklists/W4.md) | NSIS hooks install/start/stop/uninstall `sharectrl-service.exe` next to `sharectrl.exe`; one host instance rule; CI silent install/upgrade/uninstall job. Acceptance narrowed: service setup + one instance + standalone asset; elevated-window control is NOT a W4 claim |
 | W5 UIAccess (Alt+Tab / Win key passthrough) | **done** (Opus, Opus-reviewed; device-pending checklists/W5.md: Alt+Tab/Win via the service) | route (a) only: the service sets `TokenUIAccess` (SeTcb) on a duplicate of the host token; `--print-uiaccess`; startup log line; fallback launches without the flag and logs why. Signed route deferred to W6 (see the card) |
 | W7 uninstaller removes the whole install dir (service log leftover) | **done** (Opus, Opus-reviewed, merged 03d98af; proven by the windows-installer CI job on push) | first windows-installer CI run failed only on uninstall-clean: `sharectrl-service.log` left in Program Files; RMDir /r $INSTDIR in POSTUNINSTALL |
-| U1 in-app updater (check/download/install/restart) | **in progress** (Opus) | tauri-plugin-updater + updater signing key (orchestrator-created secrets), latest.json on GitHub releases, Settings UI, service-aware install+restart; TOP priority |
+| U1 in-app updater (check/download/install/restart) | **done** (Opus, Opus-reviewed; device-pending U1.md: real update loop needs two updater-enabled releases) | tauri-plugin-updater 2.14.1 + tauri-plugin-process 2.4.0, updater signing key (orchestrator-created secrets), latest.json generated on the release, Settings UI, service-aware install+restart; TOP priority |
 | W8 service-host fast path (DDA capture + HW encode) | **done** (Opus, Opus-reviewed, merged 0afabeb; capture fast-path implemented, HW-encode fix device-pending hypothesis — checklists/W8.md) | service-launched host loses the fast DDA path + HW encoder → software fallback + media-loop restarts = lag; attach the capture thread (and so the shared device the HW MFT uses) to the active input desktop + reclassify E_ACCESSDENIED as recoverable and retry instead of ending the loop; goal widened to restore capture AND HW encode (owner: was smooth self-launched) |
 | W9 Alt+Tab on a service host | **blocked: need controller app.log** | host UIAccess granted + injects reserved shortcuts, yet Alt+Tab does not switch → controlling-side capture/forward issue (keyhook on a Windows controller, or the Mac tap) |
 | T4 Wayland CI | **done** (Haiku, Opus-reviewed; jobs unverified until pushed; GNOME portal tests are device-pass items) | `native-ci.yml` jobs `wayland-sway` (ubuntu-24.04: sway + xdg-desktop-portal-wlr + pipewire + wireplumber; runs L5 `wayland_surface`, L1 `portal_capture --ignored`, and L6 `input::tests` minus uinput and `xtest_*`) and `wayland-gnome` (ubuntu-24.04: mutter 46 + xdg-desktop-portal-gnome; proves the stack, runs no test: the consent dialog has no headless pre-authorization, so the libei and GNOME portal-capture tests are device-pass items). Scripts in `.github/wayland/`. Local (lane, WSL): `wayland_surface` PASS (T4-02); `input::tests` wlroots and EIS pass, uinput fails under REQUIRED as designed (T4-03). Owner verification after the push: see the T4 card |
@@ -480,6 +480,43 @@ I1..I4 after all lanes (hardware validation)
   on a service install the service brings the host back and no duplicate instance results; a session that
   was live is cleanly ended with a warning. Note: full end-to-end needs TWO updater-enabled releases (this
   one to ship the mechanism, the next to update TO) — say so. Checklist `plans/checklists/U1.md`.
+* **As built (branch `task/U1`, done + Opus-reviewed; Rust/TS lane-proven, end-to-end needs a published release):**
+  * **Plugins + config:** `tauri-plugin-updater = "2.14.1"`, `tauri-plugin-process = "2.4.0"`
+    (plans/06), registered in `app/src/main.rs` (`.plugin(tauri_plugin_updater::Builder::new().build())`,
+    `.plugin(tauri_plugin_process::init())`). `tauri.conf.json` → `plugins.updater` with the
+    `releases/latest/download/latest.json` endpoint, `windows.installMode = "passive"`, and a
+    **placeholder `pubkey`** (`REPLACE_WITH_UPDATER_PUBLIC_KEY_FROM_native-scripts-updater-make-key-sh`)
+    the orchestrator substitutes. `createUpdaterArtifacts` is in a separate overlay
+    `tauri.updater.conf.json`, applied by `release-assets.sh` ONLY when `TAURI_SIGNING_PRIVATE_KEY`
+    is set — so native-ci's unsigned installer build is untouched. Capabilities gain
+    `updater:default` + `process:default`.
+  * **Flow in Rust** (`app/src/updater.rs`, so the UI stays a thin invoke/listen shell): commands
+    `updater_check` (version + notes, no download) and `updater_install` (ends the live session,
+    `download_and_install` with `updater-progress` events, then the restart). UI: an "Updates"
+    fieldset in Settings with the current version, "Check for updates", and, when one exists,
+    notes + "Update & restart" (relabelled "End session & update" + an inline warning when a
+    session is live). A non-blocking check runs at startup.
+  * **Service-aware restart (W4):** `restart_plan(is_windows, service_managed)` →
+    `ServiceRelaunches` | `InstallerRelaunches` | `SelfRelaunch` (unit-tested). `service_managed`
+    is the `--service-host` launch flag or `elevation::service::query().owns_sign_in()`. On every
+    Windows path the app does NOT self-relaunch (the installer, and on a service install the
+    POSTINSTALL `--install-service` restart, bring the host back; W4's one-instance gate is the
+    backstop against a double-launch); only macOS/Linux self-relaunch via `AppHandle::restart`.
+  * **Release:** `release-assets.sh` layers the updater overlay and copies the per-bundle `.sig`
+    files; macOS rebuilds + `tauri signer sign`s the `.app.tar.gz` from the **signed** app (so an
+    update keeps the certificate signature). `release.yml` exposes `TAURI_SIGNING_PRIVATE_KEY` /
+    `_PASSWORD` to the build (and, on macOS, package) step, then the checksums job runs
+    `updater-latest-json.sh` (discovers `.sig` files → `windows-x86_64`, `darwin-universal`/`-aarch64`/`-x86_64`,
+    `linux-x86_64`; .deb/.rpm are not updater targets) and `updater-check-latest-json.py`, and
+    uploads `latest.json` with the release. `updater-make-key.sh` wraps `tauri signer generate`.
+  * **Secrets the orchestrator creates** (then substitutes the public key in `tauri.conf.json`):
+    `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
+  * **Proven in the lane:** the Rust (plugins resolve, commands + `restart_plan` tests, clippy, fmt,
+    cargo-deny licences) and the `latest.json` generator's target mapping. **Needs a published
+    release:** the actual check/download/install/restart, the silent NSIS run through W4's hooks,
+    and the service bringing the host back with no duplicate — and the full loop needs TWO
+    updater-enabled releases (this one ships the mechanism, the next is what it updates TO).
+  * **platform-api:** unchanged (no trait touched).
 
 ### W8 — Service-launched host: restore the fast screen-capture path (fix the input/video lag)  (size M, Windows; owner report 2026-11-02, host app.log attached)
 * Problem: after the W4 installer started launching the host from the SYSTEM service, screen capture on

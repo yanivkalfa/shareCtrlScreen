@@ -194,6 +194,27 @@ While a session is running, the host's session panel can switch the permission
 between `view` and `control` at any time — it takes effect immediately, without
 reconnecting — and can end the session.
 
+## Updating
+
+ShareCtrlScreen updates itself. **⚙ Settings → Updates** shows the current version
+and a **Check for updates** button, and the app also checks quietly at startup (it
+never blocks launching or hosting). When a newer release exists it shows the version
+and release notes with an **Update & restart** button; clicking it downloads the
+update, verifies its signature, installs it and restarts the app so you land straight
+back in, ready to reconnect. If a session is live the button becomes **End session &
+update** and warns you first — updating closes the app and ends the session.
+
+The feed is the GitHub release asset `latest.json` on the "latest" release; each update
+payload is signed and verified against the public key built into the app, so a tampered
+download is refused. Updatable formats: the **Windows installer**, the **macOS `.dmg`**
+app and the **Linux AppImage**. The **`.deb`/`.rpm`** packages do not self-update — update
+those through your package manager or download the new one from Releases.
+
+On a **service install** (the Windows installer) the update runs the installer silently,
+which stops the service, replaces the files and restarts the service — the service then
+relaunches the host, so there is never a second instance. On a portable install the app
+restarts itself.
+
 ## Packaging
 
 Releases are built by the **Release** workflow (`.github/workflows/release.yml`). To cut one,
@@ -210,7 +231,15 @@ GitHub Release with these assets:
 | `ShareCtrlScreen_<version>_universal.dmg` | macOS 13+, Apple Silicon and Intel |
 | `ShareCtrlScreen_<version>_amd64.deb` / `ShareCtrlScreen-<version>-1.x86_64.rpm` / `ShareCtrlScreen_<version>_amd64.AppImage` | Linux |
 | `THIRD-PARTY-LICENSES-<os>.html` | Licences of the open-source code in that OS's build (also inside each installer) |
+| `latest.json` + per-bundle `.sig` files | The in-app updater feed and signatures (see **Updating**). Built only when the repo secret `TAURI_SIGNING_PRIVATE_KEY` is set; forks without it ship installers that do not self-update |
 | `SHA256SUMS.txt` | Check downloads with `sha256sum -c SHA256SUMS.txt` |
+
+The in-app updater needs a one-time keypair, separate from code signing: run
+`native/scripts/updater-make-key.sh`, set the repository secrets
+`TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` from the files it
+writes, and paste the public key it prints into `native/app/tauri.conf.json`
+(`plugins.updater.pubkey`). A full end-to-end update needs **two** updater-enabled releases
+— one to ship the mechanism, the next to update to.
 
 **Run workflow** in Actions with `dry_run` ticked builds every asset as run artifacts and
 publishes nothing. To build this machine's assets locally the same way, run

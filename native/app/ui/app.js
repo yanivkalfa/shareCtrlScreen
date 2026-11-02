@@ -211,6 +211,13 @@ function openSettings() {
   $('set-translate-modifiers').checked = config.translateModifiers !== false;
   $('openh264-license').classList.add('hidden');
   refreshOpenH264();
+  // Updates panel: reset transient state, show what the last check found, and —
+  // if we have not checked yet — fill the current version with a quiet check.
+  $('update-status').textContent = '';
+  $('update-progress').classList.add('hidden');
+  $('update-progress').textContent = '';
+  renderUpdate();
+  if (!lastUpdate) checkForUpdates(true);
   const saved = config.savedLoginCount || 0;
   const clear = $('set-clear-logins');
   clear.checked = false;
@@ -467,7 +474,91 @@ $('btn-openh264-license').addEventListener('click', () => {
   $('openh264-license').classList.toggle('hidden');
 });
 
+// ---- updates (task U1) -----------------------------------------------------
+// The flow lives in Rust (updater.rs): `updater_check` reports whether a newer
+// release exists; `updater_install` ends any live session, downloads, installs
+// and restarts (service-aware on Windows). This panel is the thin surface, plus
+// a quiet non-blocking check at startup.
+let lastUpdate = null;
+let updating = false;
+
+const sessionLive = () => state === 'HOST_ACTIVE' || state === 'VIEW_ACTIVE';
+
+function renderUpdate() {
+  if (lastUpdate && lastUpdate.currentVersion) {
+    $('update-current-version').textContent = lastUpdate.currentVersion;
+  }
+  const available = !!(lastUpdate && lastUpdate.available);
+  $('update-available').classList.toggle('hidden', !available);
+  if (!available) return;
+  $('update-new-version').textContent = lastUpdate.version;
+  const notes = (lastUpdate.notes || '').trim();
+  $('update-notes').textContent = notes;
+  $('update-notes').classList.toggle('hidden', notes === '');
+  // Warn (and relabel the button) before the click when a session is live, so
+  // the consequence is explicit — updating closes the app and ends the session.
+  $('update-session-warning').classList.toggle('hidden', !sessionLive());
+  $('btn-update-install').textContent = sessionLive()
+    ? 'End session & update'
+    : 'Update & restart';
+}
+
+async function checkForUpdates(silent) {
+  const statusEl = $('update-status');
+  if (!silent) statusEl.textContent = 'Checking…';
+  try {
+    lastUpdate = await invoke('updater_check');
+  } catch (err) {
+    lastUpdate = null;
+    if (!silent) statusEl.textContent = 'Could not check: ' + String((err && err.message) || err);
+    return null;
+  }
+  renderUpdate();
+  if (lastUpdate.available) {
+    statusEl.textContent = '';
+    if (silent) toast('Update available: ' + lastUpdate.version + ' — open Settings to install');
+  } else if (!silent) {
+    statusEl.textContent = 'You are up to date.';
+  }
+  return lastUpdate;
+}
+
+async function installUpdate() {
+  if (updating || !(lastUpdate && lastUpdate.available)) return;
+  updating = true;
+  const btn = $('btn-update-install');
+  btn.disabled = true;
+  const prog = $('update-progress');
+  prog.classList.remove('hidden');
+  prog.textContent = 'Starting…';
+  try {
+    // Returns only on macOS/Linux (the app relaunches itself) or on error; on
+    // Windows the process has already exited into the installer by now.
+    await invoke('updater_install');
+    prog.textContent = 'Installed — restarting…';
+  } catch (err) {
+    updating = false;
+    btn.disabled = false;
+    prog.classList.add('hidden');
+    prog.textContent = '';
+    toast(String((err && err.message) || err), 'error');
+  }
+}
+
+listen('updater-progress', (e) => {
+  const prog = $('update-progress');
+  const { downloaded, total } = e.payload || {};
+  if (total) {
+    const pct = Math.min(100, Math.round((downloaded / total) * 100));
+    prog.textContent = 'Downloading… ' + pct + '%';
+  } else if (downloaded) {
+    prog.textContent = 'Downloading… ' + Math.round(downloaded / 1024) + ' KB';
+  }
+});
+
 // ---- wiring ----------------------------------------------------------------
+$('btn-update-check').addEventListener('click', () => checkForUpdates(false));
+$('btn-update-install').addEventListener('click', installUpdate);
 $('btn-settings-permissions').addEventListener('click', () => openPermissions(''));
 $('btn-permissions-close').addEventListener('click', closePermissions);
 $('btn-settings').addEventListener('click', openSettings);
@@ -701,4 +792,6 @@ listen('link-restored', () => {
       'Grant these so others can see and control this computer when you let them in.'
     );
   }
+  // Non-blocking update check at startup (task U1): never hold up boot or hosting.
+  checkForUpdates(true).catch(() => {});
 })();

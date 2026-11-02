@@ -22,6 +22,17 @@
       "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'"
     }
   },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/yanivkalfa/shareCtrlScreen/releases/latest/download/latest.json"
+      ],
+      "pubkey": "REPLACE_WITH_UPDATER_PUBLIC_KEY_FROM_native-scripts-updater-make-key-sh",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": ["nsis", "app", "dmg", "appimage", "deb", "rpm"],

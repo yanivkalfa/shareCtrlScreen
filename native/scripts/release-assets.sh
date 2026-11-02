@@ -106,6 +106,15 @@ case "$phase" in steps | build | package | all) ;; *) usage ;; esac
 build_steps() {
   local about="cargo about generate --workspace --locked --fail --manifest-path ../Cargo.toml"
   local tauri="cargo tauri build --config tauri.release.conf.json"
+  # Updater artifacts (task U1): layer tauri.updater.conf.json (createUpdaterArtifacts)
+  # over the others ONLY when the updater signing key is present. Without it (a fork,
+  # or a dev dry-run), the same build still makes installers — just not self-updating
+  # ones — and `cargo tauri build` is not asked to sign something it cannot. The Tauri
+  # CLI reads TAURI_SIGNING_PRIVATE_KEY / _PASSWORD from the environment.
+  local updater=""
+  if [[ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
+    updater=" --config tauri.updater.conf.json"
+  fi
   case "$os" in
     windows)
       echo "$about --target x86_64-pc-windows-msvc --output-file THIRD-PARTY-LICENSES.html ../about.hbs"
@@ -117,17 +126,17 @@ build_steps() {
       # --no-track: no .crates.toml bookkeeping in service-bin; --force: overwrite the
       # previous build's copy.
       echo "cargo install --path ../service --root service-bin --locked --no-track --force"
-      echo "$tauri --config tauri.windows-release.conf.json --bundles nsis -- --locked"
+      echo "$tauri --config tauri.windows-release.conf.json$updater --bundles nsis -- --locked"
       ;;
     macos)
       echo "$about --target aarch64-apple-darwin --target x86_64-apple-darwin --output-file THIRD-PARTY-LICENSES.html ../about.hbs"
       # universal-apple-darwin: the CLI builds both Apple triples and `lipo`s them into
       # one binary in one .app. Only the .app: the DMG is made after signing (package).
-      echo "$tauri --target universal-apple-darwin --bundles app -- --locked"
+      echo "$tauri$updater --target universal-apple-darwin --bundles app -- --locked"
       ;;
     linux)
       echo "$about --target x86_64-unknown-linux-gnu --output-file THIRD-PARTY-LICENSES.html ../about.hbs"
-      echo "$tauri --bundles appimage,deb,rpm -- --locked"
+      echo "$tauri$updater --bundles appimage,deb,rpm -- --locked"
       ;;
   esac
 }
@@ -203,6 +212,13 @@ package_windows() {
     return 1
   }
   cp "$setup" "$dist/"
+  # Updater signature for the NSIS installer (task U1): present only when the build
+  # was signed (createUpdaterArtifacts + TAURI_SIGNING_PRIVATE_KEY). The in-app
+  # updater downloads the setup .exe and verifies it against this; latest.json (built
+  # by updater-latest-json.sh in the release workflow) embeds the signature's content.
+  if [[ -f "$setup.sig" ]]; then
+    cp "$setup.sig" "$dist/"
+  fi
   # The bare app binary ships too, under its build name: a portable copy for people who
   # run it from a folder instead of installing (it is the same file the installer puts
   # in Program Files; it needs the WebView2 runtime, present on Windows 10/11).
@@ -274,6 +290,23 @@ package_macos() {
   summary "### macOS signature: $kind" '```' "$(grep -E 'designated|Signing' "$sign_log" || true)" '```'
   rm -f "$sign_log"
   if [[ -n "${GITHUB_OUTPUT:-}" ]]; then echo "mac-signing=$kind" >>"$GITHUB_OUTPUT"; fi
+
+  # Updater archive (task U1): the in-app updater replaces the .app from a gzipped
+  # tar of the bundle. Built HERE, from the SIGNED "$app" (after macos-sign.sh),
+  # rather than by the bundler during build — the bundler would archive the app
+  # before it was re-signed, so an update would drop the certificate signature and
+  # macOS would re-prompt for Screen Recording / Accessibility (decision #9). Only
+  # when the updater signing key is set; `tauri signer sign` reads it from the env.
+  # darwin-universal / darwin-aarch64 / darwin-x86_64 in latest.json all point here.
+  if [[ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
+    local archive="$dist/ShareCtrlScreen_${version}_universal.app.tar.gz"
+    tar -C "$(dirname "$app")" -czf "$archive" "$(basename "$app")"
+    cargo tauri signer sign "$archive"
+    [[ -f "$archive.sig" ]] || {
+      echo "error: tauri signer sign did not produce $archive.sig" >&2
+      return 1
+    }
+  fi
 }
 
 package_linux() {
@@ -296,6 +329,17 @@ package_linux() {
     }
   fi
   cp "$appimage" "$deb" "$rpm" "$dist/"
+  # Updater artifact(s) for the AppImage (task U1): the AppImage is the only Linux
+  # updater target (.deb/.rpm are not self-updating — the UI points those users at
+  # Releases). Copy whatever the signed build left beside it: a `.AppImage.sig`
+  # (the AppImage signed in place) and/or a `.AppImage.tar.gz` (+ its `.sig`).
+  # updater-latest-json.sh maps either to linux-x86_64. Present only when signed.
+  shopt -s nullglob
+  local extra
+  for extra in "$bundle/appimage/"*.AppImage.sig "$bundle/appimage/"*.AppImage.tar.gz "$bundle/appimage/"*.AppImage.tar.gz.sig; do
+    cp "$extra" "$dist/"
+  done
+  shopt -u nullglob
 }
 
 run_package() {

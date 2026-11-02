@@ -11,6 +11,38 @@
 //!
 //! WGC fallback (RDP / per-window / headless) is a documented secondary backend
 //! (§5a "Gotchas"); this module implements the DDA primary path.
+//!
+//! ## Access requirements (the W8 regression)
+//!
+//! Desktop Duplication is permitted only for a process/thread associated with the
+//! **active input desktop** of the console session. `DuplicateOutput1` /
+//! `DuplicateOutput` and `AcquireNextFrame` return `E_ACCESSDENIED` when the
+//! calling thread is not on that desktop — which is exactly what happens to a
+//! host the SYSTEM service launches with `CreateProcessAsUserW` until its capture
+//! thread attaches to the input desktop (`OpenInputDesktop` + `SetThreadDesktop`),
+//! and transiently during a desktop switch (UAC secure desktop up, lock screen,
+//! fast-user-switch). Both are **recoverable**: re-attach to the input desktop and
+//! re-acquire the duplication. This crate reports that denial as
+//! [`Error::AccessDenied`] (distinct from a terminal failure) so the caller can
+//! retry rather than end the session; the thread-to-desktop attach itself lives in
+//! the Windows platform backend, next to the shared-device creation.
+//!
+//! ## References
+//!
+//! * Desktop Duplication API — `IDXGIOutputDuplication`, `AcquireNextFrame`,
+//!   and the note that the API is available to a process on the active desktop:
+//!   <https://learn.microsoft.com/windows/win32/direct3ddxgi/desktop-dup-api>
+//! * `IDXGIOutput5::DuplicateOutput1` / `IDXGIOutput1::DuplicateOutput` return
+//!   `E_ACCESSDENIED` when the application is not running on the current console
+//!   session's active desktop:
+//!   <https://learn.microsoft.com/windows/win32/api/dxgi1_5/nf-dxgi1_5-idxgioutput5-duplicateoutput1>,
+//!   <https://learn.microsoft.com/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgioutput1-duplicateoutput>
+//! * Window stations and desktops; `OpenInputDesktop`, `SetThreadDesktop`:
+//!   <https://learn.microsoft.com/windows/win32/winstation/desktops>,
+//!   <https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-openinputdesktop>,
+//!   <https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-setthreaddesktop>
+//! * WebRTC's DXGI capturer calls `SetThreadDesktop(OpenInputDesktop())` on its
+//!   capture thread for the same reason (`modules/desktop_capture/win`).
 
 #![cfg(windows)]
 
@@ -42,8 +74,14 @@ pub enum Error {
     NoOutput,
     #[error("duplication access lost — caller must re-init")]
     AccessLost,
-    #[error("secure desktop — only the SYSTEM helper can duplicate it (§8)")]
-    SecureDesktop,
+    /// `E_ACCESSDENIED` from `DuplicateOutput1`/`DuplicateOutput`/`AcquireNextFrame`:
+    /// the capture thread is not on the active input desktop (a service-launched
+    /// host before/while it attaches, or a transient desktop switch — UAC secure
+    /// desktop, lock screen, fast-user-switch). Recoverable: re-attach to the input
+    /// desktop and re-acquire. NOT terminal — the caller retries instead of ending
+    /// the session.
+    #[error("desktop duplication denied — capture thread is off the active input desktop; re-attach and retry")]
+    AccessDenied,
 }
 
 /// A move rect (§5a): the OS says a region moved from `src` to `dst`. Process
@@ -157,7 +195,7 @@ impl Duplicator {
             return match e.code() {
                 c if c == DXGI_ERROR_WAIT_TIMEOUT => Ok(None),
                 c if c == DXGI_ERROR_ACCESS_LOST => Err(Error::AccessLost),
-                c if c == E_ACCESSDENIED => Err(Error::SecureDesktop),
+                c if c == E_ACCESSDENIED => Err(Error::AccessDenied),
                 _ => Err(Error::Win(e)),
             };
         }
@@ -364,11 +402,21 @@ fn duplicate_output(
             let formats: [DXGI_FORMAT; 1] = [DXGI_FORMAT_B8G8R8A8_UNORM];
             match output5.DuplicateOutput1(device, 0, &formats) {
                 Ok(d) => return Ok(d),
-                Err(e) => tracing::warn!("DuplicateOutput1 failed ({e}); falling back"),
+                // Off the input desktop: the fallback denies for the same reason,
+                // so classify it recoverable now rather than retrying and masking
+                // it as an opaque backend error. The caller re-attaches and retries.
+                Err(e) if e.code() == E_ACCESSDENIED => return Err(Error::AccessDenied),
+                Err(e) => {
+                    tracing::warn!("DuplicateOutput1 failed ({e}); falling back to DuplicateOutput")
+                }
             }
         }
-        // Fallback: Output1::DuplicateOutput (BGRA only).
+        // Fallback: Output1::DuplicateOutput (BGRA only, older Windows).
         let output1: IDXGIOutput1 = output.cast()?;
-        Ok(output1.DuplicateOutput(device)?)
+        match output1.DuplicateOutput(device) {
+            Ok(d) => Ok(d),
+            Err(e) if e.code() == E_ACCESSDENIED => Err(Error::AccessDenied),
+            Err(e) => Err(Error::Win(e)),
+        }
     }
 }

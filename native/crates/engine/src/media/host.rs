@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
-use platform_api::{CaptureError, Codec, EncoderConfig, Platform};
+use platform_api::{CaptureError, Codec, EncoderConfig, Platform, ScreenCapture};
 
 use crate::session::Shared;
 use crate::tuning::{MAX_FPS, MAX_FPS_INTERVAL, MIN_FPS};
@@ -21,6 +21,62 @@ pub(crate) struct HostMedia {
     /// The reliable control channel, for cursor images (D9): an image is sent
     /// once, so it must not be lost the way a stale position may be.
     pub ctl_tx: Sender<Vec<u8>>,
+}
+
+/// Open the capture session, retrying the recoverable case instead of ending the
+/// session before it starts. A service-launched host can be briefly off the active
+/// input desktop at startup (the W8 regression) — a startup race, or the lock /
+/// UAC secure desktop being up — which the backend reports as [`CaptureError::Lost`];
+/// we retry with backoff until it returns or the session stops, so the loop
+/// self-recovers exactly as it does for a mid-session desktop switch. A missing
+/// saved display falls back to the primary; any other (terminal) error is returned.
+fn open_capture(
+    platform: &dyn Platform,
+    display: Option<&str>,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Result<Box<dyn ScreenCapture>, Box<dyn std::error::Error>> {
+    let mut backoff = std::time::Duration::from_millis(100);
+    let mut waited = false;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return Err("session stopped before screen capture became available".into());
+        }
+        let attempt = match platform.create_capture(display) {
+            // A saved display that no longer exists (unplugged, or an id from an
+            // older version): share the primary one rather than nothing.
+            Err(CaptureError::NoOutput) if display.is_some() => {
+                // Bind first: `display` as a bare arg to the tracing macro is
+                // parsed as its `display(...)` value formatter, not this variable.
+                let wanted = display.unwrap_or_default();
+                tracing::warn!("display {wanted:?} not found — sharing the primary display");
+                platform.create_capture(None)
+            }
+            other => other,
+        };
+        match attempt {
+            Ok(c) => {
+                if waited {
+                    tracing::info!(
+                        "host: screen capture became available — starting the fast DDA path"
+                    );
+                }
+                return Ok(c);
+            }
+            Err(CaptureError::Lost) => {
+                if !waited {
+                    waited = true;
+                    tracing::warn!(
+                        "host: screen capture not ready yet — the active input desktop is \
+                         unavailable (service host starting off the desktop, or a secure \
+                         desktop / lock screen is up); retrying until it returns"
+                    );
+                }
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 /// Host capture → encode loop. Runs on its own thread; the capture session and
@@ -46,17 +102,7 @@ pub(crate) fn host_media_loop(
     // sent again even if an earlier session had sent it.
     let mut cursor_images = super::cursor::HostCursor::default();
     let codecs = platform.codecs();
-    let mut cap = match platform.create_capture(display.as_deref()) {
-        Ok(c) => c,
-        // A saved display that no longer exists (unplugged, or an id from an
-        // older version): share the primary one rather than nothing.
-        Err(CaptureError::NoOutput) if display.is_some() => {
-            let wanted = display.as_deref().unwrap_or_default();
-            tracing::warn!("display {wanted:?} not found — sharing the primary display");
-            platform.create_capture(None)?
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let mut cap = open_capture(platform.as_ref(), display.as_deref(), &stop)?;
     // Encode at the screen's REAL size. Assuming 1920x1080 made the GPU
     // converter rescale every frame on any other monitor (soft picture, wrong
     // aspect) — the viewer adapts to whatever size actually arrives.
@@ -88,6 +134,10 @@ pub(crate) fn host_media_loop(
     let mut rejected_size: Option<(u32, u32)> = None;
     let mut sent: u64 = 0;
     let mut last_frame_at = std::time::Instant::now();
+    // When capture is down (reinit keeps failing because the input desktop is
+    // unavailable — secure desktop/lock/switch), remember since when, so we log
+    // the loss once and the recovery once rather than on every 250 ms retry.
+    let mut capture_down_since: Option<std::time::Instant> = None;
 
     // Source pacing = the "readable but slower" trade, made explicit. The encoder
     // now has a hard QUALITY floor (its max-QP floor), so when the screen needs more
@@ -306,11 +356,32 @@ pub(crate) fn host_media_loop(
                 cap.release();
             }
             Ok(None) => { /* §5a idle: WAIT_TIMEOUT, send nothing */ }
+            // The one recoverable error (mode change, display sleep, desktop
+            // switch, or a service host off the input desktop — the W8 regression,
+            // which the Windows backend maps here instead of ending the session).
+            // `reinit` re-attaches the capture thread to the active input desktop
+            // and re-acquires the duplication; if that still fails (secure desktop
+            // up), back off and keep trying until the desktop returns.
             Err(CaptureError::Lost) => {
                 if let Err(e) = cap.reinit() {
-                    tracing::warn!("capture reinit failed: {e}");
+                    if capture_down_since.is_none() {
+                        capture_down_since = Some(std::time::Instant::now());
+                        tracing::warn!(
+                            "host: screen capture lost (reinit failed: {e}) — the active input \
+                             desktop is unavailable (secure desktop / lock screen / session \
+                             switch); retrying until it returns. This is a CAPTURE restart, not \
+                             an encoder change."
+                        );
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(250));
                     continue;
+                }
+                if let Some(since) = capture_down_since.take() {
+                    tracing::info!(
+                        "host: screen capture re-acquired after {:?} — fast DDA path restored \
+                         (capture restart, not an encoder change)",
+                        since.elapsed()
+                    );
                 }
                 // A mode change alters the screen size: re-read it, and the size
                 // check above rebuilds the encoder on the next pass.

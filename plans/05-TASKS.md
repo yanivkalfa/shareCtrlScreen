@@ -55,7 +55,7 @@
 | W5 UIAccess (Alt+Tab / Win key passthrough) | **done** (Opus, Opus-reviewed; device-pending checklists/W5.md: Alt+Tab/Win via the service) | route (a) only: the service sets `TokenUIAccess` (SeTcb) on a duplicate of the host token; `--print-uiaccess`; startup log line; fallback launches without the flag and logs why. Signed route deferred to W6 (see the card) |
 | W7 uninstaller removes the whole install dir (service log leftover) | **done** (Opus, Opus-reviewed, merged 03d98af; proven by the windows-installer CI job on push) | first windows-installer CI run failed only on uninstall-clean: `sharectrl-service.log` left in Program Files; RMDir /r $INSTDIR in POSTUNINSTALL |
 | U1 in-app updater (check/download/install/restart) | **in progress** (Opus) | tauri-plugin-updater + updater signing key (orchestrator-created secrets), latest.json on GitHub releases, Settings UI, service-aware install+restart; TOP priority |
-| W8 service-host capture lag (DuplicateOutput Access-denied) | **in progress** (Opus) | service-launched host loses the fast DDA path → software fallback + media-loop restarts = lag; attach capture to the input desktop + retry transient E_ACCESSDENIED |
+| W8 service-host fast path (DDA capture + HW encode) | **in review** (Opus) | service-launched host loses the fast DDA path + HW encoder → software fallback + media-loop restarts = lag; attach the capture thread (and so the shared device the HW MFT uses) to the active input desktop + reclassify E_ACCESSDENIED as recoverable and retry instead of ending the loop; goal widened to restore capture AND HW encode (owner: was smooth self-launched) |
 | W9 Alt+Tab on a service host | **blocked: need controller app.log** | host UIAccess granted + injects reserved shortcuts, yet Alt+Tab does not switch → controlling-side capture/forward issue (keyhook on a Windows controller, or the Mac tap) |
 | T4 Wayland CI | **done** (Haiku, Opus-reviewed; jobs unverified until pushed; GNOME portal tests are device-pass items) | `native-ci.yml` jobs `wayland-sway` (ubuntu-24.04: sway + xdg-desktop-portal-wlr + pipewire + wireplumber; runs L5 `wayland_surface`, L1 `portal_capture --ignored`, and L6 `input::tests` minus uinput and `xtest_*`) and `wayland-gnome` (ubuntu-24.04: mutter 46 + xdg-desktop-portal-gnome; proves the stack, runs no test: the consent dialog has no headless pre-authorization, so the libei and GNOME portal-capture tests are device-pass items). Scripts in `.github/wayland/`. Local (lane, WSL): `wayland_surface` PASS (T4-02); `input::tests` wlroots and EIS pass, uinput fails under REQUIRED as designed (T4-03). Owner verification after the push: see the T4 card |
 | L5 video surface | **done** (Opus, Opus-reviewed; device-pending per checklists/L5.md) | X11: child window of the GTK toplevel on our own x11rb connection, XShape reveal clip, XDND drops via `XdndProxy`, Expose → redraw of the last frame. Wayland: the spike's area+video subsurface tree on GDK's connection (re-attached when GDK re-creates the toplevel surface), `wp_viewporter` crop + fractional scale, drops through GDK's own data device (sink window); decision-#3 separate window when there is no `wp_viewporter` or `SHARECTRL_VIDEO_WINDOW=separate`. Keys from the GTK toplevel on both (keymap: XKB − 8 = evdev). One wgpu presenter (Vulkan, GL fallback) over `surface-wgpu`. Headless tests: `tests/x11_surface.rs` (Xvfb), `tests/wayland_surface.rs` (headless sway). **Device-pending** (checklists/L5.md) |
@@ -527,6 +527,40 @@ I1..I4 after all lanes (hardware validation)
 * Risk/interaction: this touches elevation/session (how the service launches) and capture (desktop + error
   handling). Coordinate with W4's launch invariants — do NOT regress the elevated-window control that now
   works (UIAccess granted must stay). If a platform-api change is needed, STOP and report it.
+* **Goal widened (owner, 2026-11-02):** the owner confirms the session ran "like a charm" self-launched on
+  this exact machine BEFORE the service change. So the HW-encoder `0x8000FFFF` is NOT assumed to be a
+  permanent box quirk — it is treated as the SAME service-context regression as the DXGI denial. Target:
+  restore the FULL fast path (fast DXGI capture **and** hardware H264 encode) for the service host, to match
+  the self-launched baseline. Root-cause them together: what a self-launched interactive host has that the
+  service host lacks is the active-input-desktop association of its threads; the capture thread creates the
+  **shared** D3D11 device that the HW MFT is then built on, so attaching that thread to the input desktop
+  before the device is created is expected to fix BOTH. Only if HW encode still fails after that, on proof
+  it is service-independent, is it documented as a machine-specific fallback.
+* **As built (2026-11-02):**
+    - (1) **Desktop attach, scoped to the capture thread.** `platform_windows::adapters::DdaCapture::new`
+      now calls `attach_capture_desktop` (an `elevation::InputDesktopFollower` →
+      `OpenInputDesktop`+`SetThreadDesktop`, the same primitive the input injector uses on ITS thread)
+      BEFORE `capture::Duplicator::new`, so `DuplicateOutput1` is permitted for a service-launched host.
+      `SetThreadDesktop` is per-thread, so the injector thread (UIAccess control) and the UI thread are
+      untouched — W4/W5 invariants intact, and elevation/session.rs (the launch) is unchanged. Because the
+      attach is sticky for the thread and `host_media_loop` builds the HW H264 encoder from `cap.device()`
+      on that **same** thread right after, the shared D3D11 device + the MFT activation also happen in the
+      input-desktop context — the expected fix for the `0x8000FFFF` HW-encode regression (device-confirmed).
+    - (2) **Error classification + retry.** `capture::Error::SecureDesktop` (every `E_ACCESSDENIED` → terminal)
+      is replaced by `capture::Error::AccessDenied` (recoverable), now also returned by the `duplicate_output`
+      creation path (previously an opaque `Backend` error that ended the loop). `adapters::capture_err` maps
+      both `AccessLost` and `AccessDenied` → `CaptureError::Lost`, the one error `host_media_loop` recovers
+      from; `reinit` re-attaches to the (possibly new) input desktop. The initial `create_capture` is retried
+      with capped backoff (`open_capture`) so a startup race / secure-desktop-up self-heals instead of ending
+      the session. No `platform-api` signature change (reused `CaptureError::Lost`; `SecureDesktop` variant
+      kept but no longer produced on Windows).
+    - (3)/(4) **Logging.** `capture:` logs the input desktop it attached to; `host:` logs capture loss and a
+      single re-acquire line, both worded "capture restart, not an encoder change" so a future lag report
+      is unambiguous against the existing codec "software encoder (CPU)" line.
+    - Lane-proven: `cargo fmt/check/clippy -D warnings/test` on Windows + WSL; unit test
+      `adapters::access_denials_are_recoverable_backend_errors_are_terminal`. Device-only (W8.md): that a
+      service install uses DuplicateOutput1 AND the hardware encoder (no "software encoder (CPU)" line), the
+      session is smooth, and capture recovers across a UAC/lock transition.
 
 ## Lane M — macOS backend (`crates/platform-macos`)
 

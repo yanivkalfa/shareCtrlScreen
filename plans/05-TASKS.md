@@ -56,6 +56,7 @@
 | W7 uninstaller removes the whole install dir (service log leftover) | **done** (Opus, Opus-reviewed, merged 03d98af; proven by the windows-installer CI job on push) | first windows-installer CI run failed only on uninstall-clean: `sharectrl-service.log` left in Program Files; RMDir /r $INSTDIR in POSTUNINSTALL |
 | U1 in-app updater (check/download/install/restart) | **done** (Opus, Opus-reviewed; device-pending U1.md: real update loop needs two updater-enabled releases) | tauri-plugin-updater 2.14.1 + tauri-plugin-process 2.4.0, updater signing key (orchestrator-created secrets), latest.json generated on the release, Settings UI, service-aware install+restart; TOP priority |
 | W8 service-host fast path (DDA capture + HW encode) | **done** (Opus, Opus-reviewed, merged 0afabeb; capture fast-path implemented, HW-encode fix device-pending hypothesis — checklists/W8.md) | service-launched host loses the fast DDA path + HW encoder → software fallback + media-loop restarts = lag; attach the capture thread (and so the shared device the HW MFT uses) to the active input desktop + reclassify E_ACCESSDENIED as recoverable and retry instead of ending the loop; goal widened to restore capture AND HW encode (owner: was smooth self-launched) |
+| M13 macOS toolbar drawer not shown (reveal fires, strip empty) | **in progress** (Opus) | Mac app.log: pointer events arrive, Reveal fires, view+layer shrink 40px — but the web toolbar does not show in the strip (macOS bottom-origin axis suspect); drawer/End Session invisible |
 | W9 Alt+Tab on a service host | **blocked: need controller app.log** | host UIAccess granted + injects reserved shortcuts, yet Alt+Tab does not switch → controlling-side capture/forward issue (keyhook on a Windows controller, or the Mac tap) |
 | T4 Wayland CI | **done** (Haiku, Opus-reviewed; jobs unverified until pushed; GNOME portal tests are device-pass items) | `native-ci.yml` jobs `wayland-sway` (ubuntu-24.04: sway + xdg-desktop-portal-wlr + pipewire + wireplumber; runs L5 `wayland_surface`, L1 `portal_capture --ignored`, and L6 `input::tests` minus uinput and `xtest_*`) and `wayland-gnome` (ubuntu-24.04: mutter 46 + xdg-desktop-portal-gnome; proves the stack, runs no test: the consent dialog has no headless pre-authorization, so the libei and GNOME portal-capture tests are device-pass items). Scripts in `.github/wayland/`. Local (lane, WSL): `wayland_surface` PASS (T4-02); `input::tests` wlroots and EIS pass, uinput fails under REQUIRED as designed (T4-03). Owner verification after the push: see the T4 card |
 | L5 video surface | **done** (Opus, Opus-reviewed; device-pending per checklists/L5.md) | X11: child window of the GTK toplevel on our own x11rb connection, XShape reveal clip, XDND drops via `XdndProxy`, Expose → redraw of the last frame. Wayland: the spike's area+video subsurface tree on GDK's connection (re-attached when GDK re-creates the toplevel surface), `wp_viewporter` crop + fractional scale, drops through GDK's own data device (sink window); decision-#3 separate window when there is no `wp_viewporter` or `SHARECTRL_VIDEO_WINDOW=separate`. Keys from the GTK toplevel on both (keymap: XKB − 8 = evdev). One wgpu presenter (Vulkan, GL fallback) over `surface-wgpu`. Headless tests: `tests/x11_surface.rs` (Xvfb), `tests/wayland_surface.rs` (headless sway). **Device-pending** (checklists/L5.md) |
@@ -599,6 +600,41 @@ I1..I4 after all lanes (hardware validation)
       `adapters::access_denials_are_recoverable_backend_errors_are_terminal`. Device-only (W8.md): that a
       service install uses DuplicateOutput1 AND the hardware encoder (no "software encoder (CPU)" line), the
       session is smooth, and capture recovers across a UAC/lock transition.
+
+### M13 — macOS: the toolbar drawer does not appear although the reveal fires  (size S–M, macOS; owner report + Mac app.log 2026-11-02)
+* Problem: on the macOS viewer the top-edge drawer (the web UI toolbar with End Session / Disconnect) never
+  comes down, although M12's reveal instrumentation proves the NATIVE side works. Mac app.log
+  (`/Users/avrumy/Library/Logs/ShareCtrlScreen/app.log`, 2026-11-02, connected to a Linux host):
+    - `platform_macos::view: video view: pointer events arrive (first move at y=526.1px)` — events DO reach the view.
+    - `toolbar reveal: Reveal at y=-9.3px (scale 2, system cover 0px); view frame … height 894.0, layer frame …
+      height 894.0` then `Hide at y=161.2px; view frame … height 934.0, layer frame … height 934.0`.
+  So on Reveal BOTH the video view AND its layer shrink by 40 px (934→894) to open the strip, and Hide restores
+  it. The native reveal + layer-frame sync (M12) are correct. Yet the user sees no drawer. => The 40 px strip the
+  reveal opens is NOT showing the web toolbar underneath on macOS. This is the "layer does not reveal the webview"
+  gap, macOS-specific; on Windows the same web drawer works.
+* Likely cause (builder to confirm against the view hierarchy): the native video child view sits over wry's
+  `WryWebViewParent`; when it shrinks 40 px from the top, the webview (which renders the toolbar) must be visible
+  in that strip. It is not — candidates: the video view/layer is not actually the TOP-most in that strip (z-order),
+  or its background is opaque where it shrank, or the webview's toolbar is positioned/clipped so nothing shows in
+  the first 40 px on macOS, or the shrink happens on the wrong axis (macOS is bottom-left origin — the 40 px may be
+  opening at the BOTTOM, not the top, so the drawer region is exposed where the toolbar isn't). The last is the
+  strongest suspect: y is bottom-origin on macOS; confirm the strip opens at the visual TOP, not the bottom.
+* Deliverable: on macOS, a reveal actually exposes the web toolbar at the visual top of the video. Whatever the
+  cause: fix the axis/origin if the strip opens at the wrong edge; ensure the webview (toolbar) is drawn in the
+  revealed strip (z-order / clear background there); make Hide restore it exactly. The End Session / Disconnect
+  buttons must be clickable in the revealed strip. Keep the Windows/Linux reveal behaviour unchanged (M12/surface
+  reveal.rs is shared — scope the change to the macOS view/layout only, or prove the shared change is safe on all).
+* Secondary (same log, lower priority, fold in if cheap): spurious reveals at extreme y (`Reveal at y=-470px`,
+  `y=-1025px`; `Hide at y=568px`) — the pointer-y maps to large out-of-range values when near/over the top edge, so
+  the bar sometimes toggles on a flick far from the edge. Clamp/validate the mapped y (the `exited_through_top`
+  band) so only a genuine top-edge hover toggles. Do not let this delay the main fix.
+* Tests: pure reveal/axis math unit-tested in surface-wgpu/view where possible; the real proof is on a Mac
+  (checklist M13.md: connect, hover the top edge, the drawer with End Session comes down and is clickable, moving
+  away hides it; windowed and full-screen; the extreme-y flick no longer toggles spuriously).
+* Acceptance (device, Mac viewer): the drawer appears on a top-edge hover and End Session works; app.log still
+  shows the Reveal/Hide lines (unchanged) but now the user SEES the bar. Checklist plans/checklists/M13.md.
+* Note: this is independent of the Mac→Linux video lag (that is a TURN-relay bandwidth problem, ~220 kbps, tracked
+  separately — NOT this card).
 
 ## Lane M — macOS backend (`crates/platform-macos`)
 

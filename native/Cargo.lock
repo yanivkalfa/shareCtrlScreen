@@ -106,6 +106,7 @@ name = "app"
 version = "2.1.4"
 dependencies = [
  "codec-openh264",
+ "elevation",
  "engine",
  "platform-api",
  "platform-linux",

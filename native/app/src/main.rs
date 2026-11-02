@@ -16,7 +16,10 @@
 // On Windows release builds, don't spawn a console window.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod uiaccess;
+
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -490,6 +493,17 @@ fn raise_main_window(app: &tauri::AppHandle) {
 }
 
 fn main() {
+    // `--print-uiaccess` answers and exits before anything else exists: no
+    // window, no network, no logging (which truncates app.log) and no instance
+    // gate — it reports the status of THIS invocation and nothing more (W5).
+    if uiaccess::wants_print(std::env::args().skip(1)) {
+        let status = uiaccess::probe();
+        // A release build is a GUI-subsystem exe: stdout reaches the caller
+        // only when it is redirected or piped; a write error is not fatal.
+        let _ = writeln!(std::io::stdout(), "{}", status.line());
+        std::process::exit(status.exit_code());
+    }
+
     // One host per session when the Windows service is installed (task W4).
     // Decided before logging, so a launch that hands over never opens (and
     // truncates) the running host's app.log.
@@ -515,6 +529,9 @@ fn main() {
         if service_host.is_some() {
             tracing::info!("started by the ShareCtrlScreen service as this session's host");
         }
+        // W5: whether remote Alt+Tab / the Windows key can reach this host's
+        // shell. UIAccess is a Windows token flag, so other OSes log nothing.
+        tracing::info!("{}", uiaccess::probe().line());
     }
 
     // The engine spawns its signaling task with `tokio::spawn`, so a Tokio

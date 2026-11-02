@@ -129,7 +129,7 @@ been tested on hardware.
 | Clipboard files, pasted on this side | Yes | Yes | Yes | Yes |
 | File push, controller to controlled | Yes | Yes | Yes | Yes |
 | Drop a file on a remote window | Yes | Yes, with Accessibility permission | Yes | No. The file stays on the clipboard and a notice shows |
-| Shortcut passthrough (Alt+Tab, Cmd+Tab, Super) | Experimental, off by default. Ctrl+Alt+Del and Win+L cannot be captured | Every Cmd shortcut (Cmd+C/V, Cmd+Tab, Cmd+Space, Cmd+Shift+4, Cmd+Option+D…) and Ctrl+arrows (Spaces, Mission Control) while the remote picture has the keyboard; clicking anywhere else gives them back at once. **Cmd+Q always quits the viewer** (the escape hatch). Cannot be taken: Force Quit (Cmd+Option+Esc), Lock Screen (Cmd+Ctrl+Q), Touch ID / power and the media keys, and anything while Secure Input is on (password fields). With "Translate modifiers" on (Settings → Advanced) Cmd arrives on a Windows/Linux host as Ctrl; with it off, as the Win/Super key | Yes, the window grabs the keyboard | Depends on the compositor. If refused, the app says shortcuts are unsupported here |
+| Shortcut passthrough (Alt+Tab, Cmd+Tab, Super) | Experimental, off by default. Alt+Tab and the Windows key take effect on the host only when it runs under the Windows service (installed by the installer) — a host you start yourself captures them but the host's shell ignores them. Ctrl+Alt+Del and Win+L can never be captured | Every Cmd shortcut (Cmd+C/V, Cmd+Tab, Cmd+Space, Cmd+Shift+4, Cmd+Option+D…) and Ctrl+arrows (Spaces, Mission Control) while the remote picture has the keyboard; clicking anywhere else gives them back at once. **Cmd+Q always quits the viewer** (the escape hatch). Cannot be taken: Force Quit (Cmd+Option+Esc), Lock Screen (Cmd+Ctrl+Q), Touch ID / power and the media keys, and anything while Secure Input is on (password fields). With "Translate modifiers" on (Settings → Advanced) Cmd arrives on a Windows/Linux host as Ctrl; with it off, as the Win/Super key | Yes, the window grabs the keyboard | Depends on the compositor. If refused, the app says shortcuts are unsupported here |
 | Modifier translation for the remote OS (default on, Settings → Advanced) | From a Mac viewer: Cmd is sent as Ctrl, Cmd+Tab as Alt+Tab, Mac Control as Win. To a Mac host: Ctrl is sent as Cmd, Win as Control, Alt+Tab as Cmd+Tab | Same | Same | Same |
 | Lock screen (a user is logged in) | Through the Windows service the installer sets up (SYSTEM + desktop-follow). Unverified on a device | In scope. Unverified | In scope. Unverified | In scope. Unverified |
 | Login window (nobody logged in) | Yes, through the Windows service the installer sets up | No | No | No |
@@ -255,6 +255,16 @@ publishes nothing. To build this machine's assets locally the same way, run
   losing window focus releases it). Still **cannot** be captured, by Windows
   design: **Ctrl+Alt+Del** and **Win+L** (kernel/secure-desktop level). F11 is
   deliberately left alone so local fullscreen still works.
+  Whether the **host** acts on a forwarded Alt+Tab or Windows key depends on the
+  host having the Windows **UIAccess** token flag: Windows silently drops those
+  shell shortcuts from a process without it. The SYSTEM service (installed by the
+  installer) sets that flag on the host it launches, so Alt+Tab switches windows
+  and the Windows key opens Start on a service-installed host. A host you start
+  yourself — from Program Files or the portable copy — does not get the flag; the
+  shortcuts are still captured locally but the host's shell ignores them. The host
+  logs which case applies on startup (`UIAccess: granted` / `UIAccess: not
+  granted — <reason>` in `app.log`), and `sharectrl.exe --print-uiaccess` prints
+  that line and exits 0 (granted) or 1 (not).
 - **Modifier translation** (default on, ⚙ Settings → Advanced → "Translate modifiers for
   the remote OS"): Mac → Windows/Linux sends Cmd as Ctrl and Cmd+Tab as Alt+Tab, Mac
   Control as Win/Super; Windows/Linux → Mac sends Ctrl as Cmd, Win/Super as Control,

@@ -29,6 +29,22 @@ terminal opened as administrator (`--uninstall-service` removes it):
 sharectrl-service.exe --install-service
 ```
 
+Running the host under this service also lets remote **Alt+Tab** and the **Windows key**
+reach it (the task switcher and the Start menu), which Windows otherwise blocks for
+injected input. The service grants the host the Windows UIAccess token flag at launch; a
+host you start yourself does not get it. To check which case you have, look at the top of
+`%APPDATA%\ShareCtrlScreen\app.log` for one of:
+
+- `UIAccess: granted` — the host runs under the service; Alt+Tab and the Windows key work.
+- `UIAccess: not granted — the host was not started by the service` — a host you started
+  yourself (Program Files or the portable copy). Everything else works; only those two
+  shell shortcuts stay on your own machine.
+
+`sharectrl.exe --print-uiaccess` prints that same line and exits 0 (granted) or 1 (not),
+for a quick check from a script. If the service could not set the flag for some reason, it
+still starts the host and records why in `sharectrl-service.log` next to the service
+executable.
+
 ## macOS (13 Ventura or later)
 
 1. Open the `.dmg` and drag **ShareCtrlScreen** into **Applications**. Start the app from

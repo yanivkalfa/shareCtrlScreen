@@ -35,6 +35,8 @@ platform-api = { path = "../crates/platform-api", features = ["mock"] }
 
 [target.'cfg(windows)'.dependencies]
 platform-windows = { path = "../crates/platform-windows" }
+# The UIAccess token query for the startup line and `--print-uiaccess` (W5).
+elevation = { path = "../crates/elevation" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 platform-macos = { path = "../crates/platform-macos" }

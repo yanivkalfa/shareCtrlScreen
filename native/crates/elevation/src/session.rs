@@ -10,6 +10,7 @@ use windows::Win32::System::Threading::{
     STARTUPINFOW,
 };
 
+use crate::uiaccess::{primary_token_with_uiaccess, UiAccessError};
 use crate::wide;
 
 #[derive(Debug, thiserror::Error)]
@@ -42,18 +43,47 @@ pub fn user_token(session_id: u32) -> Result<HANDLE, SessionError> {
     Ok(token)
 }
 
+/// A host the service started.
+#[derive(Debug)]
+pub struct Launched {
+    pub pid: u32,
+    /// `Ok` when the host was started with the UIAccess token flag; otherwise
+    /// why not. The host was started either way.
+    pub ui_access: Result<(), UiAccessError>,
+}
+
 /// Launch `exe_path` (with `args`) into the user's session on
 /// `winsta0\\default`, inheriting the user's environment (§8b
 /// `CreateProcessAsUser` hand-off). The service calls this to start the engine
-/// and re-calls it whenever the active session changes.
-pub fn launch_in_session(token: HANDLE, exe_path: &str, args: &str) -> Result<u32, SessionError> {
+/// and re-calls it whenever the active session changes. `token` stays owned by
+/// the caller and is not modified.
+///
+/// The process is created from a duplicate of `token` carrying the UIAccess
+/// flag (W5, [`crate::uiaccess`]) so remote Alt+Tab and the Windows key reach
+/// the shell. INVARIANT: a failure of that step never stops the launch — the
+/// host then starts exactly as before, without the flag, and
+/// [`Launched::ui_access`] says why. Command line, desktop, environment block,
+/// working directory (inherited from the service, as before) and creation flags
+/// are the same with or without the flag.
+pub fn launch_in_session(
+    token: HANDLE,
+    exe_path: &str,
+    args: &str,
+) -> Result<Launched, SessionError> {
+    let (flagged_token, ui_access) = primary_token_with_uiaccess(token);
+    // The duplicate is used even when only the flag failed: it is the same
+    // user/session/groups as `token`, just without UIAccess. Only when the
+    // duplication itself failed does the launch fall back to `token`.
+    let launch_token = flagged_token.as_ref().map_or(token, |t| t.handle());
+
     let mut desktop = wide("winsta0\\default");
     let mut cmdline = wide(&format!("\"{exe_path}\" {args}"));
 
     // Build the user's environment block so the engine sees their profile.
     let mut env: *mut core::ffi::c_void = std::ptr::null_mut();
-    // SAFETY: token is a valid primary token.
-    let have_env = unsafe { CreateEnvironmentBlock(&mut env, Some(token), false) }.is_ok();
+    // SAFETY: launch_token is a valid primary token (the caller's, or our
+    // duplicate, alive until the end of this function).
+    let have_env = unsafe { CreateEnvironmentBlock(&mut env, Some(launch_token), false) }.is_ok();
 
     let si = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
@@ -66,7 +96,7 @@ pub fn launch_in_session(token: HANDLE, exe_path: &str, args: &str) -> Result<u3
     // CreateProcessAsUserW requires.
     let result = unsafe {
         CreateProcessAsUserW(
-            Some(token),
+            Some(launch_token),
             None,
             Some(PWSTR(cmdline.as_mut_ptr())),
             None,
@@ -92,5 +122,8 @@ pub fn launch_in_session(token: HANDLE, exe_path: &str, args: &str) -> Result<u3
         let _ = CloseHandle(pi.hThread);
         let _ = CloseHandle(pi.hProcess);
     }
-    Ok(pi.dwProcessId)
+    Ok(Launched {
+        pid: pi.dwProcessId,
+        ui_access,
+    })
 }

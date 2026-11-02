@@ -43,11 +43,8 @@ mod windows_service {
     /// the line lands in the installer's details pane and the exit code decides
     /// whether the install goes on. Unknown arguments exit 2.
     pub fn main() {
-        tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .init();
-
         let arg = std::env::args().nth(1).unwrap_or_default();
+        init_logging(arg == "--run-service");
         let outcome = match arg.as_str() {
             "--install-service" => install(),
             "--start-service" => elevation::service::start()
@@ -110,6 +107,40 @@ mod windows_service {
         Ok(format!(
             "service '{SERVICE_NAME}' {what} ({exe}) and running"
         ))
+    }
+
+    /// Set up logging for this invocation (W5). `--run-service` has no console
+    /// under the SCM, so it logs to `sharectrl-service.log` next to the service
+    /// binary (truncated at each service start) at info — this is where the
+    /// per-launch line, including why a host did not get UIAccess, is recorded.
+    /// WHY there and not under ProgramData: the file is opened by SYSTEM, and
+    /// ProgramData lets standard users pre-create entries (a planted link would
+    /// turn the truncate into an arbitrary-file overwrite); the install folder
+    /// under Program Files is writable only by admins. If the file cannot be
+    /// created it falls back to stdout. The management commands
+    /// (install/start/stop/uninstall) carry their result on stdout/stderr for
+    /// the NSIS details pane, so they stay quiet (`RUST_LOG` only), as before.
+    fn init_logging(service_run: bool) {
+        if !service_run {
+            tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .init();
+            return;
+        }
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        let log_file = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|d| d.join("sharectrl-service.log")))
+            .and_then(|path| std::fs::File::create(path).ok());
+        match log_file {
+            Some(file) => tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .with_env_filter(filter)
+                .init(),
+            None => tracing_subscriber::fmt().with_env_filter(filter).init(),
+        }
     }
 
     static STOP: AtomicBool = AtomicBool::new(false);
@@ -223,16 +254,18 @@ mod windows_service {
                 Some(session) if Some(session) != last_session => {
                     match elevation::user_token(session) {
                         Ok(token) => {
-                            let launched = elevation::launch_in_session(token, &engine_exe, &args);
-                            // The token is ours (WTSQueryUserToken); the child
-                            // has its own copy once CreateProcessAsUser returns.
-                            // SAFETY: valid handle, closed exactly once.
-                            let _ = unsafe { windows::Win32::Foundation::CloseHandle(token) };
-                            match launched {
-                                Ok(pid) => {
-                                    tracing::info!(
-                                        "launched engine pid={pid} in session {session}"
-                                    );
+                            // Owned so the handle is closed after every launch
+                            // attempt — this loop runs for the life of the
+                            // machine and relaunches on every session change.
+                            // (W4 closed the raw handle here; OwnedToken does the
+                            // same by RAII, and the child has its own copy once
+                            // CreateProcessAsUser returns.)
+                            let token = elevation::OwnedToken::from_raw(token);
+                            // W4 launch args (`--autostart --service-host`); the
+                            // UIAccess flag is set inside launch_in_session (W5).
+                            match elevation::launch_in_session(token.handle(), &engine_exe, &args) {
+                                Ok(launched) => {
+                                    log_launch(&launched, session);
                                     last_session = Some(session);
                                 }
                                 Err(e) => tracing::warn!("launch failed: {e}"),
@@ -247,6 +280,22 @@ mod windows_service {
                 None => last_session = None, // logged out; relaunch on next login
             }
             std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+
+    /// One line per launch, saying whether the host got the UIAccess flag and,
+    /// if not, the exact reason (W5 fallback: the host runs anyway, but remote
+    /// Alt+Tab and the Windows key will not reach the shell).
+    fn log_launch(launched: &elevation::Launched, session: u32) {
+        let pid = launched.pid;
+        match &launched.ui_access {
+            Ok(()) => {
+                tracing::info!("launched engine pid={pid} in session {session} with UIAccess")
+            }
+            Err(e) => tracing::warn!(
+                "launched engine pid={pid} in session {session} WITHOUT UIAccess \
+                 (remote Alt+Tab and the Windows key will not reach the host's shell): {e}"
+            ),
         }
     }
 

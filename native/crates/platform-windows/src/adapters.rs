@@ -633,7 +633,8 @@ impl ShortcutHook for LowLevelKeyHook {
             return false;
         };
         // Whether the HOST acts on injected Alt+Tab depends on the host process
-        // being elevated or UIAccess-signed; the hook is harmless either way (the
+        // having UIAccess (set by the service that launches it, W5), not on
+        // this viewer; the hook is harmless either way (the
         // stuck-key guards hold), so log the fact and install.
         tracing::info!(
             "shortcut capture on (uiaccess={})",

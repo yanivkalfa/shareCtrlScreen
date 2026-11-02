@@ -253,7 +253,7 @@ jobs:
           cat >notes.md <<EOF
           ShareCtrlScreen $VERSION
 
-          - **Windows:** \`ShareCtrlScreen_${VERSION}_x64-setup.exe\` (installer) or \`sharectrl.exe\` (portable, run it from any folder). Not code-signed: SmartScreen warns on the first run (More info -> Run anyway). The installer sets up the SYSTEM service for you — it bundles \`sharectrl-service.exe\`, registers it and starts it (one administrator consent), so UAC prompts and the lock screen work and the host starts at sign-in; uninstalling removes it. The standalone \`sharectrl-service.exe\` download is only for a manual install next to a portable \`sharectrl.exe\` (\`sharectrl-service.exe --install-service\` as administrator).
+          - **Windows:** \`ShareCtrlScreen_${VERSION}_x64-setup.exe\` (installer) or \`sharectrl.exe\` (portable, run it from any folder). Not code-signed: SmartScreen warns on the first run (More info -> Run anyway). The installer sets up the SYSTEM service for you — it bundles \`sharectrl-service.exe\`, registers it and starts it (one administrator consent), so UAC prompts and the lock screen work, remote Alt+Tab and the Windows key pass through to the host, and the host starts at sign-in; uninstalling removes it. The standalone \`sharectrl-service.exe\` download is only for a manual install next to a portable \`sharectrl.exe\` (\`sharectrl-service.exe --install-service\` as administrator).
           - **macOS 13+ (Apple Silicon and Intel):** \`ShareCtrlScreen_${VERSION}_universal.dmg\`. Not notarized: the first launch needs System Settings -> Privacy & Security -> Open Anyway. $mac_line
           - **Linux (x86_64):** \`.deb\` (Ubuntu 22.04+, Debian 12+), \`.rpm\` (Fedora 40+) or \`.AppImage\`.
 

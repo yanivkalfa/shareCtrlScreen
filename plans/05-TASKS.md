@@ -56,7 +56,7 @@
 | W5 UIAccess (Alt+Tab / Win key passthrough) | **done** (Opus, Opus-reviewed; device-pending checklists/W5.md: Alt+Tab/Win via the service) | route (a) only: the service sets `TokenUIAccess` (SeTcb) on a duplicate of the host token; `--print-uiaccess`; startup log line; fallback launches without the flag and logs why. Signed route deferred to W6 (see the card) |
 | W7 uninstaller removes the whole install dir (service log leftover) | **done** (Opus, Opus-reviewed, merged 03d98af; proven by the windows-installer CI job on push) | first windows-installer CI run failed only on uninstall-clean: `sharectrl-service.log` left in Program Files; RMDir /r $INSTDIR in POSTUNINSTALL |
 | U1 in-app updater (check/download/install/restart) | **done** (Opus, Opus-reviewed; device-pending U1.md: real update loop needs two updater-enabled releases) | tauri-plugin-updater 2.14.1 + tauri-plugin-process 2.4.0, updater signing key (orchestrator-created secrets), latest.json generated on the release, Settings UI, service-aware install+restart; TOP priority |
-| U2 Settings/Update unreachable while hosting | **in progress** (Opus) | the gear that opens Settings→Updates is only on home + viewer screens; screen-host has none → cannot update mid-session. Fix: add the gear to the host sharing screen, wired to openSettings() |
+| U2 Settings/Update unreachable while hosting | **in review** (Opus) | added `btn-host-settings` gear to `screen-host`'s header, bound (with the viewer gear) to the shared `openSettingsOverVideo()` → `openSettings()`; `closeSettings()` restore generalised to `sessionLive()`. UI-only (index.html + app.js), no Rust. Settings→Updates now reachable mid-host-session; U1 live-session warning intact |
 | W8 service-host fast path (DDA capture + HW encode) | **done** (Opus, Opus-reviewed, merged 0afabeb; capture fast-path implemented, HW-encode fix device-pending hypothesis — checklists/W8.md) | service-launched host loses the fast DDA path + HW encoder → software fallback + media-loop restarts = lag; attach the capture thread (and so the shared device the HW MFT uses) to the active input desktop + reclassify E_ACCESSDENIED as recoverable and retry instead of ending the loop; goal widened to restore capture AND HW encode (owner: was smooth self-launched) |
 | M13 macOS toolbar drawer not shown (reveal fires, strip empty) | **done** (Opus, Opus-reviewed, merged bcf7b6f; type-checked for aarch64-apple-darwin, device-pending checklists/M13.md) | Root cause: `apply_layout` positioned the hosted layer's 40px gap with the parent *view*'s `isFlipped`, but a hosted layer's frame lives in the parent *layer*'s coordinate space, whose geometry flip is independent (wry: unflipped view, geometry-flipped WKWebView layer) — so the gap opened at the wrong visual edge and the video kept covering the toolbar. Fix (view.rs only; shared reveal.rs untouched): drive the layer frame from the parent layer's own `isGeometryFlipped`, so the strip is always at the visual top. Secondary: ignore `mouseExited` reveals mapped more than one bar height above the top (the app.log's y≈-470/-1025 artifacts). M12 reveal logging kept |
 | V1 host overshoots a congested link (video stutter) | **done** (Opus, Opus-reviewed, merged 003fbf8; loopback proves encoder tracks BWE down+up; on-screen smoothness device-pending checklists/V1.md) | ROOT CAUSE (investigation): July 78cd049 raised MIN_BITRATE 400k→2.5M + DESIRED→9M + a raw-BWE source pacer → encoder wont follow BWE down → overshoot→loss→BWE collapse (65↔3700), unpaced keyframe bursts. Fix (As built): MIN_BITRATE→500k + DESIRED→8M so the encoder follows BWE down; a hysteretic resolution ladder (1.0/0.75/0.5/0.33) spends degradation on encode size, fps drops only below the smallest step; the source pacer is removed (str0m paces egress) and forced IDRs no longer bypass it. Owner: Windows went slow when the service came in (lost the fast path → tipped the latent overshoot); Mac/Linux slow from the start |
@@ -824,6 +824,23 @@ I1..I4 after all lanes (hardware validation)
   updates works, and closing Settings restores the video.
 * Acceptance: while hosting, the gear on the sharing screen opens Settings and the Update flow is reachable
   without ending the session. Checklist note in plans/checklists (or fold into U1.md).
+* **As built (branch `task/U2`, in review; UI-only — no Rust touched, tree confirmed clean in the lane):**
+  * **HTML:** `native/app/ui/index.html` — added `<button id="btn-host-settings" class="btn btn-ghost btn-sm"
+    title="Settings">&#9881;</button>` to `screen-host`'s `topbar`, right after `#host-status` (the same
+    end-of-header position `btn-view-settings` occupies in the viewer bar). Same glyph/classes/title as the
+    viewer gear.
+  * **JS:** `native/app/ui/app.js` — the viewer gear's inline click handler (hide the native video, then
+    `openSettings()`) is now a named `openSettingsOverVideo()`; **both** `btn-view-settings` and
+    `btn-host-settings` bind to it (no duplicated logic, `openSettings()` itself unchanged). `closeSettings()`'s
+    restore was gated on `state === 'VIEW_ACTIVE'`; it now uses the existing `sessionLive()` helper
+    (`HOST_ACTIVE || VIEW_ACTIVE`) so the video is restored after Settings closes from either session screen.
+  * **Host video is a no-op, not a bug:** `engine::set_video_visible` (crates/engine/src/lib.rs:822) acts only
+    on the viewer's receive `surface()`; the host has no such surface, so hide/restore are harmless no-ops on
+    the host screen and the host webview has no native overlay to obscure the modal. The hide-then-open and
+    restore paths are now generalised anyway (consistency + future-proofing).
+  * **Updater (U1) untouched**; a mid-session update from the host still shows U1's "End session & update"
+    warning. No `platform-api` / Rust change. Device note: `plans/checklists/U1.md` (U2 section).
+  * Follow-up (owner asked earlier, out of scope here): controller-triggers-host "remote update".
 
 ## Lane M — macOS backend (`crates/platform-macos`)
 

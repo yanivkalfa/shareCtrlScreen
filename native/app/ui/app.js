@@ -231,9 +231,10 @@ function openSettings() {
 
 function closeSettings() {
   $('modal-settings').classList.add('hidden');
-  // If settings were opened mid-session, the native video surface was hidden so
-  // the modal could be seen (it sits above the WebView) — bring it back.
-  if (state === 'VIEW_ACTIVE') invoke('set_video_visible', { visible: true });
+  // If settings were opened mid-session (viewer OR host), the native video
+  // surface was hidden so the modal could be seen (it sits above the WebView) —
+  // bring it back. On the host the surface is absent, so this is a no-op.
+  if (sessionLive()) invoke('set_video_visible', { visible: true });
 }
 
 async function saveSettings() {
@@ -570,17 +571,21 @@ $('btn-view-refresh').addEventListener('click', () => {
   invoke('request_refresh');
   toast('Requested a fresh frame');
 });
-$('btn-view-settings').addEventListener('click', async () => {
-  // Take the native video down BEFORE painting the modal — it sits above the web
-  // UI, so opening the dialog first means it appears underneath the video (and,
-  // if the hover bar was open, sliced to that strip).
+// Opening Settings mid-session (viewer or host): take the native video down
+// BEFORE painting the modal — it sits above the web UI, so opening the dialog
+// first means it appears underneath the video (and, if the hover bar was open,
+// sliced to that strip). On the host there is no video surface, so the invoke
+// is a harmless no-op. closeSettings() restores it.
+async function openSettingsOverVideo() {
   try {
     await invoke('set_video_visible', { visible: false });
   } catch (_) {
     /* fall through — the dialog is still better than nothing */
   }
   openSettings();
-});
+}
+$('btn-view-settings').addEventListener('click', openSettingsOverVideo);
+$('btn-host-settings').addEventListener('click', openSettingsOverVideo);
 
 $('btn-copy').addEventListener('click', async () => {
   try {

@@ -13,8 +13,8 @@
 ;
 ; Layout: one banner section per concern ("; ---- <concern> ----"), each a set of
 ; macros; the "; ---- hooks ----" section at the end calls each concern's macro
-; once per hook. A new concern (W5's certificate import) adds its own banner
-; section and one line per hook, and touches nothing else.
+; once per hook. A future concern adds its own banner section and one line per
+; hook, and touches nothing else.
 ;
 ; Two copies of sharectrl-service.exe ride in the installer: one as the bundle
 ; resource that lands in $INSTDIR, and one the PREINSTALL hook extracts with

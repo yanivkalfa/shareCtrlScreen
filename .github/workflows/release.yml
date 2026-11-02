@@ -251,7 +251,7 @@ jobs:
           cat >notes.md <<EOF
           ShareCtrlScreen $VERSION
 
-          - **Windows:** `ShareCtrlScreen_${VERSION}_x64-setup.exe` (installer) or `sharectrl.exe` (portable, run it from any folder). Not code-signed: SmartScreen warns on the first run (More info -> Run anyway). For UAC prompts and the lock screen, put `sharectrl-service.exe` next to `sharectrl.exe` and install the service once as administrator: `sharectrl-service.exe --install-service`.
+          - **Windows:** \`ShareCtrlScreen_${VERSION}_x64-setup.exe\` (installer) or \`sharectrl.exe\` (portable, run it from any folder). Not code-signed: SmartScreen warns on the first run (More info -> Run anyway). For UAC prompts and the lock screen, put \`sharectrl-service.exe\` next to \`sharectrl.exe\` and install the service once as administrator: \`sharectrl-service.exe --install-service\`.
           - **macOS 13+ (Apple Silicon and Intel):** \`ShareCtrlScreen_${VERSION}_universal.dmg\`. Not notarized: the first launch needs System Settings -> Privacy & Security -> Open Anyway. $mac_line
           - **Linux (x86_64):** \`.deb\` (Ubuntu 22.04+, Debian 12+), \`.rpm\` (Fedora 40+) or \`.AppImage\`.
 

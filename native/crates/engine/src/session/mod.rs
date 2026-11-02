@@ -43,6 +43,12 @@ pub(crate) struct Shared {
     pub cursor: Mutex<Option<ViewerPointer>>,
     /// Viewer: the host's cursor images received so far (task D9).
     pub cursor_images: Mutex<crate::media::cursor::ViewerCursors>,
+    /// Viewer: whether this session currently has CONTROL (task D10). Set from
+    /// the granted permission at session start and updated on every inbound
+    /// `ControlMsg::Perm`. While `true` and the local pointer is over the
+    /// video, the media thread draws the cursor sprite at the LOCAL pointer
+    /// (instant) instead of the host's round-trip-delayed out-of-band echo.
+    pub control: AtomicBool,
     /// Test hook (`test-hooks` feature only): the host's current encode size,
     /// `w << 32 | h`, so the loopback can watch the resolution ladder step.
     #[cfg(feature = "test-hooks")]
@@ -361,6 +367,18 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
     let cfg = engine.config();
     let codec = engine.negotiated_codec();
     let shared = Arc::new(Shared::default());
+    // Viewer control state (task D10): drives the local-pointer cursor
+    // prediction and the OS-cursor hide. The host re-asserts it over ctl via
+    // `Perm`, but seeding it from the permission the host already granted means
+    // the first frames are correct before that message arrives.
+    let has_control = matches!(
+        engine.role(),
+        Role::Viewer {
+            permission: Permission::Control,
+            ..
+        }
+    );
+    shared.control.store(has_control, Ordering::SeqCst);
     let stop = Arc::new(AtomicBool::new(false));
     let (signal_tx, signal_rx) = std::sync::mpsc::channel::<SignalData>();
     let (ctl_tx, ctl_rx) = std::sync::mpsc::channel::<Vec<u8>>();
@@ -515,6 +533,9 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
 
     surface.set_drop_sink(Some(drop_tx));
     surface.set_input_sink(Some(input_tx));
+    // Hide the OS cursor over the video while controlling (task D10); a
+    // view-only session leaves it shown. Mirrors `shared.control`.
+    surface.set_cursor_control(has_control);
     *engine.session.lock() = Some(Session {
         peer: peer.clone(),
         stop,
@@ -690,6 +711,10 @@ pub(crate) fn teardown(engine: &Engine) {
         // Releases held keys first (surface contract), then stops capturing.
         s.set_input_sink(None);
         s.set_drop_sink(None);
+        // Restore the OS cursor (task D10): the session is over, so nothing
+        // should keep it hidden. `hide()` below unhides too, but doing it here
+        // means a view-only teardown and a control teardown look the same.
+        s.set_cursor_control(false);
     }
     // Take the session out BEFORE joining, so the lock is not held while threads
     // that may need it (signal routing) wind down.

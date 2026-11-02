@@ -200,6 +200,19 @@ impl VideoSurface for MacVideoSurface {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    fn local_pointer(&self) -> Option<(f64, f64)> {
+        // Atomics in the shared state — safe to read off the main thread (the
+        // viewer media thread calls this every frame).
+        self.state.local_pointer()
+    }
+
+    fn set_cursor_control(&self, active: bool) {
+        self.state.set_cursor_control(active);
+        // Hiding / showing the OS cursor is a main-thread AppKit call; the view
+        // re-evaluates against the pointer-inside and focus state it tracks.
+        self.on_main("cursor control", |view| view.update_cursor_hidden());
+    }
 }
 
 impl Drop for MacVideoSurface {
@@ -209,8 +222,12 @@ impl Drop for MacVideoSurface {
         let Some(main) = self.main.take() else {
             return;
         };
+        // Task D10: make sure the OS cursor is not left hidden if the surface
+        // is dropped without a teardown first.
+        self.state.set_cursor_control(false);
         let teardown = move |mtm: MainThreadMarker| {
             let parts = main.get(mtm);
+            parts.view.update_cursor_hidden();
             // SAFETY: the token came from `addLocalMonitorForEvents` and is
             // removed exactly once.
             unsafe { NSEvent::removeMonitor(&parts.monitor) };

@@ -51,7 +51,7 @@
 | D8 modifier translation | **done** (Opus, Opus-reviewed; I2 device pass pending) | viewer-side `KeyTranslator` (`engine/src/modifiers.rs`): Cmd ↔ Ctrl swap and Cmd+Tab→Alt+Tab (Mac → PC), Ctrl ↔ Cmd and Alt+Tab→Cmd+Tab (PC → Mac), sent-code tracking; host OS via new optional `connect-response.os`; `translateModifiers` toggle (default on) in Settings → Advanced; unit + loopback-tested. **Device-pending** (I2 Mac↔Windows); closes M6's blocked Cmd+Tab line |
 | M12 take every Cmd shortcut (macOS viewer) | **done** (Opus, Opus-reviewed, merged 99ed737; type-checked for aarch64-apple-darwin, device-pending) | M6 tap takes every Cmd chord + Ctrl+arrows while the video has the keyboard; Cmd+Q stays local (tap and key monitor); Force Quit / Lock Screen never claimed; every modifier synchronised before a taken key; hook keys now share the surface's FIFO input channel (D8 ordering risk closed); focus loss releases at once. Also: toolbar-reveal diagnostics + layer-frame sync + full-screen cover (owner's "top edge does nothing"). **Device-pending** (checklists/M6.md §6–§7) |
 | D9 host cursor sprite on the viewer | **done** (Opus, Opus-reviewed; device-pending I1–I3: real cursor images incl. I-beam in a terminal) | additive cursor-shape message, host sends on change, viewer draws the real sprite at position−hotspot in both presenters; replaces the synthetic triangle |
-| D10 viewer cursor lag on a high-RTT link (draw at local pointer + hide OS cursor) | **in progress** (Opus) | capture already keeps the cursor out of the video; the drawn sprite follows the host out-of-band echo (a round trip behind) while the local OS cursor is instant → two cursors. Fix: draw the sprite at the LOCAL pointer when controlling + hide the OS cursor over the video |
+| D10 viewer cursor lag on a high-RTT link (draw at local pointer + hide OS cursor) | **in review** (Opus; Windows+WSL lane green, platform-macos aarch64 type-checked; device-pending I1–I3) | capture already keeps the cursor out of the video; the drawn sprite followed the host out-of-band echo (a round trip behind) while the local OS cursor was instant → two cursors. Fixed: the sprite is drawn at the LOCAL pointer when controlling and over the video (client-side prediction), and the OS cursor is hidden over the video; SHAPE stays the host's (D9) |
 | W4 installer bundles + registers the SYSTEM service | **done** (Opus, Opus-reviewed, merged d0119b4; Rust lane-proven, installer by new CI job + machine-A smoke pending; device pass checklists/W4.md) | NSIS hooks install/start/stop/uninstall `sharectrl-service.exe` next to `sharectrl.exe`; one host instance rule; CI silent install/upgrade/uninstall job. Acceptance narrowed: service setup + one instance + standalone asset; elevated-window control is NOT a W4 claim |
 | W5 UIAccess (Alt+Tab / Win key passthrough) | **done** (Opus, Opus-reviewed; device-pending checklists/W5.md: Alt+Tab/Win via the service) | route (a) only: the service sets `TokenUIAccess` (SeTcb) on a duplicate of the host token; `--print-uiaccess`; startup log line; fallback launches without the flag and logs why. Signed route deferred to W6 (see the card) |
 | W7 uninstaller removes the whole install dir (service log leftover) | **done** (Opus, Opus-reviewed, merged 03d98af; proven by the windows-installer CI job on push) | first windows-installer CI run failed only on uninstall-clean: `sharectrl-service.log` left in Program Files; RMDir /r $INSTDIR in POSTUNINSTALL |
@@ -800,6 +800,69 @@ I1..I4 after all lanes (hardware validation)
   with the correct host shape; view-only still shows the host's cursor moving; the OS cursor returns when the
   pointer leaves the video; nothing stuck. Checklist plans/checklists/D10.md. This is the fix for the owner's
   "mouse lags behind" even though input and video are fine.
+* **As built (branch `task/D10`, in review; Windows + WSL lane green, platform-macos type-checked for
+  aarch64-apple-darwin; no real relayed session yet — I1–I3):**
+  * **platform-api (orchestrator-approved, additive + defaulted, object-safe)** — two new
+    `VideoSurface` methods in `platform-api/src/surface.rs`:
+    * `fn local_pointer(&self) -> Option<(f64, f64)> { None }` — the viewer's LOCAL pointer over the
+      video, normalized `[0,1]` over the letterbox, or `None` when it is not over the surface.
+    * `fn set_cursor_control(&self, _active: bool) {}` — tells the surface whether this viewer controls, so
+      it hides the OS cursor over the video and restores it on leave/focus-loss.
+    Both default (so `MockSurface` and every backend compile unchanged); placed on `VideoSurface`, not
+    `Presenter`, because OS-cursor visibility is a window/view concern (the card's "presenter" wording was
+    loose). **Only the POSITION source changes; the D9 SHAPE stays the host's.**
+  * **Position switch (engine, all OSes)** — `engine/src/media/viewer.rs` `cursor_position(control, local,
+    host)`: when controlling AND the local pointer is over the video AND the host still shows a cursor, the
+    sprite is drawn at the LOCAL pointer (instant, client-side prediction à la AnyDesk/RDP); otherwise the
+    host's out-of-band position (view-only, or a host-initiated move while the pointer is elsewhere). The
+    host position is still the visibility-filtered one, so D9's `visible == false` hide is preserved (draws
+    nothing). Reuses the existing pointer→normalized geometry, so the sprite lands exactly under the real
+    mouse (HiDPI/letterbox correct). 4 unit tests.
+  * **Control state (engine)** — `Shared.control: AtomicBool`, seeded from the granted `Permission` in
+    `start_viewer`, and the viewer now handles inbound `ControlMsg::Perm` (previously ignored on the viewer):
+    a mid-session grant/revoke updates `shared.control` and calls `surface.set_cursor_control(..)`, so
+    view-only reverts to the host position and restores the OS cursor. Teardown calls
+    `set_cursor_control(false)`.
+  * **Shared surface state** — `surface-wgpu/src/state.rs`: `pointer_inside` + last normalized position +
+    `cursor_control` atomics; `local_pointer()` returns the position only while inside (focus intentionally
+    NOT required for the sprite — an unfocused hover shows the OS cursor, and the coinciding sprite merely
+    overlaps it). Used by macOS and Linux. 1 unit test.
+  * **Per-OS OS-cursor hide:**
+    * **Windows** (`render/src/window.rs`, D3D11 viewer): `WM_SETCURSOR` → `SetCursor(None)` while
+      controlling and the hit-test is `HTCLIENT`; pointer-driven so it is self-balancing (the toolbar strip
+      belongs to the web view and keeps its own cursor). `WM_MOUSEMOVE` + `TrackMouseEvent(TME_LEAVE)` /
+      `WM_MOUSELEAVE` (in `Win32::UI::Controls`, so `Win32_UI_Controls` was added to the crate features)
+      track inside for `local_pointer`; `hide()` resets the flags. `ChildWindowSurface` delegates both
+      methods.
+    * **macOS** (`platform-macos/src/view.rs`, `surface.rs`): `NSCursor::hide`/`unhide`, balanced by a
+      `Cell<bool>` so exactly one hide per unhide — it can never stick. Desired-hidden = control && pointer
+      inside && key focus, re-evaluated on enter/leave/move/drag/button and on **every** focus change
+      (`publish_key_focus`, `windowDidResignKey`, `resignFirstResponder`, `viewDidHide`) and on
+      `reset_reveal`; `Drop` force-restores. Cmd+Tab away → `windowDidResignKey` → unhide; back →
+      `windowDidBecomeKey` → re-hide.
+    * **Linux X11** (`platform-linux/src/surface/x11.rs`): a transparent cursor (1×1 depth-1 pixmap cleared
+      to 0, source+mask) kept beside the arrow; `set_cursor_control` swaps the window's cursor attribute —
+      a per-window attribute, inherently balanced, shown only while the pointer is over our video, restored
+      to the arrow on release and both freed in `Drop`. **Caveat:** it hides whenever controlling regardless
+      of key focus (the attribute is window-scoped), so an unfocused-but-hovered window shows no cursor
+      until control ends — minor, in the checklist.
+    * **Linux Wayland** (`platform-linux/src/surface/wayland/`): `local_pointer` is fed (instant sprite) but
+      `set_cursor_control` stays the default no-op — there is no portable GDK/`wl_pointer` cursor-hide here,
+      so the sprite simply coincides with the OS cursor (the card's allowed fallback; no lag gap).
+  * **Mock** — `platform-api/src/mock.rs`: `pointer_inside`/`cursor_control` fields + `set_pointer_inside`
+    helper + the two overrides, so the selection is unit-testable.
+  * **Tests:** unit — the position-source selection (`cursor_position`: control+over→local, view-only→host,
+    not-over→host, host-invisible→None) and `SurfaceState::local_pointer` gating. Device-only (I1–I3,
+    checklists/D10.md) — the real relayed "one instant cursor" feel and the OS-cursor hide/restore on each
+    OS. All existing render/surface-wgpu/loopback/engine tests stay green (Windows + WSL lane).
+  * **Not changed:** host capture (cursor already out-of-band), input/injection, the D9 shape path, the
+    fallback arrow, `visible == false` hiding, the reveal/toolbar.
+  * **References** (in the touched `//! ## References`): NSCursor `hide`/`unhide`
+    (<https://developer.apple.com/documentation/appkit/nscursor>); Windows `SetCursor(NULL)` +
+    `TrackMouseEvent`/`WM_MOUSELEAVE`; winit/tao `set_cursor_visible`
+    (<https://docs.rs/winit/latest/winit/window/struct.Window.html#method.set_cursor_visible>); X11
+    transparent cursor via an empty pixmap; client-side cursor prediction (AnyDesk/Microsoft RDP) as the
+    rationale for drawing at the local pointer.
 
 ### U2 — Settings/Update is unreachable while hosting a session  (size XS–S, UI; owner report 2026-11-02)
 * Problem: the Updates control (U1) lives in the Settings modal, opened by the gear button. But the gear

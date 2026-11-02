@@ -36,6 +36,16 @@
 //!   them for smooth-scrolling devices): XInput 2.1 spec, "Smooth scrolling",
 //!   <https://www.x.org/releases/current/doc/inputproto/XI2proto.txt>
 //! * X cursor font glyphs (`XC_left_ptr` = 68): `X11/cursorfont.h`.
+//! * Transparent cursor to hide the pointer over the video while controlling
+//!   (task D10): an empty (all-zero mask) 1x1 pixmap passed to `CreateCursor`,
+//!   swapped onto the window's `cursor` attribute — a per-window attribute, so
+//!   it only hides the pointer over our window and needs no enter/leave
+//!   balancing: <https://www.x.org/releases/current/doc/xproto/x11protocol.html>
+//!   (CreateCursor, ChangeWindowAttributes). The cross-platform analogue is
+//!   winit/tao `set_cursor_visible`:
+//!   <https://docs.rs/winit/latest/winit/window/struct.Window.html#method.set_cursor_visible>.
+//!   Drawing the sprite at the local pointer is client-side cursor prediction
+//!   (AnyDesk / Microsoft RDP), chosen in the engine's `media/viewer.rs`.
 //! * x11rb 0.14: <https://docs.rs/x11rb/0.14.0/x11rb/>
 //! * `gdk_x11_window_get_xid`:
 //!   <https://docs.gtk.org/gdk3-x11/>
@@ -59,8 +69,9 @@ use surface_wgpu::SurfaceState;
 use x11rb::connection::Connection;
 use x11rb::protocol::shape::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
-    Atom, ClientMessageEvent, ClipOrdering, ConfigureWindowAux, ConnectionExt as _,
-    CreateWindowAux, EventMask, NotifyMode, Rectangle, StackMode, Window, WindowClass,
+    Atom, ChangeWindowAttributesAux, ClientMessageEvent, ClipOrdering, ConfigureWindowAux,
+    ConnectionExt as _, CreateGCAux, CreateWindowAux, Cursor, EventMask, NotifyMode, Rectangle,
+    StackMode, Window, WindowClass,
 };
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
@@ -172,6 +183,12 @@ pub(crate) struct Shared {
     reveal: Mutex<Reveal>,
     repaint: Mutex<Option<Weak<dyn Repaint>>>,
     stop: AtomicBool,
+    /// Task D10: the arrow (view-only / host-initiated) and a transparent
+    /// cursor (hidden while controlling so only the sprite shows). Both are
+    /// kept alive for the window's lifetime so the attribute can swap between
+    /// them; freed in `Drop`.
+    cursor_arrow: Cursor,
+    cursor_blank: Cursor,
 }
 
 // SAFETY: `xdisplay` is the Xlib `Display*` from the window handle — tao's
@@ -186,6 +203,43 @@ unsafe impl Sync for Shared {}
 
 fn x_err(what: &str) -> impl Fn(x11rb::errors::ConnectionError) -> SurfaceError + '_ {
     move |e| SurfaceError::Backend(format!("X11 {what} failed: {e}"))
+}
+
+/// A fully transparent cursor (task D10): a 1×1 depth-1 pixmap cleared to 0,
+/// used as both source and mask, so the X server draws nothing while the
+/// pointer is over our window. Swapped in for the arrow while this viewer
+/// controls, so only the client-side sprite shows; swapped back on release.
+/// An X11 window's cursor is a per-window attribute, so it can never leak to
+/// another window and needs no enter/leave bookkeeping to stay balanced.
+fn create_blank_cursor(conn: &RustConnection, drawable: Window) -> Result<Cursor, SurfaceError> {
+    let id = |e: x11rb::errors::ReplyOrIdError| {
+        SurfaceError::Backend(format!("X11 id allocation failed: {e}"))
+    };
+    let pixmap = conn.generate_id().map_err(id)?;
+    conn.create_pixmap(1, pixmap, drawable, 1, 1)
+        .map_err(x_err("CreatePixmap"))?;
+    // CreatePixmap leaves the bits undefined; clear them so the mask is all 0.
+    let gc = conn.generate_id().map_err(id)?;
+    conn.create_gc(gc, pixmap, &CreateGCAux::new().foreground(0))
+        .map_err(x_err("CreateGC"))?;
+    conn.poly_fill_rectangle(
+        pixmap,
+        gc,
+        &[Rectangle {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        }],
+    )
+    .map_err(x_err("PolyFillRectangle"))?;
+    conn.free_gc(gc).map_err(x_err("FreeGC"))?;
+    let cursor = conn.generate_id().map_err(id)?;
+    // Source and mask both the empty pixmap: mask 0 ⇒ nothing is drawn.
+    conn.create_cursor(cursor, pixmap, pixmap, 0, 0, 0, 0, 0, 0, 0, 0)
+        .map_err(x_err("CreateCursor"))?;
+    conn.free_pixmap(pixmap).map_err(x_err("FreePixmap"))?;
+    Ok(cursor)
 }
 
 impl Shared {
@@ -257,6 +311,29 @@ impl Shared {
         self.feed_reveal(py);
         let (nx, ny) = self.state.normalize(px, py);
         self.state.input().moved(nx, ny);
+        // Task D10: the pointer is over the video — predict the sprite here so
+        // it tracks the real mouse instead of the host's delayed echo.
+        self.state.set_local_pointer(nx, ny);
+        self.state.set_pointer_inside(true);
+    }
+
+    /// Task D10: swap the window's cursor attribute. A per-window attribute, so
+    /// the transparent cursor only hides the pointer while it is over our video
+    /// and can never leak to another window — no enter/leave balancing needed.
+    fn set_os_cursor_hidden(&self, hidden: bool) {
+        let cursor = if hidden {
+            self.cursor_blank
+        } else {
+            self.cursor_arrow
+        };
+        if let Err(e) = self.conn.change_window_attributes(
+            self.window,
+            &ChangeWindowAttributesAux::new().cursor(cursor),
+        ) {
+            tracing::warn!("video surface: X11 cursor swap failed: {e}");
+            return;
+        }
+        self.flush();
     }
 
     fn button(&self, detail: u8, down: bool, x: i16, y: i16) {
@@ -305,11 +382,17 @@ impl Shared {
                 Event::MotionNotify(e) => self.pointer(e.event_x, e.event_y),
                 Event::ButtonPress(e) => self.button(e.detail, true, e.event_x, e.event_y),
                 Event::ButtonRelease(e) => self.button(e.detail, false, e.event_x, e.event_y),
-                // Leaving through the top edge counts as reaching it: a quick
-                // flick upwards can skip the top 2 px between two motion
-                // events. Grab/ungrab crossings are not real pointer moves.
-                Event::LeaveNotify(e) if e.mode == NotifyMode::NORMAL && e.event_y < 0 => {
-                    self.feed_reveal(f64::from(e.event_y));
+                // Grab/ungrab crossings are not real pointer moves.
+                Event::LeaveNotify(e) if e.mode == NotifyMode::NORMAL => {
+                    // Task D10: the pointer left the video — stop predicting the
+                    // sprite (it falls back to the host's out-of-band position).
+                    self.state.set_pointer_inside(false);
+                    // Leaving through the top edge counts as reaching it: a
+                    // quick flick upwards can skip the top 2 px between two
+                    // motion events.
+                    if e.event_y < 0 {
+                        self.feed_reveal(f64::from(e.event_y));
+                    }
                 }
                 // The last of a series: draw once for the whole exposure.
                 Event::Expose(e) if e.count == 0 => self.repaint(),
@@ -536,8 +619,10 @@ impl X11Surface {
                 "cannot create the video window in the app window: {e}"
             ))
         })?;
-        // The window holds its own reference to the cursor.
-        conn.free_cursor(cursor).map_err(x_err("FreeCursor"))?;
+        // Task D10: keep the arrow cursor alive (not freed) so the window's
+        // cursor attribute can swap back to it after hiding it; make the
+        // transparent companion now. Both are freed in `Drop`.
+        let cursor_blank = create_blank_cursor(&conn, window)?;
         let wake = conn
             .intern_atom(false, b"_SHARECTRL_VIDEO_WAKE")
             .map_err(x_err("InternAtom"))?
@@ -562,6 +647,8 @@ impl X11Surface {
             reveal: Mutex::new(Reveal::default()),
             repaint: Mutex::new(None),
             stop: AtomicBool::new(false),
+            cursor_arrow: cursor,
+            cursor_blank,
         });
         let events = {
             let shared = shared.clone();
@@ -674,6 +761,17 @@ impl VideoSurface for X11Surface {
     fn native_handles(&self) -> Option<SurfaceHandles> {
         Some(self.handles.0)
     }
+
+    fn local_pointer(&self) -> Option<(f64, f64)> {
+        self.shared.state.local_pointer()
+    }
+
+    fn set_cursor_control(&self, active: bool) {
+        // X11's cursor is a window attribute shown only over our video, so hide
+        // it whenever controlling; the sprite is drawn at the local pointer so
+        // there is no second cursor. Restored to the arrow when control ends.
+        self.shared.set_os_cursor_hidden(active);
+    }
 }
 
 impl Drop for X11Surface {
@@ -682,6 +780,10 @@ impl Drop for X11Surface {
         self.shared.state.input().set_sink(None);
         self.shared.state.set_drop_sink(None);
         self.shared.xdnd.set_active(&self.shared.conn, false);
+        // Task D10: release the two cursor resources (the window keeps showing
+        // whichever is set until it is destroyed with its parent).
+        let _ = self.shared.conn.free_cursor(self.shared.cursor_arrow);
+        let _ = self.shared.conn.free_cursor(self.shared.cursor_blank);
         self.host.take();
         let s = &self.shared;
         s.stop.store(true, Ordering::SeqCst);

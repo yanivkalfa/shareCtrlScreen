@@ -51,6 +51,17 @@
 //!   it returns `true`): <https://developer.apple.com/documentation/appkit/nsresponder/becomefirstresponder()>
 //! * `viewDidHide` / `viewDidUnhide` (also sent when an ancestor hides):
 //!   <https://developer.apple.com/documentation/appkit/nsview/viewdidhide()>
+//! * `NSCursor.hide()` / `unhide()` — the balanced hide/show counter used to
+//!   hide the OS cursor over the video while controlling (task D10); each
+//!   `hide` needs a matching `unhide`, so a `Cell<bool>` keeps it at 0 or 1:
+//!   <https://developer.apple.com/documentation/appkit/nscursor/hide()>,
+//!   <https://developer.apple.com/documentation/appkit/nscursor/unhide()>.
+//!   The cross-platform analogue is winit/tao `set_cursor_visible`:
+//!   <https://docs.rs/winit/latest/winit/window/struct.Window.html#method.set_cursor_visible>.
+//! * Client-side cursor prediction (AnyDesk / Microsoft RDP): the sprite is
+//!   drawn at the local pointer, not the host's delayed echo, so it feels
+//!   instant on a high-RTT link (task D10; position chosen in the engine's
+//!   `media/viewer.rs`).
 
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -62,8 +73,8 @@ use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, Bool, ProtocolObject};
 use objc2::{define_class, msg_send, sel, AnyThread, ClassType, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSAutoresizingMaskOptions, NSDragOperation, NSDraggingDestination, NSDraggingInfo, NSEvent,
-    NSEventMask, NSEventPhase, NSEventType, NSPasteboardTypeFileURL,
+    NSAutoresizingMaskOptions, NSCursor, NSDragOperation, NSDraggingDestination, NSDraggingInfo,
+    NSEvent, NSEventMask, NSEventPhase, NSEventType, NSPasteboardTypeFileURL,
     NSPasteboardURLReadingFileURLsOnlyKey, NSResponder, NSTrackingArea, NSTrackingAreaOptions,
     NSView, NSWindow, NSWindowDidBecomeKeyNotification, NSWindowDidResignKeyNotification,
     NSWindowOrderingMode, NSWindowStyleMask,
@@ -108,6 +119,10 @@ pub(crate) struct ViewIvars {
     /// A pointer event reached the view since it was last shown or hidden
     /// (for the one-time "events arrive" debug line).
     pointer_seen: Cell<bool>,
+    /// Task D10: whether we have currently hidden the OS cursor (via
+    /// `NSCursor::hide`). The `Cell` keeps `hide`/`unhide` balanced — exactly
+    /// one hide per unhide — so the cursor can never get stuck hidden.
+    cursor_hidden: Cell<bool>,
 }
 
 define_class!(
@@ -158,6 +173,8 @@ define_class!(
             // capture too early is harmless, capturing for another view is not.
             self.ivars().state.set_key_focus(false);
             self.ivars().state.input().release_all();
+            // Task D10: focus left — restore the OS cursor.
+            self.update_cursor_hidden();
             // SAFETY: forwarding the same selector to NSResponder.
             unsafe { msg_send![super(self), resignFirstResponder] }
         }
@@ -183,6 +200,12 @@ define_class!(
         #[unsafe(method(viewDidHide))]
         fn view_did_hide(&self) {
             self.ivars().state.set_key_focus(false);
+            // Task D10: an ancestor-driven hide skips `reset_reveal`, so clear
+            // "pointer over the video" here too — otherwise a later
+            // `becomeFirstResponder` could re-hide the cursor app-wide from a
+            // stale inside flag. Then restore the OS cursor.
+            self.ivars().state.set_pointer_inside(false);
+            self.update_cursor_hidden();
             // SAFETY: forwarding the same selector to NSView.
             let () = unsafe { msg_send![super(self), viewDidHide] };
         }
@@ -240,6 +263,8 @@ define_class!(
             // of the shortcut hook — from here on Cmd+Tab is local again.
             self.ivars().state.set_key_focus(false);
             self.ivars().state.input().release_all();
+            // Task D10: our window is no longer key — restore the OS cursor.
+            self.update_cursor_hidden();
         }
 
         /// Back in front (a click, or Cmd+Tab to us): the shortcut hook may
@@ -266,6 +291,18 @@ define_class!(
             self.feed_reveal(py);
             let (nx, ny) = self.ivars().state.normalize(px, py);
             self.ivars().state.input().moved(nx, ny);
+            // Task D10: predict the cursor sprite at the real mouse and hide the
+            // OS cursor if we control (a move means the pointer is over us, even
+            // if `mouseEntered` was missed at show time).
+            self.track_local_pointer(nx, ny);
+        }
+
+        /// Task D10: the pointer entered the video — start predicting / hiding.
+        #[unsafe(method(mouseEntered:))]
+        fn mouse_entered(&self, event: &NSEvent) {
+            let (px, py) = self.pointer_px(event);
+            let (nx, ny) = self.ivars().state.normalize(px, py);
+            self.track_local_pointer(nx, ny);
         }
 
         /// The pointer left the view. Leaving through the top edge counts as
@@ -277,6 +314,10 @@ define_class!(
         fn mouse_exited(&self, event: &NSEvent) {
             let (px, py) = self.pointer_px(event);
             self.note_pointer("exit", py);
+            // Task D10: the pointer is gone — stop predicting and restore the OS
+            // cursor at once (the sprite falls back to the host's position).
+            self.ivars().state.set_pointer_inside(false);
+            self.update_cursor_hidden();
             let (w, h) = self.ivars().state.size();
             let scale = self.ivars().state.scale();
             // An exit mapped far ABOVE the top edge is a coordinate artifact of
@@ -473,6 +514,7 @@ impl VideoView {
             reveal: Cell::new(Reveal::default()),
             pointer_seen: Cell::new(false),
             wheel: Cell::new(WheelAccumulator::default()),
+            cursor_hidden: Cell::new(false),
         });
         // SAFETY: NSView's designated initializer.
         let view: Retained<Self> =
@@ -634,12 +676,17 @@ impl VideoView {
             && !self.isHiddenOrHasHiddenAncestor()
             && self.window().is_some_and(|w| w.isKeyWindow());
         self.ivars().state.set_key_focus(focused);
+        // Task D10: focus gates the OS-cursor hide, so re-evaluate it here.
+        self.update_cursor_hidden();
     }
 
     fn drag(&self, event: &NSEvent) {
         let (px, py) = self.pointer_px(event);
         let (nx, ny) = self.ivars().state.normalize(px, py);
         self.ivars().state.input().moved(nx, ny);
+        // Task D10: a drag keeps the pointer over us (no mouseMoved arrives
+        // while a button is held), so keep predicting from here.
+        self.track_local_pointer(nx, ny);
     }
 
     fn button(&self, event: &NSEvent, button: u8, down: bool) {
@@ -652,6 +699,40 @@ impl VideoView {
         let (px, py) = self.pointer_px(event);
         let (nx, ny) = self.ivars().state.normalize(px, py);
         self.ivars().state.input().button(button, down, nx, ny);
+        // Task D10: the pointer is over us; predict and (now that we have focus)
+        // hide the OS cursor if we control.
+        self.track_local_pointer(nx, ny);
+    }
+
+    /// Task D10: record the local pointer position and that it is over the
+    /// video, then re-evaluate the OS-cursor hide. Called from every pointer
+    /// event so the sprite follows the real mouse and the hide tracks it.
+    fn track_local_pointer(&self, nx: f64, ny: f64) {
+        self.ivars().state.set_local_pointer(nx, ny);
+        self.ivars().state.set_pointer_inside(true);
+        self.update_cursor_hidden();
+    }
+
+    /// Task D10: hide the OS cursor only while we control, the pointer is over
+    /// the video, and we hold the keyboard; otherwise show it. Toggles
+    /// `NSCursor` on a real transition only, so its hide/unhide counter stays
+    /// balanced and the cursor can never stick hidden.
+    pub(crate) fn update_cursor_hidden(&self) {
+        let st = &self.ivars().state;
+        let want = st.cursor_control() && st.pointer_inside() && st.has_key_focus();
+        self.set_cursor_hidden(want);
+    }
+
+    /// Apply a desired hidden state, balancing `NSCursor::hide`/`unhide`.
+    fn set_cursor_hidden(&self, hidden: bool) {
+        if self.ivars().cursor_hidden.replace(hidden) == hidden {
+            return; // already in that state — keep the counter at 0 or 1
+        }
+        if hidden {
+            NSCursor::hide();
+        } else {
+            NSCursor::unhide();
+        }
     }
 
     /// Event location in physical pixels of the **full** surface (top-left
@@ -728,6 +809,11 @@ impl VideoView {
     /// was up.
     pub(crate) fn reset_reveal(&self) {
         self.ivars().pointer_seen.set(false);
+        // Task D10: show / hide both reset "pointer over the video" — a stale
+        // inside flag must never carry a hidden cursor across sessions. The
+        // next move re-confirms it.
+        self.ivars().state.set_pointer_inside(false);
+        self.update_cursor_hidden();
         let mut reveal = self.ivars().reveal.get();
         let change = reveal.reset();
         self.ivars().reveal.set(reveal);

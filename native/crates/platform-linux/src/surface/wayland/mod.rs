@@ -305,6 +305,18 @@ impl Shared {
         let (px, py) = self.to_full_px(x, y, true);
         let (nx, ny) = self.state.normalize(px, py);
         self.state.input().moved(nx, ny);
+        // Task D10: predict the cursor sprite at the real mouse. The OS cursor
+        // is not hidden on Wayland (no portable GDK hook), so the sprite simply
+        // coincides with it — the fallback the card allows — and still tracks
+        // the pointer instantly on a high-RTT link.
+        self.state.set_local_pointer(nx, ny);
+        self.state.set_pointer_inside(true);
+    }
+
+    /// The pointer left the video (task D10): stop predicting the sprite so it
+    /// falls back to the host's out-of-band position.
+    fn pointer_left(&self) {
+        self.state.set_pointer_inside(false);
     }
 
     /// Pointer button on the video at its last position (input thread).
@@ -659,6 +671,14 @@ impl VideoSurface for WaylandSurface {
     fn native_handles(&self) -> Option<SurfaceHandles> {
         self.handles.map(|h| h.0)
     }
+
+    fn local_pointer(&self) -> Option<(f64, f64)> {
+        self.shared.state.local_pointer()
+    }
+
+    // `set_cursor_control` stays the default no-op: there is no portable GDK /
+    // wl_pointer way to hide the OS cursor here, so the sprite is drawn at the
+    // local position and simply coincides with it (the card's fallback).
 }
 
 impl Drop for WaylandSurface {

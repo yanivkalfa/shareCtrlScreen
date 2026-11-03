@@ -51,14 +51,15 @@
 | D8 modifier translation | **done** (Opus, Opus-reviewed; I2 device pass pending) | viewer-side `KeyTranslator` (`engine/src/modifiers.rs`): Cmd ↔ Ctrl swap and Cmd+Tab→Alt+Tab (Mac → PC), Ctrl ↔ Cmd and Alt+Tab→Cmd+Tab (PC → Mac), sent-code tracking; host OS via new optional `connect-response.os`; `translateModifiers` toggle (default on) in Settings → Advanced; unit + loopback-tested. **Device-pending** (I2 Mac↔Windows); closes M6's blocked Cmd+Tab line |
 | M12 take every Cmd shortcut (macOS viewer) | **done** (Opus, Opus-reviewed, merged 99ed737; type-checked for aarch64-apple-darwin, device-pending) | M6 tap takes every Cmd chord + Ctrl+arrows while the video has the keyboard; Cmd+Q stays local (tap and key monitor); Force Quit / Lock Screen never claimed; every modifier synchronised before a taken key; hook keys now share the surface's FIFO input channel (D8 ordering risk closed); focus loss releases at once. Also: toolbar-reveal diagnostics + layer-frame sync + full-screen cover (owner's "top edge does nothing"). **Device-pending** (checklists/M6.md §6–§7) |
 | D9 host cursor sprite on the viewer | **done** (Opus, Opus-reviewed; device-pending I1–I3: real cursor images incl. I-beam in a terminal) | additive cursor-shape message, host sends on change, viewer draws the real sprite at position−hotspot in both presenters; replaces the synthetic triangle |
-| D10 viewer cursor lag on a high-RTT link (draw at local pointer + hide OS cursor) | **in progress** (Opus) | capture already keeps the cursor out of the video; the drawn sprite follows the host out-of-band echo (a round trip behind) while the local OS cursor is instant → two cursors. Fix: draw the sprite at the LOCAL pointer when controlling + hide the OS cursor over the video |
+| D10 viewer cursor lag on a high-RTT link (draw at local pointer + hide OS cursor) | **done** `da65e25` (Opus, Opus-reviewed; Windows+WSL lane green incl. loopback×3, platform-macos aarch64 type-checked; device-pending I1–I3) | capture already keeps the cursor out of the video; the drawn sprite followed the host out-of-band echo (a round trip behind) while the local OS cursor was instant → two cursors. Fixed: the sprite is drawn at the LOCAL pointer when controlling and over the video (client-side prediction), and the OS cursor is hidden over the video; SHAPE stays the host's (D9) |
 | W4 installer bundles + registers the SYSTEM service | **done** (Opus, Opus-reviewed, merged d0119b4; Rust lane-proven, installer by new CI job + machine-A smoke pending; device pass checklists/W4.md) | NSIS hooks install/start/stop/uninstall `sharectrl-service.exe` next to `sharectrl.exe`; one host instance rule; CI silent install/upgrade/uninstall job. Acceptance narrowed: service setup + one instance + standalone asset; elevated-window control is NOT a W4 claim |
 | W5 UIAccess (Alt+Tab / Win key passthrough) | **done** (Opus, Opus-reviewed; device-pending checklists/W5.md: Alt+Tab/Win via the service) | route (a) only: the service sets `TokenUIAccess` (SeTcb) on a duplicate of the host token; `--print-uiaccess`; startup log line; fallback launches without the flag and logs why. Signed route deferred to W6 (see the card) |
 | W7 uninstaller removes the whole install dir (service log leftover) | **done** (Opus, Opus-reviewed, merged 03d98af; proven by the windows-installer CI job on push) | first windows-installer CI run failed only on uninstall-clean: `sharectrl-service.log` left in Program Files; RMDir /r $INSTDIR in POSTUNINSTALL |
 | U1 in-app updater (check/download/install/restart) | **done** (Opus, Opus-reviewed; device-pending U1.md: real update loop needs two updater-enabled releases) | tauri-plugin-updater 2.14.1 + tauri-plugin-process 2.4.0, updater signing key (orchestrator-created secrets), latest.json generated on the release, Settings UI, service-aware install+restart; TOP priority |
-| U2 Settings/Update unreachable while hosting | **in progress** (Opus) | the gear that opens Settings→Updates is only on home + viewer screens; screen-host has none → cannot update mid-session. Fix: add the gear to the host sharing screen, wired to openSettings() |
+| U2 Settings/Update unreachable while hosting | **done** (Opus, Opus-reviewed, merged 3df0e22; UI-only) | added `btn-host-settings` gear to `screen-host`'s header, bound (with the viewer gear) to the shared `openSettingsOverVideo()` → `openSettings()`; `closeSettings()` restore generalised to `sessionLive()`. UI-only (index.html + app.js), no Rust. Settings→Updates now reachable mid-host-session; U1 live-session warning intact |
 | W8 service-host fast path (DDA capture + HW encode) | **done** (Opus, Opus-reviewed, merged 0afabeb; capture fast-path implemented, HW-encode fix device-pending hypothesis — checklists/W8.md) | service-launched host loses the fast DDA path + HW encoder → software fallback + media-loop restarts = lag; attach the capture thread (and so the shared device the HW MFT uses) to the active input desktop + reclassify E_ACCESSDENIED as recoverable and retry instead of ending the loop; goal widened to restore capture AND HW encode (owner: was smooth self-launched) |
 | M13 macOS toolbar drawer not shown (reveal fires, strip empty) | **done** (Opus, Opus-reviewed, merged bcf7b6f; type-checked for aarch64-apple-darwin, device-pending checklists/M13.md) | Root cause: `apply_layout` positioned the hosted layer's 40px gap with the parent *view*'s `isFlipped`, but a hosted layer's frame lives in the parent *layer*'s coordinate space, whose geometry flip is independent (wry: unflipped view, geometry-flipped WKWebView layer) — so the gap opened at the wrong visual edge and the video kept covering the toolbar. Fix (view.rs only; shared reveal.rs untouched): drive the layer frame from the parent layer's own `isGeometryFlipped`, so the strip is always at the visual top. Secondary: ignore `mouseExited` reveals mapped more than one bar height above the top (the app.log's y≈-470/-1025 artifacts). M12 reveal logging kept |
+| U3 Linux .deb/.rpm cannot self-update | **done** `0c99ec3` (Opus, Opus-reviewed; Rust lane-proven windows+wsl incl. loopback×3 + deny, UI + device-pending checklists/U3.md) | ROOT CAUSE: the feed serves an AppImage only, so a .deb/.rpm install downloads a payload whose type mismatches the install and the updater rejects it ("invalid updater binary format"). Fix: pure `update_capability(is_windows, is_macos, appimage)` → `SelfInstall`/`ManualDownload` (AppImage-mount detection mirrors autostart's `choose_exe`: `$APPIMAGE` + `$APPDIR` + exe under the mount, so a `.deb` launched from inside another AppImage is not mistaken for one); `UpdateInfo` gains `selfUpdatable` + `downloadUrl`; `updater_install` early-returns for a packaged install (never attempts the install); UI swaps "Update & restart" for a "Download update" link to the releases page (opener = `open` crate `#[tauri::command]`). Windows/macOS/AppImage unchanged |
 | V1 host overshoots a congested link (video stutter) | **done** (Opus, Opus-reviewed, merged 003fbf8; loopback proves encoder tracks BWE down+up; on-screen smoothness device-pending checklists/V1.md) | ROOT CAUSE (investigation): July 78cd049 raised MIN_BITRATE 400k→2.5M + DESIRED→9M + a raw-BWE source pacer → encoder wont follow BWE down → overshoot→loss→BWE collapse (65↔3700), unpaced keyframe bursts. Fix (As built): MIN_BITRATE→500k + DESIRED→8M so the encoder follows BWE down; a hysteretic resolution ladder (1.0/0.75/0.5/0.33) spends degradation on encode size, fps drops only below the smallest step; the source pacer is removed (str0m paces egress) and forced IDRs no longer bypass it. Owner: Windows went slow when the service came in (lost the fast path → tipped the latent overshoot); Mac/Linux slow from the start |
 | W9 Alt+Tab on a service host | **blocked: need controller app.log** | host UIAccess granted + injects reserved shortcuts, yet Alt+Tab does not switch → controlling-side capture/forward issue (keyhook on a Windows controller, or the Mac tap) |
 | T4 Wayland CI | **done** (Haiku, Opus-reviewed; jobs unverified until pushed; GNOME portal tests are device-pass items) | `native-ci.yml` jobs `wayland-sway` (ubuntu-24.04: sway + xdg-desktop-portal-wlr + pipewire + wireplumber; runs L5 `wayland_surface`, L1 `portal_capture --ignored`, and L6 `input::tests` minus uinput and `xtest_*`) and `wayland-gnome` (ubuntu-24.04: mutter 46 + xdg-desktop-portal-gnome; proves the stack, runs no test: the consent dialog has no headless pre-authorization, so the libei and GNOME portal-capture tests are device-pass items). Scripts in `.github/wayland/`. Local (lane, WSL): `wayland_surface` PASS (T4-02); `input::tests` wlroots and EIS pass, uinput fails under REQUIRED as designed (T4-03). Owner verification after the push: see the T4 card |
@@ -522,6 +523,63 @@ I1..I4 after all lanes (hardware validation)
     updater-enabled releases (this one ships the mechanism, the next is what it updates TO).
   * **platform-api:** unchanged (no trait touched).
 
+### U3 — Linux .deb/.rpm install can't self-update ("invalid updater binary format")  (size S, Linux; follow-on to U1, 2026-11-02)
+* Problem (ROOT CAUSE, confirmed): on Linux the in-app updater fails with the raw Tauri error
+  "invalid updater binary format". `tauri-plugin-updater` picks the installer from how the app was
+  installed (the current bundle type) and validates the downloaded payload against it. Our feed
+  (`latest.json` `linux-x86_64`, from `scripts/updater-latest-json.sh`) serves the AppImage only. So a
+  `.deb`/`.rpm` install downloads an AppImage payload, the type does not match, and the plugin rejects
+  it. AppImage installs self-update fine. There is no clean way to serve both a `.deb` and an AppImage
+  under one `linux-x86_64` key, and a `.deb` self-update would need root write to `/usr` anyway
+  (EACCES). Ref: tauri-apps/plugins-workspace#3108.
+* Non-goals: serving `.deb`/`.rpm` updater payloads; any change to the Windows/macOS update flow or
+  `RestartPlan`; changing the feed generator.
+* **As built (branch `task/U3`, in review; Rust lane-proven on windows + wsl, UI + device-pending):**
+  * **Install kind as pure data** (`app/src/updater.rs`): `update_capability(is_windows: bool,
+    is_macos: bool, appimage: bool) -> UpdateCapability` where `UpdateCapability` is `SelfInstall` |
+    `ManualDownload`. Windows and macOS are always `SelfInstall`; on Linux only an AppImage is
+    (`is_windows || is_macos || appimage`). OS-call-free, so unit-tested. The `appimage` bool is
+    decided at the call site by `running_from_appimage()` (Linux-only; always false off Linux),
+    which delegates to the pure, testable `running_from_appimage_inner(appimage, appdir, exe)`.
+    That helper mirrors the **containment rule** `platform-linux`'s autostart (`choose_exe`) uses —
+    `$APPIMAGE` set AND `$APPDIR` set AND our own `current_exe()` under `$APPDIR` — because
+    `$APPIMAGE` alone is inherited by child processes, so a `.deb`/`.rpm` launched from inside any
+    AppImage would otherwise be taken for self-updatable, offer "Update & restart", tear the session
+    down and then hit the very "invalid updater binary format" we are fixing. `current_update_capability()`
+    ties it together; `install_should_proceed(capability)` is the one-line guard the command shares
+    with its test.
+  * **Surfaced in the check** (`UpdateInfo`, serde camelCase): new `self_updatable: bool`
+    (`selfUpdatable`) and `download_url: String` (`downloadUrl` = `RELEASES_LATEST_URL`,
+    `https://github.com/yanivkalfa/shareCtrlScreen/releases/latest`). `updater_check` still reports
+    `available` by the version compare exactly as before — only the install affordance changes.
+  * **Never installs on a packaged install:** `updater_install` early-returns `Ok(())` when
+    `install_should_proceed(current_update_capability())` is false, before `end_session` /
+    `download_and_install`, so the raw "invalid updater binary format" can never surface. Every
+    Windows path and the macOS/Linux-AppImage `SelfRelaunch` are unchanged.
+  * **Opener:** a new `open_releases_page` `#[tauri::command]` using the `open` crate
+    (`open::that_detached`, does not wait on the browser), opening the fixed `RELEASES_LATEST_URL`.
+    Chosen over `tauri-plugin-opener` because a custom app command needs no capability-JSON entry in
+    Tauri v2 and keeps the all-`invoke` UI contract; `open` is MIT (already in the deny/about
+    allow-lists), so `cargo deny check` stays green. Registered in `main.rs`'s `generate_handler!`.
+  * **UI** (`app/ui/index.html` + `app.js`): the U1 Updates panel splits into `#update-selfinstall`
+    (the existing version/notes/warning/"Update & restart" + progress) and `#update-manual` (a
+    "Download update" button → `invoke('open_releases_page')` + the line "Your install is a .deb/.rpm
+    package; download the latest from the releases page (or use the AppImage for automatic updates).").
+    `renderUpdate` shows one or the other on `lastUpdate.selfUpdatable` (defaulting to self-install when
+    absent). The available version + notes still show in both. When `selfUpdatable` is true the panel is
+    byte-for-byte the U1 behaviour.
+  * **Tests (unit-proven):** `update_capability` — linux+appimage → `SelfInstall`;
+    linux+!appimage → `ManualDownload`; windows and macos → `SelfInstall` regardless of the appimage
+    bool; `install_should_proceed` — false for `ManualDownload`, true for `SelfInstall` (the
+    `updater_install` early-return guard, tested at unit level without a Tauri app); and
+    `running_from_appimage_inner` — true only for $APPIMAGE+$APPDIR+exe-under-$APPDIR, false for
+    inherited $APPIMAGE with no $APPDIR, false for $APPIMAGE+$APPDIR but the exe outside the mount
+    (the inherited-env case), and false for none/empty. The UI toggle is device/manual.
+  * **Device-pending** (checklists/U3.md): a real `.deb` Ubuntu install on a newer release shows the
+    version + a working "Download update" link and never the raw error; an AppImage install still
+    self-updates; Windows/macOS unchanged.
+  * **platform-api:** unchanged (no trait touched). New dep: `open = "5"` (app only).
+
 ### W8 — Service-launched host: restore the fast screen-capture path (fix the input/video lag)  (size M, Windows; owner report 2026-11-02, host app.log attached)
 * Problem: after the W4 installer started launching the host from the SYSTEM service, screen capture on
   the host degrades and the whole session feels very laggy (mouse + typing), because the user sees their
@@ -800,6 +858,69 @@ I1..I4 after all lanes (hardware validation)
   with the correct host shape; view-only still shows the host's cursor moving; the OS cursor returns when the
   pointer leaves the video; nothing stuck. Checklist plans/checklists/D10.md. This is the fix for the owner's
   "mouse lags behind" even though input and video are fine.
+* **As built (branch `task/D10`, in review; Windows + WSL lane green, platform-macos type-checked for
+  aarch64-apple-darwin; no real relayed session yet — I1–I3):**
+  * **platform-api (orchestrator-approved, additive + defaulted, object-safe)** — two new
+    `VideoSurface` methods in `platform-api/src/surface.rs`:
+    * `fn local_pointer(&self) -> Option<(f64, f64)> { None }` — the viewer's LOCAL pointer over the
+      video, normalized `[0,1]` over the letterbox, or `None` when it is not over the surface.
+    * `fn set_cursor_control(&self, _active: bool) {}` — tells the surface whether this viewer controls, so
+      it hides the OS cursor over the video and restores it on leave/focus-loss.
+    Both default (so `MockSurface` and every backend compile unchanged); placed on `VideoSurface`, not
+    `Presenter`, because OS-cursor visibility is a window/view concern (the card's "presenter" wording was
+    loose). **Only the POSITION source changes; the D9 SHAPE stays the host's.**
+  * **Position switch (engine, all OSes)** — `engine/src/media/viewer.rs` `cursor_position(control, local,
+    host)`: when controlling AND the local pointer is over the video AND the host still shows a cursor, the
+    sprite is drawn at the LOCAL pointer (instant, client-side prediction à la AnyDesk/RDP); otherwise the
+    host's out-of-band position (view-only, or a host-initiated move while the pointer is elsewhere). The
+    host position is still the visibility-filtered one, so D9's `visible == false` hide is preserved (draws
+    nothing). Reuses the existing pointer→normalized geometry, so the sprite lands exactly under the real
+    mouse (HiDPI/letterbox correct). 4 unit tests.
+  * **Control state (engine)** — `Shared.control: AtomicBool`, seeded from the granted `Permission` in
+    `start_viewer`, and the viewer now handles inbound `ControlMsg::Perm` (previously ignored on the viewer):
+    a mid-session grant/revoke updates `shared.control` and calls `surface.set_cursor_control(..)`, so
+    view-only reverts to the host position and restores the OS cursor. Teardown calls
+    `set_cursor_control(false)`.
+  * **Shared surface state** — `surface-wgpu/src/state.rs`: `pointer_inside` + last normalized position +
+    `cursor_control` atomics; `local_pointer()` returns the position only while inside (focus intentionally
+    NOT required for the sprite — an unfocused hover shows the OS cursor, and the coinciding sprite merely
+    overlaps it). Used by macOS and Linux. 1 unit test.
+  * **Per-OS OS-cursor hide:**
+    * **Windows** (`render/src/window.rs`, D3D11 viewer): `WM_SETCURSOR` → `SetCursor(None)` while
+      controlling and the hit-test is `HTCLIENT`; pointer-driven so it is self-balancing (the toolbar strip
+      belongs to the web view and keeps its own cursor). `WM_MOUSEMOVE` + `TrackMouseEvent(TME_LEAVE)` /
+      `WM_MOUSELEAVE` (in `Win32::UI::Controls`, so `Win32_UI_Controls` was added to the crate features)
+      track inside for `local_pointer`; `hide()` resets the flags. `ChildWindowSurface` delegates both
+      methods.
+    * **macOS** (`platform-macos/src/view.rs`, `surface.rs`): `NSCursor::hide`/`unhide`, balanced by a
+      `Cell<bool>` so exactly one hide per unhide — it can never stick. Desired-hidden = control && pointer
+      inside && key focus, re-evaluated on enter/leave/move/drag/button and on **every** focus change
+      (`publish_key_focus`, `windowDidResignKey`, `resignFirstResponder`, `viewDidHide`) and on
+      `reset_reveal`; `Drop` force-restores. Cmd+Tab away → `windowDidResignKey` → unhide; back →
+      `windowDidBecomeKey` → re-hide.
+    * **Linux X11** (`platform-linux/src/surface/x11.rs`): a transparent cursor (1×1 depth-1 pixmap cleared
+      to 0, source+mask) kept beside the arrow; `set_cursor_control` swaps the window's cursor attribute —
+      a per-window attribute, inherently balanced, shown only while the pointer is over our video, restored
+      to the arrow on release and both freed in `Drop`. **Caveat:** it hides whenever controlling regardless
+      of key focus (the attribute is window-scoped), so an unfocused-but-hovered window shows no cursor
+      until control ends — minor, in the checklist.
+    * **Linux Wayland** (`platform-linux/src/surface/wayland/`): `local_pointer` is fed (instant sprite) but
+      `set_cursor_control` stays the default no-op — there is no portable GDK/`wl_pointer` cursor-hide here,
+      so the sprite simply coincides with the OS cursor (the card's allowed fallback; no lag gap).
+  * **Mock** — `platform-api/src/mock.rs`: `pointer_inside`/`cursor_control` fields + `set_pointer_inside`
+    helper + the two overrides, so the selection is unit-testable.
+  * **Tests:** unit — the position-source selection (`cursor_position`: control+over→local, view-only→host,
+    not-over→host, host-invisible→None) and `SurfaceState::local_pointer` gating. Device-only (I1–I3,
+    checklists/D10.md) — the real relayed "one instant cursor" feel and the OS-cursor hide/restore on each
+    OS. All existing render/surface-wgpu/loopback/engine tests stay green (Windows + WSL lane).
+  * **Not changed:** host capture (cursor already out-of-band), input/injection, the D9 shape path, the
+    fallback arrow, `visible == false` hiding, the reveal/toolbar.
+  * **References** (in the touched `//! ## References`): NSCursor `hide`/`unhide`
+    (<https://developer.apple.com/documentation/appkit/nscursor>); Windows `SetCursor(NULL)` +
+    `TrackMouseEvent`/`WM_MOUSELEAVE`; winit/tao `set_cursor_visible`
+    (<https://docs.rs/winit/latest/winit/window/struct.Window.html#method.set_cursor_visible>); X11
+    transparent cursor via an empty pixmap; client-side cursor prediction (AnyDesk/Microsoft RDP) as the
+    rationale for drawing at the local pointer.
 
 ### U2 — Settings/Update is unreachable while hosting a session  (size XS–S, UI; owner report 2026-11-02)
 * Problem: the Updates control (U1) lives in the Settings modal, opened by the gear button. But the gear
@@ -824,6 +945,23 @@ I1..I4 after all lanes (hardware validation)
   updates works, and closing Settings restores the video.
 * Acceptance: while hosting, the gear on the sharing screen opens Settings and the Update flow is reachable
   without ending the session. Checklist note in plans/checklists (or fold into U1.md).
+* **As built (branch `task/U2`, in review; UI-only — no Rust touched, tree confirmed clean in the lane):**
+  * **HTML:** `native/app/ui/index.html` — added `<button id="btn-host-settings" class="btn btn-ghost btn-sm"
+    title="Settings">&#9881;</button>` to `screen-host`'s `topbar`, right after `#host-status` (the same
+    end-of-header position `btn-view-settings` occupies in the viewer bar). Same glyph/classes/title as the
+    viewer gear.
+  * **JS:** `native/app/ui/app.js` — the viewer gear's inline click handler (hide the native video, then
+    `openSettings()`) is now a named `openSettingsOverVideo()`; **both** `btn-view-settings` and
+    `btn-host-settings` bind to it (no duplicated logic, `openSettings()` itself unchanged). `closeSettings()`'s
+    restore was gated on `state === 'VIEW_ACTIVE'`; it now uses the existing `sessionLive()` helper
+    (`HOST_ACTIVE || VIEW_ACTIVE`) so the video is restored after Settings closes from either session screen.
+  * **Host video is a no-op, not a bug:** `engine::set_video_visible` (crates/engine/src/lib.rs:822) acts only
+    on the viewer's receive `surface()`; the host has no such surface, so hide/restore are harmless no-ops on
+    the host screen and the host webview has no native overlay to obscure the modal. The hide-then-open and
+    restore paths are now generalised anyway (consistency + future-proofing).
+  * **Updater (U1) untouched**; a mid-session update from the host still shows U1's "End session & update"
+    warning. No `platform-api` / Rust change. Device note: `plans/checklists/U1.md` (U2 section).
+  * Follow-up (owner asked earlier, out of scope here): controller-triggers-host "remote update".
 
 ## Lane M — macOS backend (`crates/platform-macos`)
 

@@ -142,9 +142,23 @@ pub(crate) fn viewer_media_loop(
                             if i + 1 < count {
                                 continue; // reference-only; present the newest
                             }
-                            // Draw the out-of-band cursor sprite on top (§7).
+                            // Draw the cursor sprite on top (§7). The SHAPE is
+                            // always the host's (D9); only the POSITION source
+                            // changes (task D10): while this session controls
+                            // and the local pointer is over the video, draw it
+                            // at the LOCAL pointer — instant, no round-trip lag
+                            // — and otherwise follow the host's out-of-band
+                            // position (view-only, or a host-initiated move
+                            // while the local pointer is elsewhere). Hidden
+                            // exactly as before when the host's cursor is not
+                            // visible.
                             let pointer = *shared.cursor.lock();
-                            let cursor = pointer.filter(|p| p.visible).map(|p| (p.x, p.y));
+                            let host_cursor = pointer.filter(|p| p.visible).map(|p| (p.x, p.y));
+                            let cursor = cursor_position(
+                                shared.control.load(Ordering::SeqCst),
+                                surface.local_pointer(),
+                                host_cursor,
+                            );
                             sprite.sync(presenter.as_mut(), &shared, pointer.and_then(|p| p.shape));
                             // A failing render is NOT silent: this was exactly the
                             // place a black screen hid (decode fine, render dead).
@@ -175,6 +189,28 @@ pub(crate) fn viewer_media_loop(
         }
     }
     Ok(())
+}
+
+/// Choose the cursor sprite POSITION (task D10). The SHAPE is always the
+/// host's (D9); only the position source changes here.
+///
+/// * controlling, the local pointer is over the video, and the host still
+///   shows a cursor (`host` is `Some`) → the LOCAL position: instant, no
+///   round-trip lag, and under the real mouse (same mapping as the input);
+/// * otherwise the host's out-of-band position — view-only, the pointer is not
+///   over the surface, or the host hid its cursor (`host` is then `None`, which
+///   keeps D9's `visible == false` hide: nothing is drawn).
+///
+/// `host` is the host position already filtered by visibility.
+fn cursor_position(
+    control: bool,
+    local: Option<(f64, f64)>,
+    host: Option<(f64, f64)>,
+) -> Option<(f64, f64)> {
+    match (control.then_some(local).flatten(), host) {
+        (Some(local_pos), Some(_)) => Some(local_pos),
+        _ => host,
+    }
 }
 
 /// The cursor image installed in the presenter, kept in step with the image
@@ -208,5 +244,46 @@ impl InstalledSprite {
             tracing::warn!("viewer: cursor image could not be shown: {e}");
         }
         self.id = wanted;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cursor_position;
+
+    const LOCAL: (f64, f64) = (0.2, 0.3);
+    const HOST: (f64, f64) = (0.8, 0.9);
+
+    #[test]
+    fn controlling_and_over_the_video_uses_the_local_pointer() {
+        assert_eq!(
+            cursor_position(true, Some(LOCAL), Some(HOST)),
+            Some(LOCAL),
+            "instant: the real mouse, not the host's delayed echo"
+        );
+    }
+
+    #[test]
+    fn view_only_always_follows_the_host() {
+        assert_eq!(
+            cursor_position(false, Some(LOCAL), Some(HOST)),
+            Some(HOST),
+            "a view-only viewer shows the host's own cursor moving"
+        );
+    }
+
+    #[test]
+    fn pointer_not_over_the_surface_follows_the_host() {
+        // Controlling, but the local pointer is elsewhere (`None`): a host-
+        // initiated move must still be reflected.
+        assert_eq!(cursor_position(true, None, Some(HOST)), Some(HOST));
+    }
+
+    #[test]
+    fn an_invisible_host_cursor_is_never_drawn_even_while_controlling() {
+        // `host == None` means the host hid its cursor (D9 visible==false); we
+        // draw nothing rather than stamping the sprite at the local pointer.
+        assert_eq!(cursor_position(true, Some(LOCAL), None), None);
+        assert_eq!(cursor_position(false, Some(LOCAL), None), None);
     }
 }

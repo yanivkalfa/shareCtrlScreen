@@ -66,6 +66,7 @@
         <div id="host-status" class="status">
           <span class="dot dot-green"></span><span>connected</span>
         </div>
+        <button id="btn-host-settings" class="btn btn-ghost btn-sm" title="Settings">&#9881;</button>
       </header>
 
       <main class="home">
@@ -304,13 +305,24 @@
           <div id="update-available" class="hint hidden">
             <b>Update available: <span id="update-new-version"></span></b>
             <pre id="update-notes" class="hint mono licence-text"></pre>
-            <div id="update-session-warning" class="hint hidden">
-              You are in a session right now &mdash; updating ends it.
+            <div id="update-selfinstall">
+              <div id="update-session-warning" class="hint hidden">
+                You are in a session right now &mdash; updating ends it.
+              </div>
+              <div class="row">
+                <button id="btn-update-install" type="button" class="btn btn-sm btn-primary">Update &amp; restart</button>
+              </div>
+              <div id="update-progress" class="hint hidden"></div>
             </div>
-            <div class="row">
-              <button id="btn-update-install" type="button" class="btn btn-sm btn-primary">Update &amp; restart</button>
+            <div id="update-manual" class="hidden">
+              <div class="hint">
+                Your install is a .deb/.rpm package; download the latest from the releases
+                page (or use the AppImage for automatic updates).
+              </div>
+              <div class="row">
+                <button id="btn-update-download" type="button" class="btn btn-sm btn-primary">Download update</button>
+              </div>
             </div>
-            <div id="update-progress" class="hint hidden"></div>
           </div>
         </fieldset>
 

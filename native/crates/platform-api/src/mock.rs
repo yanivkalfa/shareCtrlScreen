@@ -574,6 +574,13 @@ pub struct SurfaceState {
     held_keys: BTreeSet<&'static str>,
     held_buttons: BTreeSet<u8>,
     last_pos: (f64, f64),
+    /// Task D10: whether the local pointer is currently over the surface.
+    /// Tests toggle it with [`MockSurface::set_pointer_inside`]; while set,
+    /// [`VideoSurface::local_pointer`] reports `last_pos`.
+    pointer_inside: bool,
+    /// Task D10: the latest [`VideoSurface::set_cursor_control`] value, so a
+    /// test can assert the OS cursor would be hidden / restored.
+    pub cursor_control: bool,
 }
 
 /// Recording [`VideoSurface`]; tests drive "user input" with
@@ -640,6 +647,13 @@ impl MockSurface {
     pub fn set_client_size(&self, size: (u32, u32)) {
         lock(&self.state).client_size = size;
     }
+
+    /// Task D10: simulate the local pointer entering (`true`) or leaving
+    /// (`false`) the video. While inside, [`VideoSurface::local_pointer`]
+    /// reports the last position fed through [`user_input`](Self::user_input).
+    pub fn set_pointer_inside(&self, inside: bool) {
+        lock(&self.state).pointer_inside = inside;
+    }
 }
 
 impl VideoSurface for MockSurface {
@@ -688,6 +702,13 @@ impl VideoSurface for MockSurface {
     }
     fn as_any(&self) -> &dyn Any {
         self
+    }
+    fn local_pointer(&self) -> Option<(f64, f64)> {
+        let s = lock(&self.state);
+        s.pointer_inside.then_some(s.last_pos)
+    }
+    fn set_cursor_control(&self, active: bool) {
+        lock(&self.state).cursor_control = active;
     }
 }
 

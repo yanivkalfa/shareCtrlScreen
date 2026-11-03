@@ -16,6 +16,17 @@
 //!   and the over operator, Porter & Duff, "Compositing Digital Images" (1984).
 //! * Immutable textures with initial data (`D3D11_USAGE_IMMUTABLE`):
 //!   <https://learn.microsoft.com/windows/win32/api/d3d11/ne-d3d11-d3d11_usage>
+//! * Hiding the OS cursor over the client area (task D10): `WM_SETCURSOR` ->
+//!   `SetCursor(NULL)` and `TrackMouseEvent(TME_LEAVE)` / `WM_MOUSELEAVE`
+//!   (`window.rs`): <https://learn.microsoft.com/windows/win32/menurc/wm-setcursor>,
+//!   <https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-setcursor>,
+//!   <https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-trackmouseevent>.
+//!   The cross-platform analogue is winit/tao `set_cursor_visible`:
+//!   <https://docs.rs/winit/latest/winit/window/struct.Window.html#method.set_cursor_visible>.
+//! * Client-side cursor prediction — drawing the cursor at the local pointer
+//!   instead of the host's round-trip-delayed echo, as AnyDesk and Microsoft
+//!   RDP do — is why the sprite can lead the video on a high-RTT link
+//!   (task D10; the engine chooses the position source in `media/viewer.rs`).
 
 #![cfg(windows)]
 

@@ -76,6 +76,98 @@ pub fn restart_plan(is_windows: bool, service_managed: bool) -> RestartPlan {
     }
 }
 
+/// The releases page a non-self-updatable install sends the user to. Opening it
+/// is the only affordance for a `.deb`/`.rpm` install (task U3).
+pub const RELEASES_LATEST_URL: &str =
+    "https://github.com/yanivkalfa/shareCtrlScreen/releases/latest";
+
+/// Whether this install can apply an update in place, or must be updated by hand.
+/// Pure data so the decision is unit-tested without touching the OS (task U3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateCapability {
+    /// Windows, macOS, or a Linux AppImage mount: `download_and_install` replaces
+    /// the running bundle, so the in-app updater works.
+    SelfInstall,
+    /// A Linux packaged install (`.deb`/`.rpm`): the feed serves an AppImage only,
+    /// so the updater would reject the payload ("invalid updater binary format"),
+    /// and a package update needs root write to `/usr` anyway. Send the user to
+    /// the releases page instead (tauri-apps/plugins-workspace#3108).
+    ManualDownload,
+}
+
+/// Can this install self-update? Windows and macOS always can (their installers
+/// replace the app in place). On Linux only an AppImage can — a `.deb`/`.rpm`
+/// cannot. `appimage` means "actually running from an AppImage mount" and is
+/// decided from the real environment at the call site ([`running_from_appimage`],
+/// which requires $APPIMAGE + $APPDIR + the exe under the mount), so this stays
+/// OS-call-free and testable (task U3).
+pub fn update_capability(is_windows: bool, is_macos: bool, appimage: bool) -> UpdateCapability {
+    if is_windows || is_macos || appimage {
+        UpdateCapability::SelfInstall
+    } else {
+        UpdateCapability::ManualDownload
+    }
+}
+
+/// Should [`updater_install`] actually download and install? Factored out of the
+/// command so the early-return guard is unit-tested without a Tauri app (task U3).
+fn install_should_proceed(capability: UpdateCapability) -> bool {
+    matches!(capability, UpdateCapability::SelfInstall)
+}
+
+/// Whether we are *running from* an AppImage mount, decided from the three env/OS
+/// facts so it is unit-testable without touching the environment (task U3).
+///
+/// `$APPIMAGE` alone proves nothing: it is inherited by every child process, so a
+/// `.deb`/`.rpm` build launched as a descendant of any AppImage (an AppImage
+/// terminal, launcher, dock or file manager) would inherit it. Treating that as
+/// self-updatable would offer "Update & restart", tear the session down, then hit
+/// the very "invalid updater binary format" we are eliminating. So we require the
+/// same containment `platform-linux`'s autostart [`choose_exe`] does: `$APPIMAGE`
+/// set AND `$APPDIR` set AND our own executable living under `$APPDIR` (the mount).
+// Off Linux the only non-test caller (`running_from_appimage`) is `cfg`-ed out,
+// but the unit tests exercise it on every OS, so allow the lib-build dead code.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn running_from_appimage_inner(
+    appimage: Option<&std::ffi::OsStr>,
+    appdir: Option<&std::path::Path>,
+    current_exe: Option<&std::path::Path>,
+) -> bool {
+    let (Some(appimage), Some(appdir), Some(exe)) = (appimage, appdir, current_exe) else {
+        return false;
+    };
+    !appimage.is_empty() && !appdir.as_os_str().is_empty() && exe.starts_with(appdir)
+}
+
+/// True when we run from an AppImage mount. Linux-only; always false elsewhere.
+/// Supplies the real environment to [`running_from_appimage_inner`].
+fn running_from_appimage() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let appimage = std::env::var_os("APPIMAGE");
+        let appdir = std::env::var_os("APPDIR");
+        let exe = std::env::current_exe().ok();
+        running_from_appimage_inner(
+            appimage.as_deref(),
+            appdir.as_deref().map(std::path::Path::new),
+            exe.as_deref(),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// The update capability of this running install, decided from the real OS/env.
+fn current_update_capability() -> UpdateCapability {
+    update_capability(
+        cfg!(windows),
+        cfg!(target_os = "macos"),
+        running_from_appimage(),
+    )
+}
+
 /// Is this a service-managed Windows install? The `--service-host` flag is the
 /// surest sign (the service passes it, `service/src/main.rs`); failing that, an
 /// auto-start service that owns sign-in counts too, for a host on such a machine
@@ -110,6 +202,11 @@ pub struct UpdateInfo {
     pub version: String,
     pub notes: Option<String>,
     pub date: Option<String>,
+    /// Can this install apply the update in app (vs. download by hand)? Only the
+    /// install affordance changes — `available` is still the version compare.
+    pub self_updatable: bool,
+    /// Where a non-self-updatable install downloads the update by hand.
+    pub download_url: String,
 }
 
 /// Non-blocking check: does a newer release exist? No download. An error (offline,
@@ -118,6 +215,7 @@ pub struct UpdateInfo {
 #[tauri::command]
 pub async fn updater_check(app: AppHandle) -> Result<UpdateInfo, String> {
     let current = app.package_info().version.to_string();
+    let self_updatable = install_should_proceed(current_update_capability());
     let updater = app.updater().map_err(|e| e.to_string())?;
     match updater.check().await.map_err(|e| e.to_string())? {
         Some(update) => Ok(UpdateInfo {
@@ -126,6 +224,8 @@ pub async fn updater_check(app: AppHandle) -> Result<UpdateInfo, String> {
             version: update.version,
             notes: update.body,
             date: update.date.map(|d| d.to_string()),
+            self_updatable,
+            download_url: RELEASES_LATEST_URL.to_string(),
         }),
         None => Ok(UpdateInfo {
             available: false,
@@ -133,6 +233,8 @@ pub async fn updater_check(app: AppHandle) -> Result<UpdateInfo, String> {
             version: current,
             notes: None,
             date: None,
+            self_updatable,
+            download_url: RELEASES_LATEST_URL.to_string(),
         }),
     }
 }
@@ -146,6 +248,14 @@ pub async fn updater_install(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    // A packaged Linux install (.deb/.rpm) cannot self-update: the feed serves an
+    // AppImage, so `download_and_install` would reject it ("invalid updater binary
+    // format"). The UI offers "Download update" instead and never calls this, but
+    // guard here too so the raw error can never surface (task U3).
+    if !install_should_proceed(current_update_capability()) {
+        return Ok(());
+    }
+
     state.engine.end_session();
 
     let updater = app.updater().map_err(|e| e.to_string())?;
@@ -178,9 +288,19 @@ pub async fn updater_install(
     Ok(())
 }
 
+/// Open the releases page in the user's browser. The only update affordance on a
+/// non-self-updatable install (task U3). The URL is fixed, so this command never
+/// launches anything the UI did not intend.
+#[tauri::command]
+pub fn open_releases_page() -> Result<(), String> {
+    open::that_detached(RELEASES_LATEST_URL).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
+    use std::path::Path;
 
     #[test]
     fn a_windows_service_install_lets_the_service_relaunch() {
@@ -200,5 +320,101 @@ mod tests {
         // The service is Windows-only, so service_managed is never true off Windows,
         // but the decision must be SelfRelaunch regardless.
         assert_eq!(restart_plan(false, true), RestartPlan::SelfRelaunch);
+    }
+
+    #[test]
+    fn a_linux_appimage_can_self_update() {
+        // is_windows=false, is_macos=false, appimage=true.
+        assert_eq!(
+            update_capability(false, false, true),
+            UpdateCapability::SelfInstall
+        );
+    }
+
+    #[test]
+    fn a_linux_package_must_download_by_hand() {
+        // is_windows=false, is_macos=false, appimage=false — the .deb/.rpm case.
+        assert_eq!(
+            update_capability(false, false, false),
+            UpdateCapability::ManualDownload
+        );
+    }
+
+    #[test]
+    fn windows_and_macos_always_self_update() {
+        // The appimage signal is irrelevant off Linux, so it must not flip either.
+        for appimage in [false, true] {
+            assert_eq!(
+                update_capability(true, false, appimage),
+                UpdateCapability::SelfInstall,
+                "windows self-installs (appimage={appimage})"
+            );
+            assert_eq!(
+                update_capability(false, true, appimage),
+                UpdateCapability::SelfInstall,
+                "macos self-installs (appimage={appimage})"
+            );
+        }
+    }
+
+    #[test]
+    fn install_proceeds_only_when_self_updatable() {
+        // The guard updater_install uses: a ManualDownload install early-returns
+        // and never calls download_and_install (no "invalid updater binary format").
+        assert!(!install_should_proceed(UpdateCapability::ManualDownload));
+        assert!(install_should_proceed(UpdateCapability::SelfInstall));
+    }
+
+    // AppImage detection mirrors autostart's `choose_exe` containment rule: only a
+    // process whose own exe lives under $APPDIR is really running from the mount.
+    // A bare inherited $APPIMAGE (a .deb launched from inside another AppImage)
+    // must NOT count, or we would offer a self-update that then rejects the payload.
+    fn appimage_detected(appimage: Option<&str>, appdir: Option<&str>, exe: Option<&str>) -> bool {
+        running_from_appimage_inner(
+            appimage.map(OsStr::new),
+            appdir.map(Path::new),
+            exe.map(Path::new),
+        )
+    }
+
+    #[test]
+    fn running_from_an_appimage_mount_is_detected() {
+        assert!(appimage_detected(
+            Some("/home/u/Share.AppImage"),
+            Some("/tmp/.mount_ShareXYZ"),
+            Some("/tmp/.mount_ShareXYZ/usr/bin/sharectrl"),
+        ));
+    }
+
+    #[test]
+    fn inherited_appimage_without_appdir_is_not_a_mount() {
+        // $APPIMAGE inherited, but $APPDIR unset — a .deb/.rpm descendant.
+        assert!(!appimage_detected(
+            Some("/home/u/Other.AppImage"),
+            None,
+            Some("/usr/bin/sharectrl"),
+        ));
+    }
+
+    #[test]
+    fn appimage_and_appdir_but_exe_outside_the_mount_is_not_a_mount() {
+        // Both vars inherited from another AppImage, but our exe is the packaged
+        // /usr/bin binary, not under the mount — the dangerous case the reviewer hit.
+        assert!(!appimage_detected(
+            Some("/home/u/Other.AppImage"),
+            Some("/tmp/.mount_OtherXYZ"),
+            Some("/usr/bin/sharectrl"),
+        ));
+    }
+
+    #[test]
+    fn no_appimage_env_is_not_a_mount() {
+        assert!(!appimage_detected(None, None, Some("/usr/bin/sharectrl")));
+        // Empty values (set but blank) are also rejected.
+        assert!(!appimage_detected(
+            Some(""),
+            Some(""),
+            Some("/usr/bin/sharectrl")
+        ));
     }
 }

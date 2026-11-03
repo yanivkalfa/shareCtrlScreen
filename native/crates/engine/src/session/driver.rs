@@ -690,6 +690,19 @@ pub(super) fn transport_driver(d: Driver) {
                                     }
                                     continue;
                                 }
+                                // Viewer: the host changed our live permission
+                                // (§4.2). Track control (task D10) so the cursor
+                                // sprite follows the LOCAL pointer only while
+                                // controlling, and hide or restore the OS cursor
+                                // to match — a revoke must bring it back.
+                                Ok(protocol::ControlMsg::Perm { value }) if !host_side => {
+                                    let control = value == protocol::Permission::Control;
+                                    shared.control.store(control, Ordering::SeqCst);
+                                    if let Some(s) = &surface {
+                                        s.set_cursor_control(control);
+                                    }
+                                    continue;
+                                }
                                 // Viewer: a part of the host's cursor image
                                 // (D9). Reassembled and cached here; the media
                                 // thread picks it up when a position names it.

@@ -16,12 +16,16 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetClientRect, MoveWindow, RegisterClassW, ShowWindow,
-    CS_HREDRAW, CS_VREDRAW, HMENU, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WM_DROPFILES, WM_KEYDOWN,
-    WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
+    CreateWindowExW, DefWindowProcW, GetClientRect, LoadCursorW, MoveWindow, PostMessageW,
+    RegisterClassW, SetCursor, ShowWindow, CS_HREDRAW, CS_VREDRAW, HMENU, HTCLIENT, IDC_ARROW,
+    SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WM_APP, WM_DROPFILES, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SYSKEYDOWN,
     WM_SYSKEYUP, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS,
 };
 
@@ -236,8 +240,86 @@ fn apply_reveal_clip(hwnd: HWND, bar: i32) {
 /// key-up lands in some other window, never reaching our wndproc.
 static HELD_KEYS: Mutex<Vec<(u16, bool)>> = Mutex::new(Vec::new());
 static HELD_BUTTONS: Mutex<Vec<u8>> = Mutex::new(Vec::new());
-/// Last normalized cursor position (for synthesized button releases).
+/// Last normalized cursor position (for synthesized button releases, and the
+/// task-D10 local-pointer prediction).
 static LAST_POS: Mutex<(f64, f64)> = Mutex::new((0.5, 0.5));
+
+/// Task D10: whether this viewer currently has control. While set (and the
+/// window is focused and the pointer is over the client area) the OS cursor is
+/// hidden so only the drawn sprite shows; otherwise the normal arrow shows.
+static CURSOR_CONTROL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Task D10: whether the pointer is currently over the video client area, so
+/// [`local_pointer`] predicts the sprite only while it is. Maintained by
+/// `WM_MOUSEMOVE` / `WM_MOUSELEAVE`.
+static POINTER_INSIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Task D10: whether the video window currently has the keyboard focus. The
+/// hide is gated on it (like the macOS view): an Alt+Tab to another app must
+/// bring the OS cursor back over the video even though the pointer is still
+/// inside our client area. Maintained by `WM_SETFOCUS` / `WM_KILLFOCUS`.
+static FOCUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Whether a `TME_LEAVE` request is outstanding, so one is asked for per entry
+/// (Windows cancels leave-tracking after it fires the one `WM_MOUSELEAVE`).
+static LEAVE_TRACKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A private message posted from [`set_cursor_control`] so the OS cursor is
+/// refreshed on the UI thread at once (a `SetCursor` from another thread would
+/// not affect the window's cursor, and `WM_SETCURSOR` only fires on the next
+/// mouse move — so a stationary pointer would keep the stale cursor).
+const WM_REFRESH_CURSOR: u32 = WM_APP + 1;
+
+/// Task D10: hide the OS cursor over the video while controlling, or restore
+/// it. Stores the flag, drops the inside flag when turning off, and asks the
+/// UI thread to apply the change now (so a stationary pointer does not keep the
+/// old cursor until its next move).
+pub fn set_cursor_control(active: bool) {
+    CURSOR_CONTROL.store(active, Ordering::Relaxed);
+    if !active {
+        POINTER_INSIDE.store(false, Ordering::Relaxed);
+    }
+    let hwnd = drop_target_hwnd();
+    if hwnd != 0 {
+        // SAFETY: valid child HWND; posting a message is safe across threads.
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(hwnd as *mut _)),
+                WM_REFRESH_CURSOR,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    }
+}
+
+/// Task D10: the local pointer over the video (normalized over the letterbox,
+/// matching the input mapping), or `None` when it is not over the client area.
+pub fn local_pointer() -> Option<(f64, f64)> {
+    if !POINTER_INSIDE.load(Ordering::Relaxed) {
+        return None;
+    }
+    LAST_POS.lock().ok().map(|p| *p)
+}
+
+/// Whether the OS cursor should be hidden right now: controlling, focused, and
+/// the pointer over the client area (task D10).
+fn cursor_should_hide() -> bool {
+    POINTER_INSIDE.load(Ordering::Relaxed)
+        && CURSOR_CONTROL.load(Ordering::Relaxed)
+        && FOCUSED.load(Ordering::Relaxed)
+}
+
+/// Apply the OS cursor: hidden (null) or the standard arrow. Call only on the
+/// UI thread (a wndproc handler), where `SetCursor` affects our window.
+fn apply_os_cursor(hidden: bool) {
+    // SAFETY: `SetCursor`/`LoadCursorW` on the UI thread; a null cursor hides
+    // it, the system arrow restores it. `IDC_ARROW` is a built-in resource.
+    unsafe {
+        if hidden {
+            let _ = SetCursor(None);
+        } else if let Ok(arrow) = LoadCursorW(None, IDC_ARROW) {
+            let _ = SetCursor(Some(arrow));
+        }
+    }
+}
 
 /// Synthesize key-up / button-up for everything currently held (focus loss or
 /// session end) so the host never keeps a stuck modifier.
@@ -440,6 +522,12 @@ pub fn hide(hwnd_raw: isize) {
     let hwnd = HWND(hwnd_raw as *mut _);
     REVEAL_OFFSET.store(0, std::sync::atomic::Ordering::SeqCst);
     VIDEO_DIMS.store(0, Ordering::Relaxed); // avoid stale mapping next session
+                                            // Stop predicting the cursor from a stale position once the surface is gone
+                                            // (task D10). `set_cursor_control(false)` from teardown has usually run
+                                            // already; this covers the link-trouble hide too.
+    POINTER_INSIDE.store(false, Ordering::Relaxed);
+    LEAVE_TRACKED.store(false, Ordering::Relaxed);
+    FOCUSED.store(false, Ordering::Relaxed);
 
     // Clip the surface to NOTHING as well as hiding it.
     //
@@ -520,7 +608,60 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if let Ok(mut p) = LAST_POS.lock() {
                 *p = (nx, ny);
             }
+            // Task D10: the pointer is over the video — predict the sprite here,
+            // and ask for one WM_MOUSELEAVE so we learn when it leaves.
+            POINTER_INSIDE.store(true, Ordering::Relaxed);
+            if !LEAVE_TRACKED.swap(true, Ordering::Relaxed) {
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                // SAFETY: `tme` is fully initialized; `hwnd` is our window.
+                if unsafe { TrackMouseEvent(&mut tme) }.is_err() {
+                    LEAVE_TRACKED.store(false, Ordering::Relaxed);
+                }
+            }
             emit(VideoInput::Move { nx, ny });
+            return LRESULT(0);
+        }
+        // Task D10: the pointer left the video — stop predicting (the sprite
+        // falls back to the host's out-of-band position) and let the window
+        // under the pointer set its own cursor.
+        WM_MOUSELEAVE => {
+            POINTER_INSIDE.store(false, Ordering::Relaxed);
+            LEAVE_TRACKED.store(false, Ordering::Relaxed);
+            return LRESULT(0);
+        }
+        // Task D10: hide the OS cursor while controlling and the pointer is over
+        // the client area, so only the drawn sprite shows. Over the revealed
+        // toolbar strip the message goes to the web view instead, which sets its
+        // own cursor — so the toolbar is never left cursorless.
+        WM_SETCURSOR => {
+            let hit = (lparam.0 & 0xffff) as u32;
+            if hit == HTCLIENT {
+                // HTCLIENT means the pointer is over our client area; hide only
+                // while focused (an unfocused window must show the arrow even
+                // with the pointer inside, matching the macOS view). Returning
+                // TRUE stops Windows from setting the class cursor afterwards.
+                let hide =
+                    CURSOR_CONTROL.load(Ordering::Relaxed) && FOCUSED.load(Ordering::Relaxed);
+                apply_os_cursor(hide);
+                return LRESULT(1);
+            }
+            // Non-client area (resize borders): let Windows set that cursor.
+        }
+        // Task D10: refresh the cursor now that control / inside / focus
+        // changed, without waiting for the next mouse move.
+        WM_REFRESH_CURSOR => {
+            apply_os_cursor(cursor_should_hide());
+            return LRESULT(0);
+        }
+        // Task D10: regained focus — re-hide if still controlling over the video.
+        WM_SETFOCUS => {
+            FOCUSED.store(true, Ordering::Relaxed);
+            apply_os_cursor(cursor_should_hide());
             return LRESULT(0);
         }
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
@@ -597,6 +738,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // the host keeps a stuck modifier.
         WM_KILLFOCUS => {
             release_all_held();
+            // Task D10: restore the OS cursor at once — an unfocused video
+            // region must never be left cursor-less, even with the pointer
+            // still inside it.
+            FOCUSED.store(false, Ordering::Relaxed);
+            apply_os_cursor(false);
             return LRESULT(0);
         }
         // Files dropped on the video surface: the viewer pushes them to the host.

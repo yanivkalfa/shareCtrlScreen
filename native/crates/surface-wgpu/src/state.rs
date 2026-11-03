@@ -31,6 +31,22 @@ pub struct SurfaceState {
     /// which runs on its own thread inside an OS input callback and must never
     /// wait for the UI thread — hence an atomic, not a windowing-system query.
     key_focus: AtomicBool,
+    /// Task D10: whether the pointer is currently over the video surface.
+    /// Written by the UI thread on enter/leave; read (with the last position)
+    /// by [`local_pointer`](Self::local_pointer) so the viewer media thread can
+    /// draw the cursor sprite at the real mouse instead of the host's delayed
+    /// out-of-band echo while controlling.
+    pointer_inside: AtomicBool,
+    /// Task D10: the last pointer position normalized `[0,1]` over the
+    /// letterboxed video, `f64` bits in two atomics so the read never waits on
+    /// the UI thread. Only meaningful while `pointer_inside` is set.
+    local_x: AtomicU64,
+    local_y: AtomicU64,
+    /// Task D10: whether this viewer currently controls, so the surface hides
+    /// the OS cursor over the video. Set by the engine through
+    /// `VideoSurface::set_cursor_control`; the backend combines it with
+    /// `pointer_inside` and `key_focus` to decide whether to hide.
+    cursor_control: AtomicBool,
     input: Mutex<InputState>,
     drops: Mutex<Option<Sender<FileDrop>>>,
 }
@@ -111,6 +127,51 @@ impl SurfaceState {
         self.key_focus.load(Ordering::Acquire)
     }
 
+    /// Record the local pointer's normalized position (task D10). The UI thread
+    /// calls this on every pointer move, alongside feeding the input sink, so
+    /// the two always agree on where the pointer is.
+    pub fn set_local_pointer(&self, nx: f64, ny: f64) {
+        self.local_x.store(nx.to_bits(), Ordering::Release);
+        self.local_y.store(ny.to_bits(), Ordering::Release);
+    }
+
+    /// Mark whether the pointer is over the video surface (task D10). Set on
+    /// enter, cleared on leave (and on hide, so a stale position never lingers
+    /// into the next session).
+    pub fn set_pointer_inside(&self, inside: bool) {
+        self.pointer_inside.store(inside, Ordering::Release);
+    }
+
+    /// Whether the pointer is over the video surface (task D10).
+    pub fn pointer_inside(&self) -> bool {
+        self.pointer_inside.load(Ordering::Acquire)
+    }
+
+    /// Set whether this viewer controls (task D10); see the field docs.
+    pub fn set_cursor_control(&self, active: bool) {
+        self.cursor_control.store(active, Ordering::Release);
+    }
+
+    /// Whether this viewer currently controls (task D10).
+    pub fn cursor_control(&self) -> bool {
+        self.cursor_control.load(Ordering::Acquire)
+    }
+
+    /// The local pointer over the video for client-side cursor prediction
+    /// (task D10): `Some((nx, ny))` while the pointer is over the surface,
+    /// `None` otherwise. Focus is intentionally NOT required: a pointer hovering
+    /// an unfocused window shows the OS cursor (we do not hide it), and drawing
+    /// the sprite at the same local position merely makes the two coincide.
+    pub fn local_pointer(&self) -> Option<(f64, f64)> {
+        if !self.pointer_inside.load(Ordering::Acquire) {
+            return None;
+        }
+        Some((
+            f64::from_bits(self.local_x.load(Ordering::Acquire)),
+            f64::from_bits(self.local_y.load(Ordering::Acquire)),
+        ))
+    }
+
     pub fn input(&self) -> MutexGuard<'_, InputState> {
         lock(&self.input)
     }
@@ -185,6 +246,20 @@ mod tests {
         assert!(s.has_key_focus());
         s.set_key_focus(false);
         assert!(!s.has_key_focus());
+    }
+
+    #[test]
+    fn local_pointer_is_some_only_while_inside() {
+        let s = SurfaceState::new();
+        assert_eq!(s.local_pointer(), None, "unknown until the pointer enters");
+        s.set_local_pointer(0.25, 0.75);
+        assert_eq!(s.local_pointer(), None, "a position alone is not 'inside'");
+        s.set_pointer_inside(true);
+        assert_eq!(s.local_pointer(), Some((0.25, 0.75)));
+        s.set_local_pointer(0.5, 0.5);
+        assert_eq!(s.local_pointer(), Some((0.5, 0.5)));
+        s.set_pointer_inside(false);
+        assert_eq!(s.local_pointer(), None, "cleared the instant it leaves");
     }
 
     #[test]

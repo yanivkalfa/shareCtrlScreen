@@ -187,6 +187,8 @@ impl Dispatch<WlPointer, ()> for Dispatcher {
                 if state.is_video(&surface) {
                     state.inside = false;
                     if let Some(s) = &state.shared {
+                        // Task D10: stop predicting the cursor sprite.
+                        s.pointer_left();
                         let (x, y) = state.last;
                         for button in std::mem::take(&mut state.pressed) {
                             s.pointer_button(button, false, x, y);

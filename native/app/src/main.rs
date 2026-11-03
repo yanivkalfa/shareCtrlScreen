@@ -591,6 +591,7 @@ fn main() {
             openh264_download,
             updater::updater_check,
             updater::updater_install,
+            updater::open_releases_page,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();

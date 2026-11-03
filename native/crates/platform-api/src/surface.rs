@@ -115,6 +115,36 @@ pub trait VideoSurface: Send + Sync {
     fn native_handles(&self) -> Option<SurfaceHandles> {
         None
     }
+
+    /// The viewer's LOCAL pointer over the video (task D10, client-side cursor
+    /// prediction): its position normalized `[0,1]` over the letterboxed video
+    /// rectangle, or `None` when the pointer is not over the surface.
+    ///
+    /// On a high-RTT/relayed link the host's out-of-band pointer echo is a full
+    /// round trip behind the real mouse, so a sprite drawn there visibly trails.
+    /// While this viewer has control the media thread draws the sprite here
+    /// instead — instant, and under the real mouse because it reuses the same
+    /// pointer→normalized mapping the input path does (HiDPI/letterbox correct).
+    ///
+    /// Default `None` ⇒ the sprite keeps following the host's position (the
+    /// pre-D10 behaviour), which is also what a view-only session uses.
+    fn local_pointer(&self) -> Option<(f64, f64)> {
+        None
+    }
+
+    /// Tell the surface whether this viewer currently has CONTROL (task D10).
+    ///
+    /// While `true`, the surface hides the OS mouse cursor over the video so
+    /// only the drawn sprite shows (no duplicate), and restores it the instant
+    /// the pointer leaves the video or the window loses focus — the hide/show
+    /// must stay balanced so the OS cursor can never get stuck hidden. Called
+    /// on session start, on every live permission change, and `false` on
+    /// teardown.
+    ///
+    /// Default: no-op. A backend that cannot hide the OS cursor still has the
+    /// sprite drawn at the local position ([`local_pointer`](Self::local_pointer)),
+    /// so the two cursors coincide and there is no visible lag gap.
+    fn set_cursor_control(&self, _active: bool) {}
 }
 
 /// Draws decoded frames onto a [`VideoSurface`]: aspect-preserving letterbox

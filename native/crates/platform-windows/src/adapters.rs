@@ -568,6 +568,12 @@ impl VideoSurface for ChildWindowSurface {
     fn as_any(&self) -> &dyn Any {
         self
     }
+    fn local_pointer(&self) -> Option<(f64, f64)> {
+        render::window::local_pointer()
+    }
+    fn set_cursor_control(&self, active: bool) {
+        render::window::set_cursor_control(active);
+    }
 }
 
 struct D3dPresenter {

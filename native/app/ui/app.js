@@ -231,9 +231,10 @@ function openSettings() {
 
 function closeSettings() {
   $('modal-settings').classList.add('hidden');
-  // If settings were opened mid-session, the native video surface was hidden so
-  // the modal could be seen (it sits above the WebView) — bring it back.
-  if (state === 'VIEW_ACTIVE') invoke('set_video_visible', { visible: true });
+  // If settings were opened mid-session (viewer OR host), the native video
+  // surface was hidden so the modal could be seen (it sits above the WebView) —
+  // bring it back. On the host the surface is absent, so this is a no-op.
+  if (sessionLive()) invoke('set_video_visible', { visible: true });
 }
 
 async function saveSettings() {
@@ -495,12 +496,27 @@ function renderUpdate() {
   const notes = (lastUpdate.notes || '').trim();
   $('update-notes').textContent = notes;
   $('update-notes').classList.toggle('hidden', notes === '');
+  // A .deb/.rpm Linux install cannot self-update (the feed serves an AppImage, so
+  // the updater rejects the payload). Offer a manual download instead; every other
+  // install keeps the in-app "Update & restart". (task U3)
+  const selfUpdatable = lastUpdate.selfUpdatable !== false;
+  $('update-selfinstall').classList.toggle('hidden', !selfUpdatable);
+  $('update-manual').classList.toggle('hidden', selfUpdatable);
+  if (!selfUpdatable) return;
   // Warn (and relabel the button) before the click when a session is live, so
   // the consequence is explicit — updating closes the app and ends the session.
   $('update-session-warning').classList.toggle('hidden', !sessionLive());
   $('btn-update-install').textContent = sessionLive()
     ? 'End session & update'
     : 'Update & restart';
+}
+
+async function downloadUpdate() {
+  try {
+    await invoke('open_releases_page');
+  } catch (err) {
+    toast(String((err && err.message) || err), 'error');
+  }
 }
 
 async function checkForUpdates(silent) {
@@ -559,6 +575,7 @@ listen('updater-progress', (e) => {
 // ---- wiring ----------------------------------------------------------------
 $('btn-update-check').addEventListener('click', () => checkForUpdates(false));
 $('btn-update-install').addEventListener('click', installUpdate);
+$('btn-update-download').addEventListener('click', downloadUpdate);
 $('btn-settings-permissions').addEventListener('click', () => openPermissions(''));
 $('btn-permissions-close').addEventListener('click', closePermissions);
 $('btn-settings').addEventListener('click', openSettings);
@@ -570,17 +587,21 @@ $('btn-view-refresh').addEventListener('click', () => {
   invoke('request_refresh');
   toast('Requested a fresh frame');
 });
-$('btn-view-settings').addEventListener('click', async () => {
-  // Take the native video down BEFORE painting the modal — it sits above the web
-  // UI, so opening the dialog first means it appears underneath the video (and,
-  // if the hover bar was open, sliced to that strip).
+// Opening Settings mid-session (viewer or host): take the native video down
+// BEFORE painting the modal — it sits above the web UI, so opening the dialog
+// first means it appears underneath the video (and, if the hover bar was open,
+// sliced to that strip). On the host there is no video surface, so the invoke
+// is a harmless no-op. closeSettings() restores it.
+async function openSettingsOverVideo() {
   try {
     await invoke('set_video_visible', { visible: false });
   } catch (_) {
     /* fall through — the dialog is still better than nothing */
   }
   openSettings();
-});
+}
+$('btn-view-settings').addEventListener('click', openSettingsOverVideo);
+$('btn-host-settings').addEventListener('click', openSettingsOverVideo);
 
 $('btn-copy').addEventListener('click', async () => {
   try {

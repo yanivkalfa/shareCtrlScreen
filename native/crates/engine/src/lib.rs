@@ -823,6 +823,11 @@ impl Engine {
         if let Some(s) = self.surface() {
             if visible {
                 s.show();
+                // D12: re-showing the surface does NOT repaint it — the present
+                // loop only paints on a new decoded frame (or a cursor move,
+                // D11), so a static host screen stays BLACK until the next
+                // frame. Signal the present loop to repaint the held frame now.
+                session::request_repaint(self);
             } else {
                 s.hide();
             }

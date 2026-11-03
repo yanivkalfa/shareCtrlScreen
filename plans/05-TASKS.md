@@ -53,6 +53,7 @@
 | D9 host cursor sprite on the viewer | **done** (Opus, Opus-reviewed; device-pending I1–I3: real cursor images incl. I-beam in a terminal) | additive cursor-shape message, host sends on change, viewer draws the real sprite at position−hotspot in both presenters; replaces the synthetic triangle |
 | D10 viewer cursor lag on a high-RTT link (draw at local pointer + hide OS cursor) | **done** `da65e25` (Opus, Opus-reviewed; Windows+WSL lane green incl. loopback×3, platform-macos aarch64 type-checked; device-pending I1–I3) | capture already keeps the cursor out of the video; the drawn sprite followed the host out-of-band echo (a round trip behind) while the local OS cursor was instant → two cursors. Fixed: the sprite is drawn at the LOCAL pointer when controlling and over the video (client-side prediction), and the OS cursor is hidden over the video; SHAPE stays the host's (D9) |
 | D11 controller cursor freezes between video frames (decouple drawn cursor from frame arrival) | **done** `363afab` (Opus, Opus-reviewed; Windows + WSL lane green incl. loopback×3, platform-macos aarch64 type-checked; device-pending checklists/D11.md; NO platform-api change) | D10 made it visible: on a static host screen few/no frames arrive, but the drawn sprite only repainted inside the decoded-frame branch, so the local pointer froze then snapped forward. Fixed: the newest decoded `Frame` is held and the idle tick (~16 ms) re-presents it with the CURRENT cursor when the cursor moved; `cursor_position` no longer vanishes on a momentary host-cursor blip while controlling (always draws at the local pointer); Windows `pointer_inside` re-evaluated on focus regain / control-on so the sprite doesn't drop to the stale host spot |
+| D12 black screen after closing Settings mid-session (repaint the surface on hidden→shown) | **in review** (Opus; Windows + WSL lane green incl. loopback×3 with `test-hooks`, platform-macos aarch64 type-checked + clippy; device-pending checklists/D12.md; NO platform-api change) | opening Settings mid-session hides the video (`set_video_visible(false)` → `surface.hide()`), closing re-shows it; but the present loop only paints on a new decoded frame (or a cursor move, D11), so on a STATIC host screen the re-shown surface stayed BLACK until the next frame. Fixed: a one-shot `Shared.repaint_requested` flag set by `set_video_visible(true)` (via `session::request_repaint`); the idle tick re-presents the held `last_frame` once regardless of cursor movement (or requests a keyframe if nothing has decoded yet). Host unaffected (no viewer `shared`) |
 | W4 installer bundles + registers the SYSTEM service | **done** (Opus, Opus-reviewed, merged d0119b4; Rust lane-proven, installer by new CI job + machine-A smoke pending; device pass checklists/W4.md) | NSIS hooks install/start/stop/uninstall `sharectrl-service.exe` next to `sharectrl.exe`; one host instance rule; CI silent install/upgrade/uninstall job. Acceptance narrowed: service setup + one instance + standalone asset; elevated-window control is NOT a W4 claim |
 | W5 UIAccess (Alt+Tab / Win key passthrough) | **done** (Opus, Opus-reviewed; device-pending checklists/W5.md: Alt+Tab/Win via the service) | route (a) only: the service sets `TokenUIAccess` (SeTcb) on a duplicate of the host token; `--print-uiaccess`; startup log line; fallback launches without the flag and logs why. Signed route deferred to W6 (see the card) |
 | W7 uninstaller removes the whole install dir (service log leftover) | **done** (Opus, Opus-reviewed, merged 03d98af; proven by the windows-installer CI job on push) | first windows-installer CI run failed only on uninstall-clean: `sharectrl-service.log` left in Program Files; RMDir /r $INSTDIR in POSTUNINSTALL |
@@ -1016,6 +1017,44 @@ I1..I4 after all lanes (hardware validation)
 * Acceptance (device, checklists/D11.md): controlling over the relay with the host screen static, the cursor
   tracks the local pointer smoothly with NO multi-second freeze; correct host shape; view-only still shows the
   host cursor; nothing vanishes when the host cursor report blips.
+
+### D12 — Black screen after closing Settings mid-session (repaint the video surface on hidden→shown)  (size S, all viewer OSes; owner + friend report 2026-11-03)
+* Problem (root cause, confirmed): during a live VIEWER session, opening Settings calls
+  `openSettingsOverVideo()` → `invoke('set_video_visible', {visible:false})` → `engine.set_video_visible(false)`
+  → `surface.hide()`, and closing calls `set_video_visible(true)` → `surface.show()`. But `show()` does not
+  itself repaint: the present loop (`engine/src/media/viewer.rs`) paints only when a NEW decoded frame arrives
+  (the decoded-frame branch), and D11's idle re-present fires only when the cursor MOVED. So on a STATIC host
+  screen (few/no frames) the re-shown surface stayed BLACK until the next frame or a cursor move. Owner + a
+  friend (Mac controlling Ubuntu) both hit it.
+* Deliverable: on a hidden→shown transition, force the present loop to re-present the last decoded frame
+  immediately. Build on D11's held `last_frame`. No platform-api change.
+* **As built (branch `task/D12`, in review; Windows + WSL lane green incl. loopback×3 with `test-hooks`,
+  platform-macos type-checked + clippy for aarch64-apple-darwin; device-pending checklists/D12.md; NO
+  platform-api change — the `Presenter`/`VideoDecoder`/`VideoSurface` traits are untouched):**
+  * **One-shot repaint signal (engine, all OSes)** — `session/mod.rs`: `Shared` gains
+    `repaint_requested: AtomicBool` (per-session, `Default`-false). `Session` gains `shared: Option<Arc<Shared>>`
+    (the viewer's shared state; `None` on a host session). The viewer session now keeps `shared` alive past the
+    `ViewerMedia` move (clones into the media loop) and stores it on the `Session`. New crate-private
+    `session::request_repaint(engine)` sets the flag through `engine.session.lock()` — mirrors `set_control`.
+  * **Wiring** — `lib.rs` `set_video_visible(true)`: after `s.show()`, calls `session::request_repaint(self)`.
+    On the host this is a no-op twice over: the host typically has no viewer surface, and even if `surface()`
+    is `Some`, `session.shared` is `None` so nothing is signalled.
+  * **Present loop (engine, all OSes)** — `media/viewer.rs` idle-timeout branch now reads-and-clears the flag
+    with `repaint_requested.swap(false)` so it fires exactly once. When `last_frame` is `Some`, it re-presents
+    via the shared `present_frame(..)` when `should_idle_repaint(repaint, cursor, last_cursor)` is true — i.e.
+    on the repaint request REGARDLESS of cursor movement, OR (D11 unchanged) when the cursor moved. When
+    `last_frame` is `None` (nothing decoded yet), a requested repaint asks the host for a keyframe (rate-limited
+    to ~1/s via the existing `last_kf_req`) so a fresh frame arrives to show instead of staying black.
+  * **Covers all hidden→shown sites**: the signal is tied to `set_video_visible(true)` (Settings). The driver's
+    own `s.hide()`/`s.show()` (link-trouble, `driver.rs`) already requests a keyframe on re-show, so a fresh
+    frame repaints there; this change does not regress that path.
+  * **Unit-proven**: `should_idle_repaint` extracted as a pure fn and tested — repaints on a request with a
+    STATIONARY cursor (D12), does NOT repaint without a request and a still cursor (D11), repaints on a moved
+    cursor without a request (D11). The full present loop (real decoder/presenter) is device-verified.
+  * **Not changed:** platform-api traits, D11's held-frame / idle cursor tracking, the decoded-frame present
+    path, the catch-up / backlog / keyframe-watchdog pipeline, the hide behaviour, the host path.
+* Acceptance (device, checklists/D12.md): open Settings during a viewer session and close it → the video
+  reappears instantly, no black screen, even when the host screen is static.
 
 ### U2 — Settings/Update is unreachable while hosting a session  (size XS–S, UI; owner report 2026-11-02)
 * Problem: the Updates control (U1) lives in the Settings modal, opened by the gear button. But the gear

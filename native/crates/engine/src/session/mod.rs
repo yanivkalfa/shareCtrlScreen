@@ -49,6 +49,14 @@ pub(crate) struct Shared {
     /// video, the media thread draws the cursor sprite at the LOCAL pointer
     /// (instant) instead of the host's round-trip-delayed out-of-band echo.
     pub control: AtomicBool,
+    /// Viewer (task D12): a one-shot "repaint now" request. Set when the video
+    /// surface is re-shown (e.g. Settings closed mid-session) — re-showing does
+    /// not itself repaint, and the present loop otherwise only paints on a new
+    /// decoded frame (or a cursor move, D11), so a STATIC host screen stays
+    /// black until the next frame. The idle tick checks this, re-presents the
+    /// held frame once and clears it (or, with nothing decoded yet, asks for a
+    /// keyframe so a fresh frame arrives to show).
+    pub repaint_requested: AtomicBool,
     /// Test hook (`test-hooks` feature only): the host's current encode size,
     /// `w << 32 | h`, so the loopback can assert it stays full resolution as the
     /// link varies (V2 has no resolution ladder).
@@ -90,6 +98,10 @@ pub(crate) struct Session {
     clip_on: Arc<AtomicBool>,
     /// The user's clipboard-sync setting at session start.
     clipboard_setting: bool,
+    /// Viewer: the per-session shared state, so [`request_repaint`] can set the
+    /// repaint flag when the surface is re-shown (task D12). `None` on a host
+    /// session (no viewer present loop to repaint).
+    shared: Option<Arc<Shared>>,
     threads: Vec<JoinHandle<()>>,
     /// Test hooks (`test-hooks` feature only): the host's rate state, so the
     /// loopback can observe the encoder target / raw link and inject estimates.
@@ -310,6 +322,7 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission) 
         control,
         clip_on,
         clipboard_setting: cfg.clipboard_sync,
+        shared: None,
         threads,
         #[cfg(feature = "test-hooks")]
         hooks: Some(TestHooks {
@@ -493,7 +506,7 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
             platform: platform.clone(),
             surface: surface.clone(),
             codec,
-            shared,
+            shared: shared.clone(),
         };
         let (ctl, stop_r, ui) = (ctl_tx.clone(), stop.clone(), engine.ui_sender());
         spawn_or_abort!(engine, stop, threads, "viewer-media", move || {
@@ -544,6 +557,7 @@ fn start_viewer(engine: &Engine, peer: String, offer_sdp: String) {
         control: Arc::new(AtomicBool::new(false)),
         clip_on,
         clipboard_setting: cfg.clipboard_sync,
+        shared: Some(shared),
         threads,
         #[cfg(feature = "test-hooks")]
         hooks: None,
@@ -700,6 +714,19 @@ pub(crate) fn set_control(engine: &Engine, allow: bool) {
         // reading this machine's clipboard too, not just its input.
         s.clip_on
             .store(allow && s.clipboard_setting, Ordering::SeqCst);
+    }
+}
+
+/// Viewer (task D12): ask the present loop to repaint the last decoded frame
+/// once, immediately. Called after the video surface is re-shown (e.g. Settings
+/// closed mid-session): `show()` does not itself repaint, and on a static host
+/// screen the surface would otherwise stay black until the next frame. A no-op
+/// on a host session (no viewer `shared`).
+pub(crate) fn request_repaint(engine: &Engine) {
+    if let Some(s) = engine.session.lock().as_ref() {
+        if let Some(shared) = &s.shared {
+            shared.repaint_requested.store(true, Ordering::SeqCst);
+        }
     }
 }
 

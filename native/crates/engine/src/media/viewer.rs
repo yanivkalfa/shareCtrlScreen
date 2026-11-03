@@ -190,23 +190,37 @@ pub(crate) fn viewer_media_loop(
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // D11: no new frame arrived — repaint the LAST decoded frame with
-                // the CURRENT cursor so the local pointer keeps tracking on a
-                // static screen. Only when the cursor actually moved (bounds the
-                // GPU work) and only once a frame exists to repaint.
-                if let Some(frame) = &last_frame {
-                    let (cursor, shape) = current_cursor(&shared, surface.as_ref());
-                    if cursor != last_cursor {
-                        present_frame(
-                            presenter.as_mut(),
-                            &shared,
-                            &mut sprite,
-                            frame,
-                            cursor,
-                            shape,
-                            &mut render_errors,
-                        );
-                        last_cursor = cursor;
+                // No new frame arrived. Repaint the LAST decoded frame when
+                // either the cursor moved (D11 — keep the local pointer tracking
+                // on a static screen) or a one-shot repaint was requested (D12 —
+                // the surface was just re-shown, e.g. Settings closed, and would
+                // otherwise stay black until the next frame). `swap` reads and
+                // clears the request atomically so it fires exactly once.
+                let repaint = shared.repaint_requested.swap(false, Ordering::SeqCst);
+                match &last_frame {
+                    Some(frame) => {
+                        let (cursor, shape) = current_cursor(&shared, surface.as_ref());
+                        if should_idle_repaint(repaint, cursor, last_cursor) {
+                            present_frame(
+                                presenter.as_mut(),
+                                &shared,
+                                &mut sprite,
+                                frame,
+                                cursor,
+                                shape,
+                                &mut render_errors,
+                            );
+                            last_cursor = cursor;
+                        }
+                    }
+                    // D12: asked to repaint but nothing has decoded yet — ask the
+                    // host for a fresh keyframe (rate-limited) so a frame arrives
+                    // to show, instead of leaving the surface black.
+                    None => {
+                        if repaint && last_kf_req.elapsed() >= std::time::Duration::from_secs(1) {
+                            let _ = ctl_tx.send(serialize(&protocol::ControlMsg::KeyframeRequest));
+                            last_kf_req = std::time::Instant::now();
+                        }
                     }
                 }
             }
@@ -280,6 +294,19 @@ fn present_frame(
     }
 }
 
+/// Whether the idle tick should re-present the held frame. Re-present on an
+/// explicit repaint request (D12 — the surface was just re-shown, so paint even
+/// with the cursor stationary) OR when the cursor actually moved (D11 — keep the
+/// local pointer tracking on a static screen while bounding the GPU work).
+/// Split out so the signal is unit-testable without a real decoder/presenter.
+fn should_idle_repaint(
+    repaint_requested: bool,
+    cursor: Option<(f64, f64)>,
+    last_cursor: Option<(f64, f64)>,
+) -> bool {
+    repaint_requested || cursor != last_cursor
+}
+
 /// Choose the cursor sprite POSITION (task D10/D11). The SHAPE is always the
 /// host's (D9); only the position source changes here.
 ///
@@ -338,10 +365,38 @@ impl InstalledSprite {
 
 #[cfg(test)]
 mod tests {
-    use super::cursor_position;
+    use super::{cursor_position, should_idle_repaint};
 
     const LOCAL: (f64, f64) = (0.2, 0.3);
     const HOST: (f64, f64) = (0.8, 0.9);
+
+    #[test]
+    fn repaint_request_repaints_even_with_a_stationary_cursor() {
+        // D12: Settings closed → the surface was re-shown and a repaint was
+        // requested. The idle tick must re-present the held frame ONCE even
+        // though the cursor has not moved, so the video returns immediately
+        // instead of staying black on a static host screen.
+        let cursor = Some(LOCAL);
+        assert!(
+            should_idle_repaint(true, cursor, cursor),
+            "a repaint request must repaint regardless of cursor movement"
+        );
+    }
+
+    #[test]
+    fn no_request_and_a_stationary_cursor_does_not_repaint() {
+        // D11 unchanged: without a request, a static screen with a still cursor
+        // must NOT repaint every idle tick (bounds the GPU work).
+        let cursor = Some(LOCAL);
+        assert!(!should_idle_repaint(false, cursor, cursor));
+    }
+
+    #[test]
+    fn a_moved_cursor_repaints_without_a_request() {
+        // D11 unchanged: the local pointer moved on a static screen → repaint so
+        // the drawn sprite tracks it.
+        assert!(should_idle_repaint(false, Some(LOCAL), Some(HOST)));
+    }
 
     #[test]
     fn controlling_and_over_the_video_uses_the_local_pointer() {

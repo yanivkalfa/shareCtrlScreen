@@ -54,6 +54,7 @@
 | D10 viewer cursor lag on a high-RTT link (draw at local pointer + hide OS cursor) | **done** `da65e25` (Opus, Opus-reviewed; Windows+WSL lane green incl. loopback×3, platform-macos aarch64 type-checked; device-pending I1–I3) | capture already keeps the cursor out of the video; the drawn sprite followed the host out-of-band echo (a round trip behind) while the local OS cursor was instant → two cursors. Fixed: the sprite is drawn at the LOCAL pointer when controlling and over the video (client-side prediction), and the OS cursor is hidden over the video; SHAPE stays the host's (D9) |
 | D11 controller cursor freezes between video frames (decouple drawn cursor from frame arrival) | **done** `363afab` (Opus, Opus-reviewed; Windows + WSL lane green incl. loopback×3, platform-macos aarch64 type-checked; device-pending checklists/D11.md; NO platform-api change) | D10 made it visible: on a static host screen few/no frames arrive, but the drawn sprite only repainted inside the decoded-frame branch, so the local pointer froze then snapped forward. Fixed: the newest decoded `Frame` is held and the idle tick (~16 ms) re-presents it with the CURRENT cursor when the cursor moved; `cursor_position` no longer vanishes on a momentary host-cursor blip while controlling (always draws at the local pointer); Windows `pointer_inside` re-evaluated on focus regain / control-on so the sprite doesn't drop to the stale host spot |
 | D12 black screen after closing Settings mid-session (repaint the surface on hidden→shown) | **done** `17535dd` (Opus, orchestrator-reviewed; Windows + WSL lane green incl. loopback×3 with `test-hooks`, platform-macos aarch64 type-checked + clippy; device-pending checklists/D12.md; NO platform-api change) | opening Settings mid-session hides the video (`set_video_visible(false)` → `surface.hide()`), closing re-shows it; but the present loop only paints on a new decoded frame (or a cursor move, D11), so on a STATIC host screen the re-shown surface stayed BLACK until the next frame. Fixed: a one-shot `Shared.repaint_requested` flag set by `set_video_visible(true)` (via `session::request_repaint`); the idle tick re-presents the held `last_frame` once regardless of cursor movement (or requests a keyframe if nothing has decoded yet). Host unaffected (no viewer `shared`) |
+| M15 native menu on Mac/Linux + Mac cursor-leak fix (retire the top-edge drawer there) | **in review** (Opus; menu Mac/Linux, drawer removed Mac/Linux, Windows unchanged, cursor rect-scoped; compile+tests via the lane — device-pending checklists/M15.md; NO platform-api change) | new Tauri v2 native menu, macOS + Linux only (`#[cfg(any(macos,linux))]`): a "Session" submenu with exactly Settings / Disconnect / End Session / Check for updates, wired to the gear-button flows (`menu://settings`, `menu://check-updates` events → `openSettingsOverVideo`/`checkForUpdates(false)`) and `end_session` straight on the engine. macOS keeps the standard app menu (⌘Q intact) and appends ours; Linux shows only ours. The top-edge hover reveal is retired on Mac (`view.rs`) and Linux (`surface/x11.rs`, `surface/wayland/mod.rs`): pointer events no longer drive it, the surface is always full. The Mac "OS cursor stuck on the desktop" bug is fixed by replacing `NSCursor::hide` with a rect-scoped transparent cursor (`resetCursorRects`/`addCursorRect:` + `invalidateCursorRectsForView:`), which AppKit auto-restores outside the video rect / when the window is not key — it can never leak. Windows web drawer + reveal untouched |
 | W4 installer bundles + registers the SYSTEM service | **done** (Opus, Opus-reviewed, merged d0119b4; Rust lane-proven, installer by new CI job + machine-A smoke pending; device pass checklists/W4.md) | NSIS hooks install/start/stop/uninstall `sharectrl-service.exe` next to `sharectrl.exe`; one host instance rule; CI silent install/upgrade/uninstall job. Acceptance narrowed: service setup + one instance + standalone asset; elevated-window control is NOT a W4 claim |
 | W5 UIAccess (Alt+Tab / Win key passthrough) | **done** (Opus, Opus-reviewed; device-pending checklists/W5.md: Alt+Tab/Win via the service) | route (a) only: the service sets `TokenUIAccess` (SeTcb) on a duplicate of the host token; `--print-uiaccess`; startup log line; fallback launches without the flag and logs why. Signed route deferred to W6 (see the card) |
 | W7 uninstaller removes the whole install dir (service log leftover) | **done** (Opus, Opus-reviewed, merged 03d98af; proven by the windows-installer CI job on push) | first windows-installer CI run failed only on uninstall-clean: `sharectrl-service.log` left in Program Files; RMDir /r $INSTDIR in POSTUNINSTALL |
@@ -1832,6 +1833,68 @@ to run (TCC). Use `objc2` 0.6-family crates throughout (`objc2-app-kit`,
       with a warning. Cap the clipboard at what fits, or chunk it.
   * Not verified: real sessions (I1–I3): arrow/I-beam/hand/resize on each host, DXGI top-left
     semantics on hardware, portal cursor scale under fractional scaling, Retina scale.
+
+### M15 — Native menu on macOS + Linux, retire the top-edge drawer there, fix the Mac cursor leak  (size M, macOS + Linux UI + macOS cursor; owner report 2026-11-03)
+* **As built (branch `task/M15`, in review; compile + tests via the build lane on windows + wsl incl. loopback×3 with `test-hooks`, platform-macos aarch64 type-checked + clippy; menu/cursor behaviour is device-only; NO platform-api change):**
+  * **Part 1 — native menu (macOS + Linux only).** `native/app/src/main.rs`: new
+    `install_native_menu(app)` under `#[cfg(any(target_os="macos", target_os="linux"))]`
+    builds a Tauri v2 `Submenu` **"Session"** with exactly three always-enabled
+    `MenuItem`s — **Settings** (`menu-settings`), **Disconnect / End Session**
+    (`menu-end-session`), **Check for updates** (`menu-check-updates`). macOS keeps
+    the standard app menu (`Menu::default(app.handle())`, so About/Hide/⌘Q survive —
+    the video view's key handling relies on ⌘Q reaching the menu bar) and appends
+    ours; Linux shows only ours (`Menu::with_items`). `Builder::on_menu_event`
+    dispatches via `handle_menu_event`: Settings and Check-for-updates `emit`
+    `menu://settings` / `menu://check-updates` to the webview; Disconnect calls the
+    engine directly (`AppState.engine.end_session()`, exactly what the `end_session`
+    command does — the resulting `role-changed` event drives the UI). The handler is
+    registered on all platforms but only fires where a menu is installed (no-op on
+    Windows).
+  * `native/app/ui/app.js`: two `listen(...)`s mirror the gear-button flow —
+    `menu://settings` → `openSettingsOverVideo()`; `menu://check-updates` →
+    `openSettingsOverVideo()` then `checkForUpdates(false)` and scrolls the Updates
+    panel into view. No new command, no HTML change.
+  * **Part 2 — retire the top-edge drawer on Mac + Linux (Windows kept).** The hover
+    reveal no longer runs: callers stop driving it and the surface is always full.
+    * macOS `view.rs`: `mouseMoved`/`mouseExited` no longer feed the reveal;
+      `feed_reveal` and `system_cover_pt` are gone; the `reveal` ivar is retained but
+      never advanced (its inset is always 0, so the hard-won M13 layer-flip layout in
+      `apply_layout`/`view_to_px` is left intact and simply computes a zero inset).
+    * Linux `surface/x11.rs`: pointer motion and the top-edge `LeaveNotify` no longer
+      call `feed_reveal` (removed); the `reveal` mutex stays (always un-revealed, so
+      the XShape bounding/input region is never cut and the XDND inset is 0).
+    * Linux `surface/wayland/mod.rs`: `to_full_px` dropped its `feed_reveal` arg and
+      the reveal branch; the `Reveal` field is removed; `geo.revealed` is never set
+      (so `bar_logical()`/the viewport crop stay 0). `geometry.rs` is unchanged (its
+      crop logic is simply never triggered).
+    * Shared `surface-wgpu/src/reveal.rs` is **untouched** — Windows (`render/src/window.rs`)
+      keeps its reveal entirely; only the Mac/Linux callers stopped driving it.
+  * **Part 3 — Mac cursor leak fix (rect-scoped, the brief's preferred approach).**
+    `view.rs` replaces D10's app-wide `NSCursor::hide()` + `mouseExited`/focus restore
+    (whose `unhide` could be missed when the pointer left the whole window, leaving
+    the cursor stuck on the Mac desktop until the app lost focus). Now the view owns a
+    1×1 transparent `NSCursor` (`blank_cursor()`, the AppKit analogue of the X11
+    transparent-pixmap cursor) and overrides `resetCursorRects` to `addCursorRect:`
+    it over the whole video bounds **only while `cursor_control()` and the view is
+    visible**. AppKit applies the cursor only while the pointer is inside that rect
+    and the window is key, and restores the normal cursor otherwise — so it can never
+    leak outside the video. Control changes (`VideoSurface::set_cursor_control`, and
+    teardown) call the new `VideoView::refresh_cursor()` →
+    `window.invalidateCursorRectsForView(self)` to rebuild. The old `cursor_hidden`
+    `Cell`, `set_cursor_hidden`/`update_cursor_hidden` and every per-event
+    `update_cursor_hidden` call are gone; `set_pointer_inside` writes remain (they
+    drive the D10 sprite prediction, unchanged).
+  * **Compile/test-proven:** both lane sides (windows + wsl) — fmt, check, clippy
+    `-D warnings`, `cargo test --workspace`, `cargo build -p app`, the
+    `platform-macos` aarch64 `--all-targets` check + clippy, and the engine loopback
+    ×3 with `test-hooks`. The menu appearing/working, the drawer being gone on
+    Mac/Linux, and the cursor returning the instant the pointer leaves the window are
+    **device-only** (checklists/M15.md). Windows is unchanged (drawer still works) —
+    no Windows code touched beyond the always-registered, never-firing menu handler.
+  * **Risks:** the transparent-image cursor and the cursor-rect timing (does AppKit
+    apply the blank cursor immediately when control turns on while the pointer is
+    already inside?) are unverifiable without a Mac; the Linux in-window menu bar's
+    exact placement under GTK is device-only.
 
 ## Lane T — tests & CI
 

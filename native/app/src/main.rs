@@ -493,6 +493,67 @@ fn raise_main_window(app: &tauri::AppHandle) {
     }
 }
 
+/// Build the native app menu and install it. macOS + Linux only (task M15):
+/// Windows keeps its existing web drawer, so it gets no menu. A single "Session"
+/// submenu with exactly three always-enabled items — Settings, Disconnect / End
+/// Session, Check for updates. On macOS the standard app menu (About, Hide and
+/// ⌘Q — the video view's key handling relies on ⌘Q reaching the menu bar) is
+/// kept and ours is appended; Linux has no system app menu, so only ours shows
+/// (in the window's menu bar).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn install_native_menu(app: &tauri::App) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem, Submenu};
+    let settings = MenuItem::with_id(app, "menu-settings", "Settings", true, None::<&str>)?;
+    let disconnect = MenuItem::with_id(
+        app,
+        "menu-end-session",
+        "Disconnect / End Session",
+        true,
+        None::<&str>,
+    )?;
+    let updates = MenuItem::with_id(
+        app,
+        "menu-check-updates",
+        "Check for updates",
+        true,
+        None::<&str>,
+    )?;
+    let session = Submenu::with_items(app, "Session", true, &[&settings, &disconnect, &updates])?;
+    #[cfg(target_os = "macos")]
+    {
+        let menu = Menu::default(app.handle())?;
+        menu.append(&session)?;
+        app.set_menu(menu)?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let menu = Menu::with_items(app, &[&session])?;
+        app.set_menu(menu)?;
+    }
+    Ok(())
+}
+
+/// Dispatch a click on one of the native menu items (task M15). Settings and
+/// "Check for updates" go to the webview as events — the same `openSettings`
+/// flow the gear buttons use; "Check for updates" additionally runs the quiet
+/// updater check in the Updates panel. Disconnect ends the session straight
+/// through the engine, exactly as the `end_session` command does. A no-op on
+/// Windows (no menu is installed there, so this never fires).
+fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::MenuEvent) {
+    match event.id().as_ref() {
+        "menu-settings" => {
+            let _ = app.emit("menu://settings", ());
+        }
+        "menu-check-updates" => {
+            let _ = app.emit("menu://check-updates", ());
+        }
+        "menu-end-session" => {
+            app.state::<AppState>().engine.end_session();
+        }
+        _ => {}
+    }
+}
+
 fn main() {
     // `--print-uiaccess` answers and exits before anything else exists: no
     // window, no network, no logging (which truncates app.log) and no instance
@@ -571,6 +632,9 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(state)
+        // Native menu clicks (macOS + Linux). Harmless on Windows: no menu is
+        // installed there, so it never fires.
+        .on_menu_event(handle_menu_event)
         .invoke_handler(tauri::generate_handler![
             get_config,
             get_platform_info,
@@ -595,6 +659,13 @@ fn main() {
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
+
+            // Native menu (macOS + Linux only; Windows keeps its web drawer).
+            // Not fatal: the app is still fully usable without the menu.
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            if let Err(e) = install_native_menu(app) {
+                tracing::warn!("native menu: {e}");
+            }
 
             // Another launch in this session asks the service host to show
             // its window instead of starting a second host.

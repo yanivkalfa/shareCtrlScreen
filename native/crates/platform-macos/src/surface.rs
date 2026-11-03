@@ -209,9 +209,11 @@ impl VideoSurface for MacVideoSurface {
 
     fn set_cursor_control(&self, active: bool) {
         self.state.set_cursor_control(active);
-        // Hiding / showing the OS cursor is a main-thread AppKit call; the view
-        // re-evaluates against the pointer-inside and focus state it tracks.
-        self.on_main("cursor control", |view| view.update_cursor_hidden());
+        // Task M15: control changed — rebuild the window's cursor rects on the
+        // main thread so the transparent cursor is added over the video (or
+        // dropped). AppKit then scopes it to the video rect and the key window,
+        // so the OS cursor can never leak onto the desktop.
+        self.on_main("cursor control", |view| view.refresh_cursor());
     }
 }
 
@@ -222,12 +224,13 @@ impl Drop for MacVideoSurface {
         let Some(main) = self.main.take() else {
             return;
         };
-        // Task D10: make sure the OS cursor is not left hidden if the surface
-        // is dropped without a teardown first.
+        // Task M15: clear control and rebuild the cursor rects so the view adds
+        // no cursor rect as it goes away (the OS cursor is already safe — it was
+        // only ever scoped to the video rect — but keep the state consistent).
         self.state.set_cursor_control(false);
         let teardown = move |mtm: MainThreadMarker| {
             let parts = main.get(mtm);
-            parts.view.update_cursor_hidden();
+            parts.view.refresh_cursor();
             // SAFETY: the token came from `addLocalMonitorForEvents` and is
             // removed exactly once.
             unsafe { NSEvent::removeMonitor(&parts.monitor) };

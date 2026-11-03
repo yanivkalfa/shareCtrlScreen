@@ -215,7 +215,7 @@ fn converted(route: &mut Route) {
     let paths = parse_uri_list(&selection_bytes(&route.sink));
     let delivered = match route.shared.upgrade() {
         Some(s) if !paths.is_empty() => {
-            let (px, py) = s.to_full_px(drag.pos.0, drag.pos.1, false);
+            let (px, py) = s.to_full_px(drag.pos.0, drag.pos.1);
             let (nx, ny) = s.state.normalize(px, py);
             s.state.deliver_drop(FileDrop { paths, nx, ny })
         }

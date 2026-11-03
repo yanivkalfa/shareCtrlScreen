@@ -1,24 +1,24 @@
 //! Host media thread: capture → encode → hand AUs to the transport, with
-//! viewer-size encoding, a bandwidth-driven resolution/fps ladder, and
-//! rate-limited on-demand keyframes.
+//! viewer-size encoding, a bandwidth-following encoder bitrate, and rate-limited
+//! on-demand keyframes.
 //!
-//! The encoder follows str0m's bandwidth estimate down (the driver clamps it to
-//! the bitrate floor); this thread spends the rest of the degradation on the
-//! ENCODE RESOLUTION, stepping down a hysteretic ladder as the link falls and
-//! back up as it recovers, so a constrained link yields a sharp SMALL image
-//! rather than a mushy full-res one. Only once the smallest step still cannot fit
-//! the link does the frame rate drop. str0m's own pacer meters egress; there is
-//! no hand-rolled source pacer (it was what pinned egress to the raw estimate and
+//! The encoder follows str0m's bandwidth estimate down in BITRATE (the driver
+//! clamps it to the floor) and back up, always encoding at the FULL viewer-fit
+//! resolution. A constrained link gets a softer but STEADY picture; the encode
+//! size changes only when the viewer window actually resizes, never from the
+//! bandwidth estimate (V1's resolution ladder caused a constant soften/re-sharpen
+//! flap and was removed in V2). str0m's own pacer meters egress; there is no
+//! hand-rolled source pacer (it was what pinned egress to the raw estimate and
 //! kept the bandwidth estimate from ever probing back up — the self-sustaining
-//! stutter this replaced).
+//! stutter V1 replaced, and we keep gone).
 //!
 //! ## References
 //! * str0m 0.21 `Writer::write` paces RTP egress and NACK-repairs from its send
 //!   buffer; the encoder need only produce frames sized to the estimate.
 //! * Commit 352d56d: the proven-smooth precedent — encoder follows BWE down, no
-//!   source pacer, frame size (here, resolution) absorbs congestion.
-//! * `crate::tuning`: the pure [`resolution_step`](crate::tuning::resolution_step)
-//!   / [`target_fps`](crate::tuning::target_fps) / `encoder_target` policy.
+//!   source pacer.
+//! * `crate::tuning`: the pure [`encoder_target`](crate::tuning::encoder_target)
+//!   bitrate policy.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -27,7 +27,7 @@ use std::sync::Arc;
 use platform_api::{CaptureError, Codec, EncoderConfig, Platform, ScreenCapture};
 
 use crate::session::Shared;
-use crate::tuning::{self, MAX_FPS, RESOLUTION_LADDER};
+use crate::tuning::{MAX_FPS, MAX_FPS_INTERVAL};
 
 /// What the host media thread needs.
 pub(crate) struct HostMedia {
@@ -104,7 +104,6 @@ pub(crate) fn host_media_loop(
     frame_tx: Sender<(Vec<u8>, bool)>,
     cursor_tx: Sender<Vec<u8>>,
     bitrate: Arc<std::sync::atomic::AtomicU32>,
-    link: Arc<std::sync::atomic::AtomicU32>,
     force_key: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -162,13 +161,6 @@ pub(crate) fn host_media_loop(
     // the loss once and the recovery once rather than on every 250 ms retry.
     let mut capture_down_since: Option<std::time::Instant> = None;
 
-    // Degradation is spent on RESOLUTION first (a sharp small image), then frame
-    // rate as a last resort — never on a bitrate floor that would overshoot the
-    // link. `res_step` indexes the hysteretic resolution ladder; it rises as the
-    // link falls and recovers as it climbs (see `crate::tuning`). str0m's own
-    // pacer meters egress, so there is no hand-rolled source pacer here.
-    let mut res_step: usize = 0;
-
     // Keyframe rate limiting + attribution (see the emit site below). The first
     // keyframe must not be delayed, so start the clock a full gap in the past.
     const MIN_KEYFRAME_GAP: std::time::Duration = std::time::Duration::from_millis(1000);
@@ -179,21 +171,14 @@ pub(crate) fn host_media_loop(
     let mut last_key_log = std::time::Instant::now();
 
     while !stop.load(Ordering::SeqCst) {
-        // Read the raw link estimate once and update the resolution ladder from
-        // it. The ladder index then drives both the encode size (below) and, at
-        // the smallest step, the frame rate.
-        let link_bps = link.load(Ordering::SeqCst);
-        res_step = tuning::resolution_step(res_step, link_bps);
-
-        // Frame-rate cap: never encode faster than the ladder's current rate
-        // (MAX_FPS everywhere except the smallest step on a sub-floor link). The
-        // pacing sleep only bites when we're running FASTER than the cap (a busy
-        // screen); a slow software encoder or an idle screen sets the real rate.
-        let fps = tuning::target_fps(res_step, link_bps);
-        let interval = std::time::Duration::from_millis(1000 / u64::from(fps.max(1)));
+        // Frame-rate cap: always run at MAX_FPS and never encode faster than
+        // MAX_FPS_INTERVAL. The pacing sleep only bites when we're running FASTER
+        // than the cap (a busy screen); a slow software encoder or an idle screen
+        // sets the real rate. A constrained link is absorbed by the bitrate
+        // following BWE down (below), not by dropping the frame rate.
         let since = last_frame_at.elapsed();
-        if since < interval {
-            std::thread::sleep(interval - since);
+        if since < MAX_FPS_INTERVAL {
+            std::thread::sleep(MAX_FPS_INTERVAL - since);
         }
         last_frame_at = std::time::Instant::now();
 
@@ -205,27 +190,22 @@ pub(crate) fn host_media_loop(
             cfg.bitrate_bps = target;
         }
 
-        // Encode at the size the viewer actually displays (never upscaling past
-        // our own screen), so it presents 1:1 with no resampling. The GPU
+        // Encode at the FULL size the viewer actually displays (never upscaling
+        // past our own screen), so it presents 1:1 with no resampling. The GPU
         // converter already scales, so this costs nothing extra — and encoding
-        // fewer pixels puts more bits into each one. Rebuild only on a material
-        // change; the viewer debounces, and every rebuild costs a keyframe.
-        let base = match shared.view_size.load(Ordering::SeqCst) {
+        // fewer pixels puts more bits into each one. The encode size tracks ONLY
+        // the viewer window size (never the bandwidth estimate — V2 removed V1's
+        // resolution ladder, which flapped the image between scales); a
+        // constrained link is absorbed by the bitrate, not the resolution.
+        // Rebuild only on a material change; the viewer debounces, and every
+        // rebuild costs a keyframe.
+        let want = match shared.view_size.load(Ordering::SeqCst) {
             0 => (cap_w, cap_h),
             v => {
                 let (vw, vh) = ((v >> 32) as u32, v as u32);
                 fit_within((vw, vh), (cap_w, cap_h))
             }
         };
-        // Spend congestion on resolution: scale the viewer-sized target down the
-        // ladder. `fit_within` keeps the source aspect, forbids upscaling and
-        // rounds to even dimensions. At index 0 the scale is 1.0 (a no-op).
-        let scale = RESOLUTION_LADDER[res_step];
-        let scaled = (
-            (base.0 as f32 * scale).round() as u32,
-            (base.1 as f32 * scale).round() as u32,
-        );
-        let want = fit_within(scaled, (cap_w, cap_h));
         if want != encoder_size && want.0 >= 2 && want.1 >= 2 && rejected_size != Some(want) {
             tracing::info!(
                 "host: re-encoding at {}x{} (was {}x{})",

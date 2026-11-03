@@ -50,7 +50,8 @@ pub(crate) struct Shared {
     /// (instant) instead of the host's round-trip-delayed out-of-band echo.
     pub control: AtomicBool,
     /// Test hook (`test-hooks` feature only): the host's current encode size,
-    /// `w << 32 | h`, so the loopback can watch the resolution ladder step.
+    /// `w << 32 | h`, so the loopback can assert it stays full resolution as the
+    /// link varies (V2 has no resolution ladder).
     #[cfg(feature = "test-hooks")]
     pub encode_dims: AtomicU64,
     /// Test hook (`test-hooks` feature only): a forced bandwidth estimate in bps
@@ -287,8 +288,7 @@ pub(crate) fn begin_host(engine: &Engine, peer: String, permission: Permission) 
         let stop_m = stop.clone();
         let ui = engine.ui_sender();
         spawn_or_abort!(engine, stop, threads, "host-media", move || {
-            if let Err(e) =
-                host_media_loop(media, frame_tx, cursor_tx, bitrate, link, force_key, stop_m)
+            if let Err(e) = host_media_loop(media, frame_tx, cursor_tx, bitrate, force_key, stop_m)
             {
                 tracing::warn!("host media loop ended: {e}");
                 let _ = ui.send(crate::UiEvent::Toast(format!(
@@ -740,7 +740,7 @@ impl Session {
             .as_ref()
             .map(|h| h.bitrate.load(Ordering::SeqCst))
     }
-    /// The raw bandwidth estimate (bps) driving the ladder, or `None` (viewer).
+    /// The raw bandwidth estimate (bps), or `None` on a viewer session.
     pub(crate) fn raw_link_bps(&self) -> Option<u32> {
         self.hooks.as_ref().map(|h| h.link.load(Ordering::SeqCst))
     }

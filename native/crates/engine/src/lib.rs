@@ -883,7 +883,7 @@ impl Engine {
             .and_then(|s| s.encoder_target_bps())
     }
 
-    /// The host session's raw bandwidth estimate (bps) driving the ladder.
+    /// The host session's raw bandwidth estimate (bps).
     #[doc(hidden)]
     pub fn test_raw_link_bps(&self) -> Option<u32> {
         self.session.lock().as_ref().and_then(|s| s.raw_link_bps())

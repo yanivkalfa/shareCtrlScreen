@@ -19,12 +19,14 @@ use super::{serialize, Shared, DESIRED_BITRATE};
 /// take exactly the same path.
 ///
 /// Two outputs come from the one estimate:
-/// * `link` — the RAW capacity, unfloored, for the resolution/fps ladder in the
-///   media thread: it needs the true estimate to decide how small an image the
-///   link can carry (see [`crate::tuning::resolution_step`]).
+/// * `link` — the RAW capacity, unfloored: the telemetry / test-observation value
+///   (the loopback asserts on it). V2 has no resolution ladder, so nothing steers
+///   the encode size from it; it records what the estimate actually read.
 /// * `bitrate` — the encoder's CBR target, the estimate clamped into
 ///   `[MIN_BITRATE, TARGET_BITRATE]` (see [`crate::tuning::encoder_target`]), so
 ///   the encoder FOLLOWS the estimate down instead of overshooting a slow link.
+///   This is the ONLY thing the link estimate changes — a constrained link gets a
+///   softer but STEADY full-resolution picture.
 ///
 /// A 15% hysteresis on the target keeps estimate jitter from becoming visible
 /// quality flicker.
@@ -91,14 +93,14 @@ pub(super) struct Driver {
     /// on the wire, so the first *deliverable* frame must restart the decoder.
     pub(super) force_key: Option<Arc<AtomicBool>>,
     /// Host: the encoder's CBR target — the BWE estimate clamped to
-    /// `[MIN_BITRATE, TARGET_BITRATE]`. It FOLLOWS the estimate down to a low
-    /// floor; sharpness on a constrained link is kept by shrinking the encode
-    /// resolution, not by holding the bitrate up (see `crate::tuning`).
+    /// `[MIN_BITRATE, TARGET_BITRATE]`. It FOLLOWS the estimate down to a low floor
+    /// and back up; this is the ONLY thing a constrained link changes — the encode
+    /// resolution stays full, so the picture softens but stays steady (V2 removed
+    /// V1's resolution ladder — see `crate::tuning`).
     pub(super) bitrate: Option<Arc<std::sync::atomic::AtomicU32>>,
-    /// Host: the RAW measured link capacity from BWE, unfloored. The media thread
-    /// drives the resolution/fps ladder from THIS — the true capacity decides how
-    /// small an image the link can carry, and below the smallest step how far the
-    /// frame rate must drop so egress matches the link instead of overshooting.
+    /// Host: the RAW measured link capacity from BWE, unfloored. Recorded for
+    /// telemetry and loopback observation; V2 does not steer the encode size from
+    /// it (no resolution ladder), so it only tracks what the estimate read.
     pub(super) link: Option<Arc<std::sync::atomic::AtomicU32>>,
     /// Notify the UI + reset the role when the transport dies unexpectedly (the
     /// driver thread has no `&Engine`). This is the fix for "you get disconnected
@@ -626,10 +628,10 @@ pub(super) fn transport_driver(d: Driver) {
                         }
                         Inbound::BweEstimate(bps) => {
                             last_est = bps;
-                            // Steer the encoder (clamped) and the ladder (raw) from
-                            // the one estimate. While a test is holding the link at
-                            // a fixed value, the real estimate is ignored so the
-                            // scenario is deterministic (see `apply_bwe`).
+                            // Steer the encoder bitrate (clamped) and record the raw
+                            // estimate from the one value. While a test is holding
+                            // the link at a fixed value, the real estimate is ignored
+                            // so the scenario is deterministic (see `apply_bwe`).
                             if !bwe_overridden(&shared) {
                                 apply_bwe(bps, &bitrate, &link_bw);
                             }

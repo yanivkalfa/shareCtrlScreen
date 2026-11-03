@@ -62,6 +62,7 @@
 | M13 macOS toolbar drawer not shown (reveal fires, strip empty) | **done** (Opus, Opus-reviewed, merged bcf7b6f; type-checked for aarch64-apple-darwin, device-pending checklists/M13.md) | Root cause: `apply_layout` positioned the hosted layer's 40px gap with the parent *view*'s `isFlipped`, but a hosted layer's frame lives in the parent *layer*'s coordinate space, whose geometry flip is independent (wry: unflipped view, geometry-flipped WKWebView layer) — so the gap opened at the wrong visual edge and the video kept covering the toolbar. Fix (view.rs only; shared reveal.rs untouched): drive the layer frame from the parent layer's own `isGeometryFlipped`, so the strip is always at the visual top. Secondary: ignore `mouseExited` reveals mapped more than one bar height above the top (the app.log's y≈-470/-1025 artifacts). M12 reveal logging kept |
 | U3 Linux .deb/.rpm cannot self-update | **done** `0c99ec3` (Opus, Opus-reviewed; Rust lane-proven windows+wsl incl. loopback×3 + deny, UI + device-pending checklists/U3.md) | ROOT CAUSE: the feed serves an AppImage only, so a .deb/.rpm install downloads a payload whose type mismatches the install and the updater rejects it ("invalid updater binary format"). Fix: pure `update_capability(is_windows, is_macos, appimage)` → `SelfInstall`/`ManualDownload` (AppImage-mount detection mirrors autostart's `choose_exe`: `$APPIMAGE` + `$APPDIR` + exe under the mount, so a `.deb` launched from inside another AppImage is not mistaken for one); `UpdateInfo` gains `selfUpdatable` + `downloadUrl`; `updater_install` early-returns for a packaged install (never attempts the install); UI swaps "Update & restart" for a "Download update" link to the releases page (opener = `open` crate `#[tauri::command]`). Windows/macOS/AppImage unchanged |
 | V1 host overshoots a congested link (video stutter) | **done** (Opus, Opus-reviewed, merged 003fbf8; loopback proves encoder tracks BWE down+up; on-screen smoothness device-pending checklists/V1.md) | ROOT CAUSE (investigation): July 78cd049 raised MIN_BITRATE 400k→2.5M + DESIRED→9M + a raw-BWE source pacer → encoder wont follow BWE down → overshoot→loss→BWE collapse (65↔3700), unpaced keyframe bursts. Fix (As built): MIN_BITRATE→500k + DESIRED→8M so the encoder follows BWE down; a hysteretic resolution ladder (1.0/0.75/0.5/0.33) spends degradation on encode size, fps drops only below the smallest step; the source pacer is removed (str0m paces egress) and forced IDRs no longer bypass it. Owner: Windows went slow when the service came in (lost the fast path → tipped the latent overshoot); Mac/Linux slow from the start |
+| V2 remove the resolution ladder (constant soften/re-sharpen blur) | **in review** (branch `task/V2`, Opus; lane-proven Windows + WSL, device-pending per checklists/V2.md) | V1's `RESOLUTION_LADDER [1.0,0.75,0.5,0.33]` scaled the ENCODE RESOLUTION from the BWE: on a noisy/good link it scaled down and oscillated between steps → the owner's "ever blurring and focusing on things that don't change", unusable on all platforms incl. Windows. Fix (As built): remove the ladder entirely — the encoder ALWAYS encodes at the full `fit_within(view_size)` resolution; the encode size changes only on a real viewer-window resize, never from BWE. KEPT V1's proven-smooth core: `encoder_target()`=clamp(bwe,500k,8M) so the BITRATE still follows BWE down+up, `apply_bwe`, the removed source pacer, no keyframe-pacer-bypass. fps is always `MAX_FPS` (30) now there is no ladder bottom. |
 | W9 Alt+Tab on a service host | **blocked: need controller app.log** | host UIAccess granted + injects reserved shortcuts, yet Alt+Tab does not switch → controlling-side capture/forward issue (keyhook on a Windows controller, or the Mac tap) |
 | T4 Wayland CI | **done** (Haiku, Opus-reviewed; jobs unverified until pushed; GNOME portal tests are device-pass items) | `native-ci.yml` jobs `wayland-sway` (ubuntu-24.04: sway + xdg-desktop-portal-wlr + pipewire + wireplumber; runs L5 `wayland_surface`, L1 `portal_capture --ignored`, and L6 `input::tests` minus uinput and `xtest_*`) and `wayland-gnome` (ubuntu-24.04: mutter 46 + xdg-desktop-portal-gnome; proves the stack, runs no test: the consent dialog has no headless pre-authorization, so the libei and GNOME portal-capture tests are device-pass items). Scripts in `.github/wayland/`. Local (lane, WSL): `wayland_surface` PASS (T4-02); `input::tests` wlroots and EIS pass, uinput fails under REQUIRED as designed (T4-03). Owner verification after the push: see the T4 card |
 | L5 video surface | **done** (Opus, Opus-reviewed; device-pending per checklists/L5.md) | X11: child window of the GTK toplevel on our own x11rb connection, XShape reveal clip, XDND drops via `XdndProxy`, Expose → redraw of the last frame. Wayland: the spike's area+video subsurface tree on GDK's connection (re-attached when GDK re-creates the toplevel surface), `wp_viewporter` crop + fractional scale, drops through GDK's own data device (sink window); decision-#3 separate window when there is no `wp_viewporter` or `SHARECTRL_VIDEO_WINDOW=separate`. Keys from the GTK toplevel on both (keymap: XKB − 8 = evdev). One wgpu presenter (Vulkan, GL fallback) over `surface-wgpu`. Headless tests: `tests/x11_surface.rs` (Xvfb), `tests/wayland_surface.rs` (headless sway). **Device-pending** (checklists/L5.md) |
@@ -814,6 +815,41 @@ I1..I4 after all lanes (hardware validation)
   viewer's pixels: the MOCK encoder passes the source frame's dimensions through unchanged (a real encoder
   resamples to the configured size), so the on-screen resolution drop is device-only (checklists/V1.md).
   The existing 7 loopback tests and the full workspace suite stay green on Windows and WSL.
+
+### V2 — Remove the resolution ladder; restore sharp, STEADY full-resolution video  (size S, engine only; owner report 2026-11-03)
+* Problem: V1's resolution ladder (shipped 2.1.8) made the picture unusable — "badly blurry and ever
+  blurring and focusing on things that don't change" on ALL platforms including a good Windows link.
+  Root cause: `RESOLUTION_LADDER` scaled the ENCODE RESOLUTION from the bandwidth estimate; on a noisy or
+  merely-good estimate it scaled the image down and oscillated between ladder steps, so the picture
+  constantly softened and re-sharpened. V1's OTHER changes were good (encoder follows BWE down in BITRATE,
+  no hand-rolled source pacer, no keyframe-pacer-bypass) — that is the proven-smooth model.
+* **As built (branch `task/V2`, Opus; lane-proven on Windows + WSL, device-pending per checklists/V2.md; NO
+  platform-api change; engine crate only):** Removed ONLY the resolution scaling; kept everything else V1
+  did.
+  REMOVED:
+  - `tuning.rs`: `RESOLUTION_LADDER`, `LADDER_DOWN`, `LADDER_UP`, `resolution_step()`, `target_fps()`, and
+    `MIN_FPS` (only `target_fps` referenced it). Deleted the three ladder unit tests
+    (`resolution_ladder_steps_down…`, `resolution_ladder_is_hysteretic`, `resolution_step_is_monotonic…`,
+    `fps_drops_only_below_the_smallest_step…`).
+  - `media/host.rs`: the `res_step` state, the per-frame `link`/`resolution_step`/`target_fps` reads, and
+    the `RESOLUTION_LADDER[res_step]` scaling of the encode size. The encode target is now just
+    `fit_within(view_size)` — the FULL viewer-fit size. Dropped the now-unused `link` parameter from
+    `host_media_loop` (and its one call site in `session/mod.rs`); `link` is still computed in the driver
+    for telemetry/test observation.
+  KEPT (the smoothness):
+  - `encoder_target(bwe) = bwe.clamp(MIN_BITRATE, TARGET_BITRATE)` and `driver::apply_bwe` — the encoder
+    BITRATE still follows BWE down to the 500 k floor and back up. `MIN_BITRATE = 500_000`,
+    `TARGET_BITRATE = 8_000_000`, `DESIRED_BITRATE = TARGET`, `MAX_FPS = 30` all unchanged.
+  - No source pacer re-introduced; no 2.5 M bitrate pin; forced IDRs still ride str0m's pacer
+    (`MIN_KEYFRAME_GAP`, PLI handling unchanged). The `test-hooks` feature + BWE injector + `encode_dims`
+    observation are kept.
+  - Frame rate: re-added `MAX_FPS_INTERVAL` to `tuning.rs`; the host always paces at `MAX_FPS` (30) — the
+    ladder-bottom fps drop was only reachable at the smallest resolution step, which no longer exists.
+  Tests: `tuning.rs` keeps the `encoder_target_tracks_bwe_but_clamps` unit test. The loopback test
+  `constrained_link_tracks_bwe_down_and_recovers` was changed: it still drives 300 k → 2 M → 6 M via the
+  `test-hooks` BWE injector and asserts the BITRATE tracks down to the floor and back up and frames keep
+  flowing with no link-trouble, but now asserts the encode size stays FULL (640×360) throughout instead of
+  stepping down/recovering. All other engine/loopback tests stay green on Windows and WSL.
 
 ### D10 — Viewer cursor feels laggy on a high-latency link: draw it at the LOCAL pointer, hide the OS cursor  (size M, all viewer OSes; owner report 2026-11-02)
 * Problem (diagnosed with the owner from the controller screen): when controlling over a relayed/high-RTT

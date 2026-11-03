@@ -307,6 +307,60 @@ fn cursor_should_hide() -> bool {
         && FOCUSED.load(Ordering::Relaxed)
 }
 
+/// Task D11: re-evaluate whether the OS pointer is physically over the video's
+/// client area and, if so, mark it inside and refresh the predicted position.
+///
+/// `POINTER_INSIDE` is maintained by `WM_MOUSEMOVE` / `WM_MOUSELEAVE`, so after
+/// a focus change or a control toggle with no mouse move since, it can be stuck
+/// `false` even though the pointer sits over the video — which drops the drawn
+/// sprite to the stale host position until the next move. Called on focus
+/// regain and when control turns on so the sprite tracks the local pointer at
+/// once. Only ever SETS inside (never clears it): leaving is `WM_MOUSELEAVE`'s job.
+fn reevaluate_pointer_inside(hwnd: HWND) {
+    use windows::Win32::Foundation::POINT;
+    // SAFETY: valid child HWND; GetCursorPos/ScreenToClient/GetClientRect read only.
+    unsafe {
+        let mut pt = POINT::default();
+        if windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt).is_err() {
+            return;
+        }
+        // Screen → this window's client coordinates.
+        if !windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt).as_bool() {
+            return;
+        }
+        let mut rc = RECT::default();
+        if GetClientRect(hwnd, &mut rc).is_err() {
+            return;
+        }
+        // Over the revealed toolbar strip the pointer belongs to the web view
+        // (its mouse messages go to the sibling), so treat that as outside.
+        let bar = REVEAL_OFFSET.load(Ordering::SeqCst);
+        let inside =
+            pt.x >= rc.left && pt.x < rc.right && pt.y >= bar.max(rc.top) && pt.y < rc.bottom;
+        if !inside {
+            return;
+        }
+        let (nx, ny) = normalize_client(hwnd, pt.x as f64, pt.y as f64);
+        if let Ok(mut p) = LAST_POS.lock() {
+            *p = (nx, ny);
+        }
+        POINTER_INSIDE.store(true, Ordering::Relaxed);
+        // Ask for one WM_MOUSELEAVE so we still learn when it next leaves,
+        // exactly as WM_MOUSEMOVE does on entry.
+        if !LEAVE_TRACKED.swap(true, Ordering::Relaxed) {
+            let mut tme = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            if TrackMouseEvent(&mut tme).is_err() {
+                LEAVE_TRACKED.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// Apply the OS cursor: hidden (null) or the standard arrow. Call only on the
 /// UI thread (a wndproc handler), where `SetCursor` affects our window.
 fn apply_os_cursor(hidden: bool) {
@@ -655,12 +709,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // Task D10: refresh the cursor now that control / inside / focus
         // changed, without waiting for the next mouse move.
         WM_REFRESH_CURSOR => {
+            // Task D11: control may have just turned ON while the pointer was
+            // already sitting over the video (no move since), so re-evaluate
+            // `POINTER_INSIDE` here or the sprite would stay at the host spot.
+            if CURSOR_CONTROL.load(Ordering::Relaxed) {
+                reevaluate_pointer_inside(hwnd);
+            }
             apply_os_cursor(cursor_should_hide());
             return LRESULT(0);
         }
         // Task D10: regained focus — re-hide if still controlling over the video.
         WM_SETFOCUS => {
             FOCUSED.store(true, Ordering::Relaxed);
+            // Task D11: on focus regain the pointer may already be over the video
+            // with no move since the focus loss, leaving `POINTER_INSIDE` stuck
+            // `false`; re-evaluate so the sprite doesn't drop to the host spot.
+            reevaluate_pointer_inside(hwnd);
             apply_os_cursor(cursor_should_hide());
             return LRESULT(0);
         }

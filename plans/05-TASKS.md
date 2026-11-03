@@ -52,6 +52,8 @@
 | M12 take every Cmd shortcut (macOS viewer) | **done** (Opus, Opus-reviewed, merged 99ed737; type-checked for aarch64-apple-darwin, device-pending) | M6 tap takes every Cmd chord + Ctrl+arrows while the video has the keyboard; Cmd+Q stays local (tap and key monitor); Force Quit / Lock Screen never claimed; every modifier synchronised before a taken key; hook keys now share the surface's FIFO input channel (D8 ordering risk closed); focus loss releases at once. Also: toolbar-reveal diagnostics + layer-frame sync + full-screen cover (owner's "top edge does nothing"). **Device-pending** (checklists/M6.md §6–§7) |
 | D9 host cursor sprite on the viewer | **done** (Opus, Opus-reviewed; device-pending I1–I3: real cursor images incl. I-beam in a terminal) | additive cursor-shape message, host sends on change, viewer draws the real sprite at position−hotspot in both presenters; replaces the synthetic triangle |
 | D10 viewer cursor lag on a high-RTT link (draw at local pointer + hide OS cursor) | **done** `da65e25` (Opus, Opus-reviewed; Windows+WSL lane green incl. loopback×3, platform-macos aarch64 type-checked; device-pending I1–I3) | capture already keeps the cursor out of the video; the drawn sprite followed the host out-of-band echo (a round trip behind) while the local OS cursor was instant → two cursors. Fixed: the sprite is drawn at the LOCAL pointer when controlling and over the video (client-side prediction), and the OS cursor is hidden over the video; SHAPE stays the host's (D9) |
+| D11 controller cursor freezes between video frames (decouple drawn cursor from frame arrival) | **done** `363afab` (Opus, Opus-reviewed; Windows + WSL lane green incl. loopback×3, platform-macos aarch64 type-checked; device-pending checklists/D11.md; NO platform-api change) | D10 made it visible: on a static host screen few/no frames arrive, but the drawn sprite only repainted inside the decoded-frame branch, so the local pointer froze then snapped forward. Fixed: the newest decoded `Frame` is held and the idle tick (~16 ms) re-presents it with the CURRENT cursor when the cursor moved; `cursor_position` no longer vanishes on a momentary host-cursor blip while controlling (always draws at the local pointer); Windows `pointer_inside` re-evaluated on focus regain / control-on so the sprite doesn't drop to the stale host spot |
+| D12 black screen after closing Settings mid-session (repaint the surface on hidden→shown) | **done** `17535dd` (Opus, orchestrator-reviewed; Windows + WSL lane green incl. loopback×3 with `test-hooks`, platform-macos aarch64 type-checked + clippy; device-pending checklists/D12.md; NO platform-api change) | opening Settings mid-session hides the video (`set_video_visible(false)` → `surface.hide()`), closing re-shows it; but the present loop only paints on a new decoded frame (or a cursor move, D11), so on a STATIC host screen the re-shown surface stayed BLACK until the next frame. Fixed: a one-shot `Shared.repaint_requested` flag set by `set_video_visible(true)` (via `session::request_repaint`); the idle tick re-presents the held `last_frame` once regardless of cursor movement (or requests a keyframe if nothing has decoded yet). Host unaffected (no viewer `shared`) |
 | W4 installer bundles + registers the SYSTEM service | **done** (Opus, Opus-reviewed, merged d0119b4; Rust lane-proven, installer by new CI job + machine-A smoke pending; device pass checklists/W4.md) | NSIS hooks install/start/stop/uninstall `sharectrl-service.exe` next to `sharectrl.exe`; one host instance rule; CI silent install/upgrade/uninstall job. Acceptance narrowed: service setup + one instance + standalone asset; elevated-window control is NOT a W4 claim |
 | W5 UIAccess (Alt+Tab / Win key passthrough) | **done** (Opus, Opus-reviewed; device-pending checklists/W5.md: Alt+Tab/Win via the service) | route (a) only: the service sets `TokenUIAccess` (SeTcb) on a duplicate of the host token; `--print-uiaccess`; startup log line; fallback launches without the flag and logs why. Signed route deferred to W6 (see the card) |
 | W7 uninstaller removes the whole install dir (service log leftover) | **done** (Opus, Opus-reviewed, merged 03d98af; proven by the windows-installer CI job on push) | first windows-installer CI run failed only on uninstall-clean: `sharectrl-service.log` left in Program Files; RMDir /r $INSTDIR in POSTUNINSTALL |
@@ -61,6 +63,7 @@
 | M13 macOS toolbar drawer not shown (reveal fires, strip empty) | **done** (Opus, Opus-reviewed, merged bcf7b6f; type-checked for aarch64-apple-darwin, device-pending checklists/M13.md) | Root cause: `apply_layout` positioned the hosted layer's 40px gap with the parent *view*'s `isFlipped`, but a hosted layer's frame lives in the parent *layer*'s coordinate space, whose geometry flip is independent (wry: unflipped view, geometry-flipped WKWebView layer) — so the gap opened at the wrong visual edge and the video kept covering the toolbar. Fix (view.rs only; shared reveal.rs untouched): drive the layer frame from the parent layer's own `isGeometryFlipped`, so the strip is always at the visual top. Secondary: ignore `mouseExited` reveals mapped more than one bar height above the top (the app.log's y≈-470/-1025 artifacts). M12 reveal logging kept |
 | U3 Linux .deb/.rpm cannot self-update | **done** `0c99ec3` (Opus, Opus-reviewed; Rust lane-proven windows+wsl incl. loopback×3 + deny, UI + device-pending checklists/U3.md) | ROOT CAUSE: the feed serves an AppImage only, so a .deb/.rpm install downloads a payload whose type mismatches the install and the updater rejects it ("invalid updater binary format"). Fix: pure `update_capability(is_windows, is_macos, appimage)` → `SelfInstall`/`ManualDownload` (AppImage-mount detection mirrors autostart's `choose_exe`: `$APPIMAGE` + `$APPDIR` + exe under the mount, so a `.deb` launched from inside another AppImage is not mistaken for one); `UpdateInfo` gains `selfUpdatable` + `downloadUrl`; `updater_install` early-returns for a packaged install (never attempts the install); UI swaps "Update & restart" for a "Download update" link to the releases page (opener = `open` crate `#[tauri::command]`). Windows/macOS/AppImage unchanged |
 | V1 host overshoots a congested link (video stutter) | **done** (Opus, Opus-reviewed, merged 003fbf8; loopback proves encoder tracks BWE down+up; on-screen smoothness device-pending checklists/V1.md) | ROOT CAUSE (investigation): July 78cd049 raised MIN_BITRATE 400k→2.5M + DESIRED→9M + a raw-BWE source pacer → encoder wont follow BWE down → overshoot→loss→BWE collapse (65↔3700), unpaced keyframe bursts. Fix (As built): MIN_BITRATE→500k + DESIRED→8M so the encoder follows BWE down; a hysteretic resolution ladder (1.0/0.75/0.5/0.33) spends degradation on encode size, fps drops only below the smallest step; the source pacer is removed (str0m paces egress) and forced IDRs no longer bypass it. Owner: Windows went slow when the service came in (lost the fast path → tipped the latent overshoot); Mac/Linux slow from the start |
+| V2 remove the resolution ladder (constant soften/re-sharpen blur) | **done** `36d9cc8` (Opus, Opus-reviewed; lane-proven Windows + WSL, device-pending per checklists/V2.md) | V1's `RESOLUTION_LADDER [1.0,0.75,0.5,0.33]` scaled the ENCODE RESOLUTION from the BWE: on a noisy/good link it scaled down and oscillated between steps → the owner's "ever blurring and focusing on things that don't change", unusable on all platforms incl. Windows. Fix (As built): remove the ladder entirely — the encoder ALWAYS encodes at the full `fit_within(view_size)` resolution; the encode size changes only on a real viewer-window resize, never from BWE. KEPT V1's proven-smooth core: `encoder_target()`=clamp(bwe,500k,8M) so the BITRATE still follows BWE down+up, `apply_bwe`, the removed source pacer, no keyframe-pacer-bypass. fps is always `MAX_FPS` (30) now there is no ladder bottom. |
 | W9 Alt+Tab on a service host | **blocked: need controller app.log** | host UIAccess granted + injects reserved shortcuts, yet Alt+Tab does not switch → controlling-side capture/forward issue (keyhook on a Windows controller, or the Mac tap) |
 | T4 Wayland CI | **done** (Haiku, Opus-reviewed; jobs unverified until pushed; GNOME portal tests are device-pass items) | `native-ci.yml` jobs `wayland-sway` (ubuntu-24.04: sway + xdg-desktop-portal-wlr + pipewire + wireplumber; runs L5 `wayland_surface`, L1 `portal_capture --ignored`, and L6 `input::tests` minus uinput and `xtest_*`) and `wayland-gnome` (ubuntu-24.04: mutter 46 + xdg-desktop-portal-gnome; proves the stack, runs no test: the consent dialog has no headless pre-authorization, so the libei and GNOME portal-capture tests are device-pass items). Scripts in `.github/wayland/`. Local (lane, WSL): `wayland_surface` PASS (T4-02); `input::tests` wlroots and EIS pass, uinput fails under REQUIRED as designed (T4-03). Owner verification after the push: see the T4 card |
 | L5 video surface | **done** (Opus, Opus-reviewed; device-pending per checklists/L5.md) | X11: child window of the GTK toplevel on our own x11rb connection, XShape reveal clip, XDND drops via `XdndProxy`, Expose → redraw of the last frame. Wayland: the spike's area+video subsurface tree on GDK's connection (re-attached when GDK re-creates the toplevel surface), `wp_viewporter` crop + fractional scale, drops through GDK's own data device (sink window); decision-#3 separate window when there is no `wp_viewporter` or `SHARECTRL_VIDEO_WINDOW=separate`. Keys from the GTK toplevel on both (keymap: XKB − 8 = evdev). One wgpu presenter (Vulkan, GL fallback) over `surface-wgpu`. Headless tests: `tests/x11_surface.rs` (Xvfb), `tests/wayland_surface.rs` (headless sway). **Device-pending** (checklists/L5.md) |
@@ -814,6 +817,41 @@ I1..I4 after all lanes (hardware validation)
   resamples to the configured size), so the on-screen resolution drop is device-only (checklists/V1.md).
   The existing 7 loopback tests and the full workspace suite stay green on Windows and WSL.
 
+### V2 — Remove the resolution ladder; restore sharp, STEADY full-resolution video  (size S, engine only; owner report 2026-11-03)
+* Problem: V1's resolution ladder (shipped 2.1.8) made the picture unusable — "badly blurry and ever
+  blurring and focusing on things that don't change" on ALL platforms including a good Windows link.
+  Root cause: `RESOLUTION_LADDER` scaled the ENCODE RESOLUTION from the bandwidth estimate; on a noisy or
+  merely-good estimate it scaled the image down and oscillated between ladder steps, so the picture
+  constantly softened and re-sharpened. V1's OTHER changes were good (encoder follows BWE down in BITRATE,
+  no hand-rolled source pacer, no keyframe-pacer-bypass) — that is the proven-smooth model.
+* **As built (branch `task/V2`, Opus; lane-proven on Windows + WSL, device-pending per checklists/V2.md; NO
+  platform-api change; engine crate only):** Removed ONLY the resolution scaling; kept everything else V1
+  did.
+  REMOVED:
+  - `tuning.rs`: `RESOLUTION_LADDER`, `LADDER_DOWN`, `LADDER_UP`, `resolution_step()`, `target_fps()`, and
+    `MIN_FPS` (only `target_fps` referenced it). Deleted the three ladder unit tests
+    (`resolution_ladder_steps_down…`, `resolution_ladder_is_hysteretic`, `resolution_step_is_monotonic…`,
+    `fps_drops_only_below_the_smallest_step…`).
+  - `media/host.rs`: the `res_step` state, the per-frame `link`/`resolution_step`/`target_fps` reads, and
+    the `RESOLUTION_LADDER[res_step]` scaling of the encode size. The encode target is now just
+    `fit_within(view_size)` — the FULL viewer-fit size. Dropped the now-unused `link` parameter from
+    `host_media_loop` (and its one call site in `session/mod.rs`); `link` is still computed in the driver
+    for telemetry/test observation.
+  KEPT (the smoothness):
+  - `encoder_target(bwe) = bwe.clamp(MIN_BITRATE, TARGET_BITRATE)` and `driver::apply_bwe` — the encoder
+    BITRATE still follows BWE down to the 500 k floor and back up. `MIN_BITRATE = 500_000`,
+    `TARGET_BITRATE = 8_000_000`, `DESIRED_BITRATE = TARGET`, `MAX_FPS = 30` all unchanged.
+  - No source pacer re-introduced; no 2.5 M bitrate pin; forced IDRs still ride str0m's pacer
+    (`MIN_KEYFRAME_GAP`, PLI handling unchanged). The `test-hooks` feature + BWE injector + `encode_dims`
+    observation are kept.
+  - Frame rate: re-added `MAX_FPS_INTERVAL` to `tuning.rs`; the host always paces at `MAX_FPS` (30) — the
+    ladder-bottom fps drop was only reachable at the smallest resolution step, which no longer exists.
+  Tests: `tuning.rs` keeps the `encoder_target_tracks_bwe_but_clamps` unit test. The loopback test
+  `constrained_link_tracks_bwe_down_and_recovers` was changed: it still drives 300 k → 2 M → 6 M via the
+  `test-hooks` BWE injector and asserts the BITRATE tracks down to the floor and back up and frames keep
+  flowing with no link-trouble, but now asserts the encode size stays FULL (640×360) throughout instead of
+  stepping down/recovering. All other engine/loopback tests stay green on Windows and WSL.
+
 ### D10 — Viewer cursor feels laggy on a high-latency link: draw it at the LOCAL pointer, hide the OS cursor  (size M, all viewer OSes; owner report 2026-11-02)
 * Problem (diagnosed with the owner from the controller screen): when controlling over a relayed/high-RTT
   link the pointer "lags behind". The controlled machine's own cursor moves smoothly (input arrives fine),
@@ -921,6 +959,102 @@ I1..I4 after all lanes (hardware validation)
     (<https://docs.rs/winit/latest/winit/window/struct.Window.html#method.set_cursor_visible>); X11
     transparent cursor via an empty pixmap; client-side cursor prediction (AnyDesk/Microsoft RDP) as the
     rationale for drawing at the local pointer.
+
+### D11 — Controller cursor freezes between video frames (decouple the drawn cursor from frame arrival)  (size M, all viewer OSes; owner report after D10)
+* Problem (root cause, confirmed): the viewer repainted the drawn cursor sprite ONLY when a new video
+  frame was presented — the present lived solely inside the decoded-frame branch, and the
+  `recv_timeout(100 ms)` idle branch did nothing. So on a static host screen (few/no frames) or a starved
+  link the LOCAL pointer kept moving but the sprite was not repainted: it froze and snapped forward when the
+  next frame arrived. D10 made it visible (the sprite follows the local pointer and the OS cursor is hidden,
+  so the gap shows as a dead cursor).
+* Deliverable: repaint the cursor independently of new frames (hold the last frame, re-present it with the
+  current cursor on an idle tick when the cursor moved); fix `cursor_position` so a controlling viewer with
+  the pointer inside never loses the sprite on a momentary host-cursor blip; harden Windows `pointer_inside`
+  against sticking `false` after a focus change / control toggle. No platform-api change.
+* **As built (branch `task/D11`, in review; Windows + WSL lane green incl. loopback×3 with `test-hooks`,
+  platform-macos type-checked for aarch64-apple-darwin; device-pending checklists/D11.md; NO platform-api
+  change — the `Presenter`/`VideoDecoder`/`VideoSurface` traits are untouched):**
+  * **Idle re-present (engine, all OSes)** — `engine/src/media/viewer.rs`. The present loop now holds the
+    newest decoded frame as `last_frame: Option<Frame<'_>>`. The decoded `Frame` borrows the decoder's
+    current surface (valid only until the next `decode`), so `last_frame = None` is set BEFORE the decode
+    path re-borrows the decoder; the held frame is therefore dropped exactly when the decoder is about to
+    overwrite it (no leak, no race — single-threaded loop, the decoder keeps one extra texture alive at
+    most). To store the newest frame without the borrow checker tying the loan across a re-borrow, the
+    batch decode is split: a `for _ in 1..count` reference-only loop (decode to carry references, present
+    nothing), then a single newest-frame block that presents and stores it.
+  * **Cadence** — `recv_timeout` shortened from 100 ms to `IDLE_REPAINT_INTERVAL = 16 ms` (~60 Hz). When
+    frames flow, `recv_timeout` returns at once on the queued data, so this adds NO video latency; only a
+    static/starved stream reaches the timeout branch. The timeout branch re-presents `last_frame` with the
+    CURRENT cursor ONLY when it differs from `last_cursor` (the position of the last present) — so a truly
+    idle screen with a stationary pointer does zero extra GPU work, and a moving pointer tracks at ~60 Hz.
+  * **Reuse** — both the decoded-frame path and the idle path go through one `present_frame(..)` helper
+    (sprite `sync` + `present` + the non-silent render-error logging) and one `current_cursor(..)` helper
+    (D10 position selection + host shape id), so the sprite/size/error behaviour is identical on both. The
+    catch-up/backlog/keyframe-watchdog logic is unchanged (the no-picture watchdog is now the shared
+    `on_no_picture(..)`; decode heartbeat logging is `note_decoded(..)`).
+  * **`cursor_position` blip fix (engine, all OSes)** — previously `(control=true, local=Some, host=None)`
+    returned `None`, so the sprite VANISHED whenever the host's out-of-band cursor report momentarily
+    blipped to absent (a dropped unreliable-channel update, or the host hiding its own cursor) while
+    controlling with the pointer inside. Now: controlling AND `local.is_some()` → ALWAYS the local pointer;
+    otherwise the host position (view-only, or controlling with the pointer not over the surface). On the
+    host path the position is still the visibility-filtered one, so an invisible host cursor still draws
+    nothing in view-only. Unit tests: the new fixed quadrant
+    (`controlling_over_the_video_survives_a_host_cursor_blip`) plus the reworked view-only invisible case;
+    the other three D10 quadrant tests stay green.
+  * **Windows `pointer_inside` hardening** — `render/src/window.rs`. `POINTER_INSIDE` is driven by
+    `WM_MOUSEMOVE`/`WM_MOUSELEAVE`, so after a focus change or control toggle with no mouse move since it
+    could stick `false` and drop the sprite to the stale host position. New `reevaluate_pointer_inside(hwnd)`
+    (`GetCursorPos` → `ScreenToClient` → `GetClientRect`, honouring the revealed-toolbar clip) sets
+    `POINTER_INSIDE = true` and refreshes `LAST_POS` + the `TME_LEAVE` request when the OS pointer is
+    physically over the client area. Called from `WM_SETFOCUS` (focus regain) and from the `WM_REFRESH_CURSOR`
+    handler when `CURSOR_CONTROL` just turned on. It only ever SETS inside — clearing stays `WM_MOUSELEAVE`'s
+    job — so it cannot leave the OS cursor stuck hidden.
+  * **No regression on macOS/Linux** — the idle re-present is in the shared engine loop; those presenters
+    re-present `last_frame` (whose backing surface the decoder still owns, since the held frame keeps it
+    alive) exactly as the decoded path does. macOS/Linux cursor-hide behaviour is untouched.
+  * **Not changed:** platform-api traits, host capture/input/injection, the D9 shape path, the catch-up /
+    backlog / size-report logic, the reveal/toolbar.
+* Acceptance (device, checklists/D11.md): controlling over the relay with the host screen static, the cursor
+  tracks the local pointer smoothly with NO multi-second freeze; correct host shape; view-only still shows the
+  host cursor; nothing vanishes when the host cursor report blips.
+
+### D12 — Black screen after closing Settings mid-session (repaint the video surface on hidden→shown)  (size S, all viewer OSes; owner + friend report 2026-11-03)
+* Problem (root cause, confirmed): during a live VIEWER session, opening Settings calls
+  `openSettingsOverVideo()` → `invoke('set_video_visible', {visible:false})` → `engine.set_video_visible(false)`
+  → `surface.hide()`, and closing calls `set_video_visible(true)` → `surface.show()`. But `show()` does not
+  itself repaint: the present loop (`engine/src/media/viewer.rs`) paints only when a NEW decoded frame arrives
+  (the decoded-frame branch), and D11's idle re-present fires only when the cursor MOVED. So on a STATIC host
+  screen (few/no frames) the re-shown surface stayed BLACK until the next frame or a cursor move. Owner + a
+  friend (Mac controlling Ubuntu) both hit it.
+* Deliverable: on a hidden→shown transition, force the present loop to re-present the last decoded frame
+  immediately. Build on D11's held `last_frame`. No platform-api change.
+* **As built (branch `task/D12`, in review; Windows + WSL lane green incl. loopback×3 with `test-hooks`,
+  platform-macos type-checked + clippy for aarch64-apple-darwin; device-pending checklists/D12.md; NO
+  platform-api change — the `Presenter`/`VideoDecoder`/`VideoSurface` traits are untouched):**
+  * **One-shot repaint signal (engine, all OSes)** — `session/mod.rs`: `Shared` gains
+    `repaint_requested: AtomicBool` (per-session, `Default`-false). `Session` gains `shared: Option<Arc<Shared>>`
+    (the viewer's shared state; `None` on a host session). The viewer session now keeps `shared` alive past the
+    `ViewerMedia` move (clones into the media loop) and stores it on the `Session`. New crate-private
+    `session::request_repaint(engine)` sets the flag through `engine.session.lock()` — mirrors `set_control`.
+  * **Wiring** — `lib.rs` `set_video_visible(true)`: after `s.show()`, calls `session::request_repaint(self)`.
+    On the host this is a no-op twice over: the host typically has no viewer surface, and even if `surface()`
+    is `Some`, `session.shared` is `None` so nothing is signalled.
+  * **Present loop (engine, all OSes)** — `media/viewer.rs` idle-timeout branch now reads-and-clears the flag
+    with `repaint_requested.swap(false)` so it fires exactly once. When `last_frame` is `Some`, it re-presents
+    via the shared `present_frame(..)` when `should_idle_repaint(repaint, cursor, last_cursor)` is true — i.e.
+    on the repaint request REGARDLESS of cursor movement, OR (D11 unchanged) when the cursor moved. When
+    `last_frame` is `None` (nothing decoded yet), a requested repaint asks the host for a keyframe (rate-limited
+    to ~1/s via the existing `last_kf_req`) so a fresh frame arrives to show instead of staying black.
+  * **Covers all hidden→shown sites**: the signal is tied to `set_video_visible(true)` (Settings). The driver's
+    own `s.hide()`/`s.show()` (link-trouble, `driver.rs`) already requests a keyframe on re-show, so a fresh
+    frame repaints there; this change does not regress that path.
+  * **Unit-proven**: `should_idle_repaint` extracted as a pure fn and tested — repaints on a request with a
+    STATIONARY cursor (D12), does NOT repaint without a request and a still cursor (D11), repaints on a moved
+    cursor without a request (D11). The full present loop (real decoder/presenter) is device-verified.
+  * **Not changed:** platform-api traits, D11's held-frame / idle cursor tracking, the decoded-frame present
+    path, the catch-up / backlog / keyframe-watchdog pipeline, the hide behaviour, the host path.
+* Acceptance (device, checklists/D12.md): open Settings during a viewer session and close it → the video
+  reappears instantly, no black screen, even when the host screen is static.
 
 ### U2 — Settings/Update is unreachable while hosting a session  (size XS–S, UI; owner report 2026-11-02)
 * Problem: the Updates control (U1) lives in the Settings modal, opened by the gear button. But the gear

@@ -260,9 +260,21 @@ async fn full_session_over_real_webrtc() {
             s.presented.len(),
             "every frame carries its stamp"
         );
+        // D11: the cursor is repainted between video frames by re-presenting the
+        // LAST decoded frame with the current cursor, so the same stamp can
+        // appear on consecutive presents. A re-present always repeats the newest
+        // decoded frame, so collapsing consecutive duplicates leaves the stream
+        // of DECODED frames — which must still arrive strictly in order (the
+        // catch-up pipeline never reorders or goes backward).
+        let decoded: Vec<u64> = stamps
+            .iter()
+            .enumerate()
+            .filter(|&(i, s)| i == 0 || stamps[i - 1] != *s)
+            .map(|(_, s)| *s)
+            .collect();
         assert!(
-            stamps.windows(2).all(|w| w[0] < w[1]),
-            "frames arrive in order without repeats: {stamps:?}"
+            decoded.windows(2).all(|w| w[0] < w[1]),
+            "decoded frames arrive in order (D11 re-presents de-duplicated): {stamps:?}"
         );
         let first = &s.presented[0];
         assert_eq!((first.width, first.height), (640, 360));
@@ -773,26 +785,26 @@ async fn windows_viewer_ctrl_c_is_cmd_c_on_a_mac_host() {
     viewer.engine.end_session();
 }
 
-// ---- V1: the host follows the bandwidth estimate down, and back up -------------
+// ---- V2: the host follows the bandwidth estimate down in BITRATE, full res -----
 
 /// Drive a constrained-then-recovering link over the real str0m session (via the
 /// `test-hooks` bandwidth injector, since loopback has no congestion of its own)
-/// and prove the V1 fix end to end:
-///   * the encoder's CBR target TRACKS the estimate down to the floor instead of
-///     pinning at the old 2.5 Mbps (the regression) — and tracks a mid value and
-///     back up;
-///   * degradation is spent on RESOLUTION: the host's encode size steps DOWN as
-///     the link falls and back UP as it recovers;
+/// and prove the V2 model end to end:
+///   * the encoder's CBR target TRACKS the estimate down to the ~500 kbps floor
+///     instead of pinning at the old 2.5 Mbps (the regression) — and tracks a mid
+///     value and back up;
+///   * degradation is spent ONLY on bitrate: the host's encode size stays FULL
+///     resolution throughout — V2 removed V1's resolution ladder, so the link
+///     estimate never changes the encode size (that caused the constant
+///     soften/re-sharpen flap);
 ///   * frames keep flowing throughout (no stall) and neither side reports link
 ///     trouble — i.e. no self-sustaining collapse.
 ///
-/// Resolution is asserted from the HOST's configured encode size (the ladder's
-/// real output), not the viewer's presented pixels: the mock encoder passes the
-/// captured frame's dimensions straight through (it does not resample to the
-/// configured size the way a real H.264 encoder does), so the viewer always
-/// decodes at the capture size. The viewer side is therefore checked only for
-/// liveness (frames keep arriving); the actual on-screen resolution drop is
-/// covered by the device checklist (plans/checklists/V1.md).
+/// Resolution is asserted from the HOST's configured encode size: the mock encoder
+/// passes the captured frame's dimensions straight through (it does not resample
+/// the way a real H.264 encoder does), so this watches the size the host actually
+/// configures. The viewer side is checked for liveness (frames keep arriving); the
+/// device checklist (plans/checklists/V2.md) covers on-screen sharpness/steadiness.
 #[cfg(feature = "test-hooks")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn constrained_link_tracks_bwe_down_and_recovers() {
@@ -815,15 +827,24 @@ async fn constrained_link_tracks_bwe_down_and_recovers() {
     .await;
     let observe = |phase: &str| {
         eprintln!(
-            "V1 {phase}: applied={:?} bps, bwe={:?} bps, encode_dims={:?}",
+            "V2 {phase}: applied={:?} bps, bwe={:?} bps, encode_dims={:?}",
             host.engine.test_encoder_target_bps(),
             host.engine.test_raw_link_bps(),
             host.engine.test_encode_dims(),
         );
     };
+    // The encode size must stay FULL (640x360) regardless of the link — V2 spends
+    // degradation on bitrate only, never on resolution.
+    let assert_full_res = |phase: &str| {
+        assert_eq!(
+            host.engine.test_encode_dims(),
+            Some((640, 360)),
+            "{phase}: encode size changed with the link (V1 ladder regression)"
+        );
+    };
 
     // --- constrained: 300 kbps. The target must track DOWN to the ~500 kbps floor
-    // (NOT pin at the old 2.5 Mbps), and the encode size must shrink.
+    // (NOT pin at the old 2.5 Mbps), while the encode size stays full.
     host.engine.test_inject_bwe(300_000);
     eventually(
         "encoder target tracks the link down to the floor",
@@ -840,11 +861,7 @@ async fn constrained_link_tracks_bwe_down_and_recovers() {
         host.engine.test_encoder_target_bps().unwrap() < 2_500_000,
         "regression: target pinned at the old floor instead of tracking BWE"
     );
-    eventually("encode resolution steps down", t, || {
-        host.engine.test_encode_dims().is_some_and(|(w, _)| w < 400)
-    })
-    .await;
-    let small = host.engine.test_encode_dims().unwrap();
+    assert_full_res("constrained");
     observe("constrained");
     // Frames keep flowing while constrained — no stall, no self-sustaining
     // collapse. Count progress from here.
@@ -853,9 +870,11 @@ async fn constrained_link_tracks_bwe_down_and_recovers() {
         viewer.platform.surface.state().presented.len() >= presented_before + 15
     })
     .await;
+    // The resolution never dropped during the constrained phase.
+    assert_full_res("constrained (after frames flowed)");
 
     // --- mid link: 2 Mbps. The target TRACKS the value (proving it is not pinned
-    // at either extreme) and the encode size climbs partway back.
+    // at either extreme); the encode size is still full.
     host.engine.test_inject_bwe(2_000_000);
     eventually("target tracks a mid estimate", t, || {
         host.engine
@@ -863,15 +882,10 @@ async fn constrained_link_tracks_bwe_down_and_recovers() {
             .is_some_and(|b| b.abs_diff(2_000_000) <= 100_000)
     })
     .await;
-    eventually("resolution climbs partway back", t, || {
-        host.engine
-            .test_encode_dims()
-            .is_some_and(|(w, _)| w > small.0)
-    })
-    .await;
+    assert_full_res("mid");
     observe("mid");
 
-    // --- recovered: 6 Mbps. Target and encode size both return to full.
+    // --- recovered: 6 Mbps. Target returns toward the ceiling; encode size full.
     host.engine.test_inject_bwe(6_000_000);
     eventually("encoder target tracks back up", t, || {
         host.engine
@@ -879,10 +893,7 @@ async fn constrained_link_tracks_bwe_down_and_recovers() {
             .is_some_and(|b| b.abs_diff(6_000_000) <= 100_000)
     })
     .await;
-    eventually("encode resolution returns to full", t, || {
-        host.engine.test_encode_dims() == Some((640, 360))
-    })
-    .await;
+    assert_full_res("recovered");
     observe("recovered");
     // The recovered link keeps delivering frames to the viewer too.
     let presented_recovered = viewer.platform.surface.state().presented.len();

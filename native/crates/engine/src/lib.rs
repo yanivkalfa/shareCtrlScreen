@@ -823,6 +823,11 @@ impl Engine {
         if let Some(s) = self.surface() {
             if visible {
                 s.show();
+                // D12: re-showing the surface does NOT repaint it — the present
+                // loop only paints on a new decoded frame (or a cursor move,
+                // D11), so a static host screen stays BLACK until the next
+                // frame. Signal the present loop to repaint the held frame now.
+                session::request_repaint(self);
             } else {
                 s.hide();
             }
@@ -883,7 +888,7 @@ impl Engine {
             .and_then(|s| s.encoder_target_bps())
     }
 
-    /// The host session's raw bandwidth estimate (bps) driving the ladder.
+    /// The host session's raw bandwidth estimate (bps).
     #[doc(hidden)]
     pub fn test_raw_link_bps(&self) -> Option<u32> {
         self.session.lock().as_ref().and_then(|s| s.raw_link_bps())

@@ -873,25 +873,37 @@ async fn constrained_link_tracks_bwe_down_and_recovers() {
     // The resolution never dropped during the constrained phase.
     assert_full_res("constrained (after frames flowed)");
 
-    // --- mid link: 2 Mbps. The target TRACKS the value (proving it is not pinned
-    // at either extreme); the encode size is still full.
+    // --- mid link: 2 Mbps held. V3 smooths the target, so it no longer snaps to
+    // the exact estimate (that 1:1 follow is what made the picture pulse) — a
+    // SUSTAINED mid value moves it up into a mid band and keeps it there. The
+    // encode size is still full.
     host.engine.test_inject_bwe(2_000_000);
-    eventually("target tracks a mid estimate", t, || {
-        host.engine
-            .test_encoder_target_bps()
-            .is_some_and(|b| b.abs_diff(2_000_000) <= 100_000)
-    })
+    eventually(
+        "target rises to a mid band on a sustained mid estimate",
+        t,
+        || {
+            host.engine
+                .test_encoder_target_bps()
+                .is_some_and(|b| (1_300_000..=2_100_000).contains(&b))
+        },
+    )
     .await;
     assert_full_res("mid");
     observe("mid");
 
-    // --- recovered: 6 Mbps. Target returns toward the ceiling; encode size full.
+    // --- recovered: 6 Mbps held. A sustained high estimate raises the target back
+    // toward the ceiling (smoothed, so it climbs over a couple of seconds rather
+    // than snapping); encode size full.
     host.engine.test_inject_bwe(6_000_000);
-    eventually("encoder target tracks back up", t, || {
-        host.engine
-            .test_encoder_target_bps()
-            .is_some_and(|b| b.abs_diff(6_000_000) <= 100_000)
-    })
+    eventually(
+        "encoder target climbs back up on a sustained high estimate",
+        t,
+        || {
+            host.engine
+                .test_encoder_target_bps()
+                .is_some_and(|b| b >= 4_000_000)
+        },
+    )
     .await;
     assert_full_res("recovered");
     observe("recovered");
@@ -903,6 +915,136 @@ async fn constrained_link_tracks_bwe_down_and_recovers() {
     .await;
 
     // No link trouble was ever reported — the fix is smooth, not a collapse.
+    for (who, p) in [("viewer", &viewer), ("host", &host)] {
+        assert_eq!(
+            p.link_trouble.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{who} reported link trouble"
+        );
+    }
+
+    viewer.engine.end_session();
+    eventually("both idle", t, || {
+        host.engine.role() == Role::Idle && viewer.engine.role() == Role::Idle
+    })
+    .await;
+}
+
+/// V3: the encoder bitrate must stay STEADY on a noisy-but-stable link and still
+/// follow a REAL sustained trend. This mirrors the owner's live host log, where
+/// GCC's estimate stabbed between ~500–900 kbps and ~3–4 Mbps every second or two
+/// on a link that was really multi-Mbps capable; V2 applied each swing 1:1, so the
+/// full-resolution picture pulsed blurry→sharp→blurry. The smoothing lives in the
+/// pure `tuning::RateFilter` (unit-tested directly); this proves it end to end over
+/// the real str0m session via the `test-hooks` bandwidth injector.
+///
+/// Phase 1 (OSCILLATING): alternate the injected estimate ~300k↔~4M every ~1 s for
+/// ~18 s and sample the APPLIED encoder target. It must change only a HANDFUL of
+/// times (not once per swing) and stay inside a bounded mid band — i.e. steady, not
+/// pulsing 500↔4000. Phase 2 (SUSTAINED DOWN): hold ~800k and the target must come
+/// down. Phase 3 (SUSTAINED UP): hold ~6M and it must climb back toward the ceiling.
+#[cfg(feature = "test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn noisy_link_stays_steady_but_follows_a_sustained_trend() {
+    let relay = start_relay().await;
+    let host = start_peer("steady-host", &relay);
+    let viewer = start_peer("steady-viewer", &relay);
+    let t = Duration::from_secs(25);
+    eventually("both registered", t, || {
+        host.engine.server_connected() && viewer.engine.server_connected()
+    })
+    .await;
+    viewer.engine.connect_to(host.uuid.clone());
+    eventually("video flowing at full size", t, || {
+        host.engine.test_encode_dims() == Some((640, 360))
+            && !viewer.platform.surface.state().presented.is_empty()
+    })
+    .await;
+
+    // Settle the filter at a known mid value FROM BELOW so the oscillation starts
+    // from a deterministic steady point (not mid-ramp): pull it to the floor, then
+    // let a sustained 2 Mbps raise it to a stable mid target.
+    host.engine.test_inject_bwe(300_000);
+    eventually("pulled to the floor", t, || {
+        host.engine
+            .test_encoder_target_bps()
+            .is_some_and(|b| b <= 700_000)
+    })
+    .await;
+    host.engine.test_inject_bwe(2_000_000);
+    eventually("settled at a mid target", t, || {
+        host.engine
+            .test_encoder_target_bps()
+            .is_some_and(|b| (1_300_000..=1_950_000).contains(&b))
+    })
+    .await;
+
+    // --- Phase 1: oscillate ~300k ↔ ~4M every ~1 s for ~18 s, sampling the applied
+    // target every ~300 ms. The raw link reading must prove the injector really is
+    // swinging; the applied target must NOT.
+    let mut samples: Vec<u32> = Vec::new();
+    let mut raw_seen: Vec<u32> = Vec::new();
+    let mut high = false;
+    let osc_start = Instant::now();
+    let mut next_flip = Instant::now();
+    while osc_start.elapsed() < Duration::from_secs(18) {
+        if Instant::now() >= next_flip {
+            high = !high;
+            host.engine
+                .test_inject_bwe(if high { 4_000_000 } else { 300_000 });
+            next_flip = Instant::now() + Duration::from_secs(1);
+        }
+        if let Some(b) = host.engine.test_encoder_target_bps() {
+            samples.push(b);
+        }
+        if let Some(r) = host.engine.test_raw_link_bps() {
+            raw_seen.push(r);
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    // The injector genuinely swung (raw reading saw both extremes) — otherwise the
+    // steadiness below would be meaningless.
+    assert!(
+        raw_seen.iter().any(|&r| r <= 400_000) && raw_seen.iter().any(|&r| r >= 3_500_000),
+        "raw link reading never swung — the oscillation injector did nothing: {raw_seen:?}"
+    );
+
+    // The applied target changed only a handful of times — NOT once per swing (V2
+    // would have changed ~18 times). And it stayed inside a bounded mid band the
+    // whole time: no 500↔4000 pulsing.
+    let changes = samples.windows(2).filter(|w| w[0] != w[1]).count();
+    assert!(
+        changes <= 4,
+        "applied target pulsed with the noise: {changes} changes across {} samples: {samples:?}",
+        samples.len()
+    );
+    let min = *samples.iter().min().unwrap();
+    let max = *samples.iter().max().unwrap();
+    assert!(
+        min >= 1_000_000 && max <= 3_000_000,
+        "applied target left the steady band under noise: min={min} max={max}"
+    );
+
+    // --- Phase 2: a REAL sustained drop to ~800 kbps must bring the target down.
+    host.engine.test_inject_bwe(800_000);
+    eventually("target follows a sustained drop", t, || {
+        host.engine
+            .test_encoder_target_bps()
+            .is_some_and(|b| b <= 1_200_000)
+    })
+    .await;
+
+    // --- Phase 3: a REAL sustained recovery to ~6 Mbps must bring it back up.
+    host.engine.test_inject_bwe(6_000_000);
+    eventually("target follows a sustained rise", t, || {
+        host.engine
+            .test_encoder_target_bps()
+            .is_some_and(|b| b >= 4_000_000)
+    })
+    .await;
+
+    // No link trouble through any of it — steady, not a collapse.
     for (who, p) in [("viewer", &viewer), ("host", &host)] {
         assert_eq!(
             p.link_trouble.load(std::sync::atomic::Ordering::SeqCst),

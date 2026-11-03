@@ -64,6 +64,7 @@
 | U3 Linux .deb/.rpm cannot self-update | **done** `0c99ec3` (Opus, Opus-reviewed; Rust lane-proven windows+wsl incl. loopback×3 + deny, UI + device-pending checklists/U3.md) | ROOT CAUSE: the feed serves an AppImage only, so a .deb/.rpm install downloads a payload whose type mismatches the install and the updater rejects it ("invalid updater binary format"). Fix: pure `update_capability(is_windows, is_macos, appimage)` → `SelfInstall`/`ManualDownload` (AppImage-mount detection mirrors autostart's `choose_exe`: `$APPIMAGE` + `$APPDIR` + exe under the mount, so a `.deb` launched from inside another AppImage is not mistaken for one); `UpdateInfo` gains `selfUpdatable` + `downloadUrl`; `updater_install` early-returns for a packaged install (never attempts the install); UI swaps "Update & restart" for a "Download update" link to the releases page (opener = `open` crate `#[tauri::command]`). Windows/macOS/AppImage unchanged |
 | V1 host overshoots a congested link (video stutter) | **done** (Opus, Opus-reviewed, merged 003fbf8; loopback proves encoder tracks BWE down+up; on-screen smoothness device-pending checklists/V1.md) | ROOT CAUSE (investigation): July 78cd049 raised MIN_BITRATE 400k→2.5M + DESIRED→9M + a raw-BWE source pacer → encoder wont follow BWE down → overshoot→loss→BWE collapse (65↔3700), unpaced keyframe bursts. Fix (As built): MIN_BITRATE→500k + DESIRED→8M so the encoder follows BWE down; a hysteretic resolution ladder (1.0/0.75/0.5/0.33) spends degradation on encode size, fps drops only below the smallest step; the source pacer is removed (str0m paces egress) and forced IDRs no longer bypass it. Owner: Windows went slow when the service came in (lost the fast path → tipped the latent overshoot); Mac/Linux slow from the start |
 | V2 remove the resolution ladder (constant soften/re-sharpen blur) | **done** `36d9cc8` (Opus, Opus-reviewed; lane-proven Windows + WSL, device-pending per checklists/V2.md) | V1's `RESOLUTION_LADDER [1.0,0.75,0.5,0.33]` scaled the ENCODE RESOLUTION from the BWE: on a noisy/good link it scaled down and oscillated between steps → the owner's "ever blurring and focusing on things that don't change", unusable on all platforms incl. Windows. Fix (As built): remove the ladder entirely — the encoder ALWAYS encodes at the full `fit_within(view_size)` resolution; the encode size changes only on a real viewer-window resize, never from BWE. KEPT V1's proven-smooth core: `encoder_target()`=clamp(bwe,500k,8M) so the BITRATE still follows BWE down+up, `apply_bwe`, the removed source pacer, no keyframe-pacer-bypass. fps is always `MAX_FPS` (30) now there is no ladder bottom. |
+| V3 video quality PULSES (blurry→sharp→blurry on a noisy-but-stable link) | **in review** (branch `task/V3`, Opus; lane-proven Windows + WSL incl. loopback×3 with `test-hooks`, device-pending per checklists/V3.md; NO platform-api change; engine crate only) | After V2 the full-res picture still pulsed: the owner's LIVE host log showed GCC's estimate swinging 4574→3000→1432→692→4130→500 kbps in ~2 min on a capable link, and `applied` followed it 1:1 (V2's 15% hysteresis was far smaller than the swings), reconfiguring the MF encoder on nearly every swing → 1–4 encoder-initiated IDRs/5s despite GOP 600 → GCC destabilised further. Fix (As built): new pure `tuning::RateFilter` smooths the applied target — a light EMA (τ=1.5s) of the estimate + ASYMMETRIC sustained-window gating: the target moves only after the smoothed estimate stays outside a ±25% dead-band CONTINUOUSLY for a hold window (3.0s to drop, 2.0s to raise); any in-band sample resets the timers, so transient dips/spikes never reconfigure the encoder, while a genuine sustained trend is followed in a few seconds. `apply_bwe` now folds each estimate (with elapsed dt) through the filter and only `set_bitrate`s when the smoothed target actually changes → far fewer reconfigs → fewer keyframes. KEPT V2 full-res + floor 500k/ceiling 8M + str0m pacer. |
 | W9 Alt+Tab on a service host | **blocked: need controller app.log** | host UIAccess granted + injects reserved shortcuts, yet Alt+Tab does not switch → controlling-side capture/forward issue (keyhook on a Windows controller, or the Mac tap) |
 | T4 Wayland CI | **done** (Haiku, Opus-reviewed; jobs unverified until pushed; GNOME portal tests are device-pass items) | `native-ci.yml` jobs `wayland-sway` (ubuntu-24.04: sway + xdg-desktop-portal-wlr + pipewire + wireplumber; runs L5 `wayland_surface`, L1 `portal_capture --ignored`, and L6 `input::tests` minus uinput and `xtest_*`) and `wayland-gnome` (ubuntu-24.04: mutter 46 + xdg-desktop-portal-gnome; proves the stack, runs no test: the consent dialog has no headless pre-authorization, so the libei and GNOME portal-capture tests are device-pass items). Scripts in `.github/wayland/`. Local (lane, WSL): `wayland_surface` PASS (T4-02); `input::tests` wlroots and EIS pass, uinput fails under REQUIRED as designed (T4-03). Owner verification after the push: see the T4 card |
 | L5 video surface | **done** (Opus, Opus-reviewed; device-pending per checklists/L5.md) | X11: child window of the GTK toplevel on our own x11rb connection, XShape reveal clip, XDND drops via `XdndProxy`, Expose → redraw of the last frame. Wayland: the spike's area+video subsurface tree on GDK's connection (re-attached when GDK re-creates the toplevel surface), `wp_viewporter` crop + fractional scale, drops through GDK's own data device (sink window); decision-#3 separate window when there is no `wp_viewporter` or `SHARECTRL_VIDEO_WINDOW=separate`. Keys from the GTK toplevel on both (keymap: XKB − 8 = evdev). One wgpu presenter (Vulkan, GL fallback) over `surface-wgpu`. Headless tests: `tests/x11_surface.rs` (Xvfb), `tests/wayland_surface.rs` (headless sway). **Device-pending** (checklists/L5.md) |
@@ -851,6 +852,56 @@ I1..I4 after all lanes (hardware validation)
   `test-hooks` BWE injector and asserts the BITRATE tracks down to the floor and back up and frames keep
   flowing with no link-trouble, but now asserts the encode size stays FULL (640×360) throughout instead of
   stepping down/recovering. All other engine/loopback tests stay green on Windows and WSL.
+
+### V3 — The video quality PULSES (blurry→sharp→blurry on a noisy-but-stable link)  (size S, engine only; owner report 2026-11-03)
+* Problem (ROOT CAUSE, confirmed from the owner's LIVE host app.log): after V2 removed the ladder the
+  full-resolution picture STILL pulses — blurry, clears, blurry again every few seconds, on Windows too.
+  The host log (2026-11-03 ~11:12–11:18) showed GCC's bandwidth estimate swinging wildly on a capable link
+  — `bwe 4574 → 3892 → 3000 → 3597 → 1432 → 1206 → 3693 → 1743 → 692 → 936 → 782 → 4130 → 3221 → 500` kbps
+  within ~2 min — and the encoder `applied` bitrate tracking each one 1:1, because V2 fed the raw clamped
+  estimate with only a 15% hysteresis (the swings are far bigger than 15%, so it changed on nearly every
+  swing). So the full-res picture's QUALITY pulsed (sharp ~4 Mbps, blocky ~500–900 kbps). The log also
+  showed 1–4 encoder-initiated keyframes/5s despite GOP 600 — a feedback loop: frequent bitrate reconfigs →
+  MF emits IDRs → the IDR bursts destabilise GCC → the estimate swings more.
+* **As built (branch `task/V3`, Opus; lane-proven on Windows + WSL incl. loopback×3 with `test-hooks`,
+  device-pending per checklists/V3.md; NO platform-api change; engine crate only):** smooth the APPLIED
+  target against estimate noise; keep V2 full-resolution and the 500 k floor / 8 M ceiling untouched.
+  ADDED — `tuning.rs::RateFilter` (pure, Copy, timer-free):
+  - `RateFilter::next(raw_bps, dt_secs)` folds one estimate into the prior state and returns the new state.
+    (1) a light EMA of the raw estimate, `alpha = 1 - exp(-dt/τ)`, `SMOOTH_TAU_SECS = 1.5` — time-based, so
+    it behaves identically whether called once per real estimate (~1–2/s) or re-applied every driver tick
+    (the `test-hooks` path); it removes single-sample spikes/notches. (2) ASYMMETRIC sustained-window gate:
+    the applied `target` changes only after the clamped smoothed estimate stays OUTSIDE a ±`DEAD_BAND_FRAC`
+    (0.25) band around the current target CONTINUOUSLY for a hold window — `DROP_HOLD_SECS = 3.0` to lower,
+    `RAISE_HOLD_SECS = 2.0` to raise; any in-band sample resets both timers, so a transient dip/spike never
+    moves the target. On commit the target snaps to the smoothed value and the timers reset.
+  - WHY these constants (tied to the real log): the log's dips to ~500–900 kbps RECOVERED within ~1–2s, so
+    a 3.0s drop-hold ignores every one of them, while genuine sustained congestion (which persists) is
+    followed within ~3–4s — "slow enough to ignore transient noise, fast enough to follow a real sustained
+    drop within a few seconds" (the V1 over-damp/garble risk). Raise faster (2.0s) because restoring quality
+    is safe (we only raise when BWE itself sustains high → the capacity is real) and desirable. The ±25%
+    dead-band replaces V2's 15% (which reacted to nearly every swing); normal link noise never leaves it.
+  CHANGED — `session/driver.rs`:
+  - `apply_bwe` now takes `dt_secs` + `&mut RateFilter`; it stores the RAW estimate to `link` as before
+    (telemetry/test observation), folds the estimate through the filter, and calls `br.store` (→ the media
+    loop's `encoder.set_bitrate` at host.rs ~186) ONLY when the smoothed `target` actually changes. Far
+    fewer reconfigs → far fewer encoder-initiated keyframes (deliverable #2, cuts the feedback loop).
+  - `transport_driver` owns `rate_filter` (seeded from the initial encoder bitrate) and `last_bwe_at`; both
+    call sites (the real `Inbound::BweEstimate` and the `test-hooks` re-apply) compute `dt` from
+    `last_bwe_at` and reset it.
+  KEPT: V2's full-res encoding (host.rs encode-size logic untouched — NO resolution ladder re-added),
+  `encoder_target` clamp, floor/ceiling, str0m pacer, `MIN_KEYFRAME_GAP`/PLI handling, the cursor fixes
+  (D10–D12). No platform-api change.
+  Tests: `tuning.rs` keeps `encoder_target_tracks_bwe_but_clamps` and ADDS pure `RateFilter` unit tests —
+  `noise_in_steady_out` (oscillating 300k/4M in → ≤2 target changes in 20s), `sustained_drop_is_followed`,
+  `sustained_rise_is_followed`, `a_brief_dip_does_not_move_the_target`, `target_stays_in_range`. The loopback
+  ADDS `noisy_link_stays_steady_but_follows_a_sustained_trend` (drives the real-log oscillation over the
+  real str0m session via the BWE injector and asserts the applied target changes only a handful of times and
+  stays in a bounded mid band, then that a sustained ~800k drop lowers it and a sustained ~6M rise raises
+  it). The existing `constrained_link_tracks_bwe_down_and_recovers` kept its floor-tracking + full-res +
+  no-link-trouble asserts; its two TIGHT (±100k) mid/recovered tracking asserts were relaxed to V3
+  smoothing semantics (mid lands in a band, recovered climbs ≥4M) — exact 1:1 tracking is precisely what V3
+  removes. All other engine/loopback tests stay green on Windows and WSL.
 
 ### D10 — Viewer cursor feels laggy on a high-latency link: draw it at the LOCAL pointer, hide the OS cursor  (size M, all viewer OSes; owner report 2026-11-02)
 * Problem (diagnosed with the owner from the controller screen): when controlling over a relayed/high-RTT

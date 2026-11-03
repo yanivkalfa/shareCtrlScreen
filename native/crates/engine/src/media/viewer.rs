@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 
-use platform_api::{Codec, Platform, Presenter, VideoSurface};
+use platform_api::{Codec, Frame, Platform, Presenter, VideoSurface};
 
 use crate::session::{serialize, Shared};
 
@@ -15,6 +15,11 @@ pub(crate) struct ViewerMedia {
     pub codec: Codec,
     pub shared: Arc<Shared>,
 }
+
+/// Idle repaint cadence (D11): how long the loop blocks for a new frame before
+/// repainting the cursor on the last one. ~60 Hz so a static host screen still
+/// tracks the local pointer smoothly; a flowing stream returns sooner on data.
+const IDLE_REPAINT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
 /// Viewer decode → present loop, with backlog catch-up, a keyframe watchdog and
 /// debounced view-size reports. The presenter and decoder are created here.
@@ -61,6 +66,15 @@ pub(crate) fn viewer_media_loop(
     let mut pending_size: (u32, u32) = (0, 0);
     // Which of the host's cursor images the presenter holds (D9).
     let mut sprite = InstalledSprite::default();
+    // D11: the newest decoded frame, held so the cursor can be repainted
+    // BETWEEN video frames — a static host screen sends few/no frames, yet the
+    // local pointer keeps moving, so the drawn sprite would otherwise freeze and
+    // only snap forward on the next frame. It borrows the decoder's current
+    // surface, so it MUST be dropped (`= None`) before the next `decode` call.
+    // `last_cursor` is where that frame was last presented, so the idle tick
+    // re-presents only when the cursor actually moved (bounding the GPU work).
+    let mut last_frame: Option<Frame<'_>> = None;
+    let mut last_cursor: Option<(f64, f64)> = None;
     while !stop.load(Ordering::SeqCst) {
         // Track window resizes (and hover-reveal offsets) — no-op when unchanged.
         surface.fit();
@@ -82,7 +96,10 @@ pub(crate) fn viewer_media_loop(
                 }));
             }
         }
-        match video_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+        // A short idle timeout (~16 ms) so a static screen still repaints the
+        // cursor at ~60 Hz (D11); when frames are flowing, `recv_timeout`
+        // returns at once on the queued data, so this adds no video latency.
+        match video_rx.recv_timeout(IDLE_REPAINT_INTERVAL) {
             Ok(first) => {
                 // Batch-drain the queue, then CATCH UP instead of falling behind
                 // (the AnyDesk property): software decode at ~20-30ms/frame can
@@ -125,91 +142,163 @@ pub(crate) fn viewer_media_loop(
 
                 // Decode the batch; PRESENT only the newest decoded frame (the
                 // earlier ones only exist to carry decoder references forward).
+                // Drop the held frame FIRST: it borrows the decoder's surface,
+                // which the next `decode` overwrites (D11).
+                last_frame = None;
                 let count = pending.len();
-                for (i, (au, keyframe)) in pending.into_iter().enumerate() {
+                let mut pending = pending.into_iter();
+                // All but the newest are reference-only: decode to carry the
+                // decoder's references forward, present nothing.
+                for _ in 1..count {
+                    let (au, keyframe) = pending.next().expect("count-1 reference frames");
                     // 100-ns MF units at ~60 fps — decoders (esp. the software
                     // AV1 MFT) can stall on nonsense timestamps like 1,2,3….
                     ts += 166_667;
                     match decoder.decode(&au, keyframe, ts) {
+                        Ok(Some(_)) => note_decoded(&mut rendered, &mut undecoded_streak, skipped),
+                        Ok(None) => on_no_picture(&mut undecoded_streak, &mut last_kf_req, &ctl_tx),
+                        Err(e) => tracing::warn!("decode error: {e}"),
+                    }
+                }
+                // The newest frame: decode, draw the cursor on top, present, and
+                // KEEP it so the idle tick can repaint the cursor on it.
+                if let Some((au, keyframe)) = pending.next() {
+                    ts += 166_667;
+                    match decoder.decode(&au, keyframe, ts) {
                         Ok(Some(frame)) => {
-                            undecoded_streak = 0;
-                            rendered += 1;
-                            if rendered == 1 || rendered.is_multiple_of(120) {
-                                tracing::info!(
-                                    "viewer: decoded frame #{rendered} (skipped {skipped} total)"
-                                );
-                            }
-                            if i + 1 < count {
-                                continue; // reference-only; present the newest
-                            }
-                            // Draw the cursor sprite on top (§7). The SHAPE is
-                            // always the host's (D9); only the POSITION source
-                            // changes (task D10): while this session controls
-                            // and the local pointer is over the video, draw it
-                            // at the LOCAL pointer — instant, no round-trip lag
-                            // — and otherwise follow the host's out-of-band
-                            // position (view-only, or a host-initiated move
-                            // while the local pointer is elsewhere). Hidden
-                            // exactly as before when the host's cursor is not
-                            // visible.
-                            let pointer = *shared.cursor.lock();
-                            let host_cursor = pointer.filter(|p| p.visible).map(|p| (p.x, p.y));
-                            let cursor = cursor_position(
-                                shared.control.load(Ordering::SeqCst),
-                                surface.local_pointer(),
-                                host_cursor,
+                            note_decoded(&mut rendered, &mut undecoded_streak, skipped);
+                            // The SHAPE is always the host's (D9); the POSITION
+                            // follows the LOCAL pointer while controlling over the
+                            // video (D10/D11 — instant, no round-trip lag), and
+                            // otherwise the host's out-of-band position.
+                            let (cursor, shape) = current_cursor(&shared, surface.as_ref());
+                            present_frame(
+                                presenter.as_mut(),
+                                &shared,
+                                &mut sprite,
+                                &frame,
+                                cursor,
+                                shape,
+                                &mut render_errors,
                             );
-                            sprite.sync(presenter.as_mut(), &shared, pointer.and_then(|p| p.shape));
-                            // A failing render is NOT silent: this was exactly the
-                            // place a black screen hid (decode fine, render dead).
-                            if let Err(e) = presenter.present(&frame, cursor) {
-                                render_errors += 1;
-                                if render_errors <= 10 || render_errors.is_multiple_of(120) {
-                                    tracing::warn!("render error #{render_errors}: {e}");
-                                }
-                            }
+                            last_cursor = cursor;
+                            last_frame = Some(frame);
                         }
-                        Ok(None) => {
-                            undecoded_streak += 1;
-                            if undecoded_streak >= 5
-                                && last_kf_req.elapsed() >= std::time::Duration::from_secs(1)
-                            {
-                                tracing::info!("viewer: no decodable frames — requesting keyframe");
-                                let _ =
-                                    ctl_tx.send(serialize(&protocol::ControlMsg::KeyframeRequest));
-                                last_kf_req = std::time::Instant::now();
-                            }
-                        }
+                        Ok(None) => on_no_picture(&mut undecoded_streak, &mut last_kf_req, &ctl_tx),
                         Err(e) => tracing::warn!("decode error: {e}"),
                     }
                 }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // D11: no new frame arrived — repaint the LAST decoded frame with
+                // the CURRENT cursor so the local pointer keeps tracking on a
+                // static screen. Only when the cursor actually moved (bounds the
+                // GPU work) and only once a frame exists to repaint.
+                if let Some(frame) = &last_frame {
+                    let (cursor, shape) = current_cursor(&shared, surface.as_ref());
+                    if cursor != last_cursor {
+                        present_frame(
+                            presenter.as_mut(),
+                            &shared,
+                            &mut sprite,
+                            frame,
+                            cursor,
+                            shape,
+                            &mut render_errors,
+                        );
+                        last_cursor = cursor;
+                    }
+                }
+            }
             Err(_) => break,
         }
     }
     Ok(())
 }
 
-/// Choose the cursor sprite POSITION (task D10). The SHAPE is always the
+/// Bookkeeping for a decoded picture: reset the keyframe watchdog and log a
+/// heartbeat. Shared by the reference-only and newest-frame decode paths (D11).
+fn note_decoded(rendered: &mut u64, undecoded_streak: &mut u32, skipped: u64) {
+    *undecoded_streak = 0;
+    *rendered += 1;
+    if *rendered == 1 || rendered.is_multiple_of(120) {
+        tracing::info!("viewer: decoded frame #{rendered} (skipped {skipped} total)");
+    }
+}
+
+/// The decoder produced no picture: bump the watchdog and, after a short streak,
+/// ask the host for a fresh keyframe (rate-limited to ~1/s so a slow link is
+/// not flooded). Shared by both decode paths (D11).
+fn on_no_picture(
+    undecoded_streak: &mut u32,
+    last_kf_req: &mut std::time::Instant,
+    ctl_tx: &Sender<Vec<u8>>,
+) {
+    *undecoded_streak += 1;
+    if *undecoded_streak >= 5 && last_kf_req.elapsed() >= std::time::Duration::from_secs(1) {
+        tracing::info!("viewer: no decodable frames — requesting keyframe");
+        let _ = ctl_tx.send(serialize(&protocol::ControlMsg::KeyframeRequest));
+        *last_kf_req = std::time::Instant::now();
+    }
+}
+
+/// The cursor to draw right now and the host's shape id (task D10/D11), from the
+/// shared state and the local pointer. Split out so the decoded-frame present
+/// and the idle repaint compute it identically.
+fn current_cursor(
+    shared: &Shared,
+    surface: &dyn VideoSurface,
+) -> (Option<(f64, f64)>, Option<u32>) {
+    let pointer = *shared.cursor.lock();
+    let host_cursor = pointer.filter(|p| p.visible).map(|p| (p.x, p.y));
+    let cursor = cursor_position(
+        shared.control.load(Ordering::SeqCst),
+        surface.local_pointer(),
+        host_cursor,
+    );
+    (cursor, pointer.and_then(|p| p.shape))
+}
+
+/// Sync the cursor sprite shape, then present `frame` with `cursor`. A failing
+/// render is NOT silent — this is exactly where a black screen once hid (decode
+/// fine, render dead). Shared by the decoded-frame and idle repaint paths (D11).
+fn present_frame(
+    presenter: &mut dyn Presenter,
+    shared: &Shared,
+    sprite: &mut InstalledSprite,
+    frame: &Frame<'_>,
+    cursor: Option<(f64, f64)>,
+    shape: Option<u32>,
+    render_errors: &mut u64,
+) {
+    sprite.sync(presenter, shared, shape);
+    if let Err(e) = presenter.present(frame, cursor) {
+        *render_errors += 1;
+        if *render_errors <= 10 || render_errors.is_multiple_of(120) {
+            tracing::warn!("render error #{render_errors}: {e}");
+        }
+    }
+}
+
+/// Choose the cursor sprite POSITION (task D10/D11). The SHAPE is always the
 /// host's (D9); only the position source changes here.
 ///
-/// * controlling, the local pointer is over the video, and the host still
-///   shows a cursor (`host` is `Some`) → the LOCAL position: instant, no
-///   round-trip lag, and under the real mouse (same mapping as the input);
-/// * otherwise the host's out-of-band position — view-only, the pointer is not
-///   over the surface, or the host hid its cursor (`host` is then `None`, which
-///   keeps D9's `visible == false` hide: nothing is drawn).
-///
-/// `host` is the host position already filtered by visibility.
+/// * controlling AND the local pointer is over the video (`local` is `Some`) →
+///   the LOCAL position, ALWAYS: instant, under the real mouse (same mapping as
+///   the input), and — the D11 fix — it must NOT vanish when the host's
+///   out-of-band cursor report momentarily blips to absent (a dropped
+///   unreliable-channel update, or the host hiding its own cursor);
+/// * otherwise the host's out-of-band position — view-only, or controlling with
+///   the pointer not over the surface. `host` is already filtered by visibility,
+///   so on this path an invisible host cursor (`host == None`) draws nothing.
 fn cursor_position(
     control: bool,
     local: Option<(f64, f64)>,
     host: Option<(f64, f64)>,
 ) -> Option<(f64, f64)> {
-    match (control.then_some(local).flatten(), host) {
-        (Some(local_pos), Some(_)) => Some(local_pos),
-        _ => host,
+    match control.then_some(local).flatten() {
+        Some(local_pos) => Some(local_pos),
+        None => host,
     }
 }
 
@@ -280,10 +369,25 @@ mod tests {
     }
 
     #[test]
-    fn an_invisible_host_cursor_is_never_drawn_even_while_controlling() {
-        // `host == None` means the host hid its cursor (D9 visible==false); we
-        // draw nothing rather than stamping the sprite at the local pointer.
-        assert_eq!(cursor_position(true, Some(LOCAL), None), None);
+    fn controlling_over_the_video_survives_a_host_cursor_blip() {
+        // D11 fix: the host's out-of-band cursor report is momentarily absent
+        // (a dropped unreliable-channel update, or the host hid its own cursor)
+        // while we control with the pointer inside. The sprite must STAY at the
+        // local pointer, not vanish and snap back when the next report arrives.
+        assert_eq!(
+            cursor_position(true, Some(LOCAL), None),
+            Some(LOCAL),
+            "controlling + pointer inside always draws at the local pointer"
+        );
+    }
+
+    #[test]
+    fn an_invisible_host_cursor_is_never_drawn_in_view_only() {
+        // View-only (or controlling with the pointer not over the surface):
+        // `host == None` (the host hid its cursor, D9 visible==false) draws
+        // nothing — there is no local pointer to fall back on.
         assert_eq!(cursor_position(false, Some(LOCAL), None), None);
+        assert_eq!(cursor_position(false, None, None), None);
+        assert_eq!(cursor_position(true, None, None), None);
     }
 }

@@ -260,9 +260,21 @@ async fn full_session_over_real_webrtc() {
             s.presented.len(),
             "every frame carries its stamp"
         );
+        // D11: the cursor is repainted between video frames by re-presenting the
+        // LAST decoded frame with the current cursor, so the same stamp can
+        // appear on consecutive presents. A re-present always repeats the newest
+        // decoded frame, so collapsing consecutive duplicates leaves the stream
+        // of DECODED frames — which must still arrive strictly in order (the
+        // catch-up pipeline never reorders or goes backward).
+        let decoded: Vec<u64> = stamps
+            .iter()
+            .enumerate()
+            .filter(|&(i, s)| i == 0 || stamps[i - 1] != *s)
+            .map(|(_, s)| *s)
+            .collect();
         assert!(
-            stamps.windows(2).all(|w| w[0] < w[1]),
-            "frames arrive in order without repeats: {stamps:?}"
+            decoded.windows(2).all(|w| w[0] < w[1]),
+            "decoded frames arrive in order (D11 re-presents de-duplicated): {stamps:?}"
         );
         let first = &s.presented[0];
         assert_eq!((first.width, first.height), (640, 360));

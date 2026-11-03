@@ -52,6 +52,7 @@
 | M12 take every Cmd shortcut (macOS viewer) | **done** (Opus, Opus-reviewed, merged 99ed737; type-checked for aarch64-apple-darwin, device-pending) | M6 tap takes every Cmd chord + Ctrl+arrows while the video has the keyboard; Cmd+Q stays local (tap and key monitor); Force Quit / Lock Screen never claimed; every modifier synchronised before a taken key; hook keys now share the surface's FIFO input channel (D8 ordering risk closed); focus loss releases at once. Also: toolbar-reveal diagnostics + layer-frame sync + full-screen cover (owner's "top edge does nothing"). **Device-pending** (checklists/M6.md §6–§7) |
 | D9 host cursor sprite on the viewer | **done** (Opus, Opus-reviewed; device-pending I1–I3: real cursor images incl. I-beam in a terminal) | additive cursor-shape message, host sends on change, viewer draws the real sprite at position−hotspot in both presenters; replaces the synthetic triangle |
 | D10 viewer cursor lag on a high-RTT link (draw at local pointer + hide OS cursor) | **done** `da65e25` (Opus, Opus-reviewed; Windows+WSL lane green incl. loopback×3, platform-macos aarch64 type-checked; device-pending I1–I3) | capture already keeps the cursor out of the video; the drawn sprite followed the host out-of-band echo (a round trip behind) while the local OS cursor was instant → two cursors. Fixed: the sprite is drawn at the LOCAL pointer when controlling and over the video (client-side prediction), and the OS cursor is hidden over the video; SHAPE stays the host's (D9) |
+| D11 controller cursor freezes between video frames (decouple drawn cursor from frame arrival) | **in review** (branch `task/D11`, Opus; Windows + WSL lane green incl. loopback×3, platform-macos aarch64 type-checked; device-pending checklists/D11.md; NO platform-api change) | D10 made it visible: on a static host screen few/no frames arrive, but the drawn sprite only repainted inside the decoded-frame branch, so the local pointer froze then snapped forward. Fixed: the newest decoded `Frame` is held and the idle tick (~16 ms) re-presents it with the CURRENT cursor when the cursor moved; `cursor_position` no longer vanishes on a momentary host-cursor blip while controlling (always draws at the local pointer); Windows `pointer_inside` re-evaluated on focus regain / control-on so the sprite doesn't drop to the stale host spot |
 | W4 installer bundles + registers the SYSTEM service | **done** (Opus, Opus-reviewed, merged d0119b4; Rust lane-proven, installer by new CI job + machine-A smoke pending; device pass checklists/W4.md) | NSIS hooks install/start/stop/uninstall `sharectrl-service.exe` next to `sharectrl.exe`; one host instance rule; CI silent install/upgrade/uninstall job. Acceptance narrowed: service setup + one instance + standalone asset; elevated-window control is NOT a W4 claim |
 | W5 UIAccess (Alt+Tab / Win key passthrough) | **done** (Opus, Opus-reviewed; device-pending checklists/W5.md: Alt+Tab/Win via the service) | route (a) only: the service sets `TokenUIAccess` (SeTcb) on a duplicate of the host token; `--print-uiaccess`; startup log line; fallback launches without the flag and logs why. Signed route deferred to W6 (see the card) |
 | W7 uninstaller removes the whole install dir (service log leftover) | **done** (Opus, Opus-reviewed, merged 03d98af; proven by the windows-installer CI job on push) | first windows-installer CI run failed only on uninstall-clean: `sharectrl-service.log` left in Program Files; RMDir /r $INSTDIR in POSTUNINSTALL |
@@ -921,6 +922,64 @@ I1..I4 after all lanes (hardware validation)
     (<https://docs.rs/winit/latest/winit/window/struct.Window.html#method.set_cursor_visible>); X11
     transparent cursor via an empty pixmap; client-side cursor prediction (AnyDesk/Microsoft RDP) as the
     rationale for drawing at the local pointer.
+
+### D11 — Controller cursor freezes between video frames (decouple the drawn cursor from frame arrival)  (size M, all viewer OSes; owner report after D10)
+* Problem (root cause, confirmed): the viewer repainted the drawn cursor sprite ONLY when a new video
+  frame was presented — the present lived solely inside the decoded-frame branch, and the
+  `recv_timeout(100 ms)` idle branch did nothing. So on a static host screen (few/no frames) or a starved
+  link the LOCAL pointer kept moving but the sprite was not repainted: it froze and snapped forward when the
+  next frame arrived. D10 made it visible (the sprite follows the local pointer and the OS cursor is hidden,
+  so the gap shows as a dead cursor).
+* Deliverable: repaint the cursor independently of new frames (hold the last frame, re-present it with the
+  current cursor on an idle tick when the cursor moved); fix `cursor_position` so a controlling viewer with
+  the pointer inside never loses the sprite on a momentary host-cursor blip; harden Windows `pointer_inside`
+  against sticking `false` after a focus change / control toggle. No platform-api change.
+* **As built (branch `task/D11`, in review; Windows + WSL lane green incl. loopback×3 with `test-hooks`,
+  platform-macos type-checked for aarch64-apple-darwin; device-pending checklists/D11.md; NO platform-api
+  change — the `Presenter`/`VideoDecoder`/`VideoSurface` traits are untouched):**
+  * **Idle re-present (engine, all OSes)** — `engine/src/media/viewer.rs`. The present loop now holds the
+    newest decoded frame as `last_frame: Option<Frame<'_>>`. The decoded `Frame` borrows the decoder's
+    current surface (valid only until the next `decode`), so `last_frame = None` is set BEFORE the decode
+    path re-borrows the decoder; the held frame is therefore dropped exactly when the decoder is about to
+    overwrite it (no leak, no race — single-threaded loop, the decoder keeps one extra texture alive at
+    most). To store the newest frame without the borrow checker tying the loan across a re-borrow, the
+    batch decode is split: a `for _ in 1..count` reference-only loop (decode to carry references, present
+    nothing), then a single newest-frame block that presents and stores it.
+  * **Cadence** — `recv_timeout` shortened from 100 ms to `IDLE_REPAINT_INTERVAL = 16 ms` (~60 Hz). When
+    frames flow, `recv_timeout` returns at once on the queued data, so this adds NO video latency; only a
+    static/starved stream reaches the timeout branch. The timeout branch re-presents `last_frame` with the
+    CURRENT cursor ONLY when it differs from `last_cursor` (the position of the last present) — so a truly
+    idle screen with a stationary pointer does zero extra GPU work, and a moving pointer tracks at ~60 Hz.
+  * **Reuse** — both the decoded-frame path and the idle path go through one `present_frame(..)` helper
+    (sprite `sync` + `present` + the non-silent render-error logging) and one `current_cursor(..)` helper
+    (D10 position selection + host shape id), so the sprite/size/error behaviour is identical on both. The
+    catch-up/backlog/keyframe-watchdog logic is unchanged (the no-picture watchdog is now the shared
+    `on_no_picture(..)`; decode heartbeat logging is `note_decoded(..)`).
+  * **`cursor_position` blip fix (engine, all OSes)** — previously `(control=true, local=Some, host=None)`
+    returned `None`, so the sprite VANISHED whenever the host's out-of-band cursor report momentarily
+    blipped to absent (a dropped unreliable-channel update, or the host hiding its own cursor) while
+    controlling with the pointer inside. Now: controlling AND `local.is_some()` → ALWAYS the local pointer;
+    otherwise the host position (view-only, or controlling with the pointer not over the surface). On the
+    host path the position is still the visibility-filtered one, so an invisible host cursor still draws
+    nothing in view-only. Unit tests: the new fixed quadrant
+    (`controlling_over_the_video_survives_a_host_cursor_blip`) plus the reworked view-only invisible case;
+    the other three D10 quadrant tests stay green.
+  * **Windows `pointer_inside` hardening** — `render/src/window.rs`. `POINTER_INSIDE` is driven by
+    `WM_MOUSEMOVE`/`WM_MOUSELEAVE`, so after a focus change or control toggle with no mouse move since it
+    could stick `false` and drop the sprite to the stale host position. New `reevaluate_pointer_inside(hwnd)`
+    (`GetCursorPos` → `ScreenToClient` → `GetClientRect`, honouring the revealed-toolbar clip) sets
+    `POINTER_INSIDE = true` and refreshes `LAST_POS` + the `TME_LEAVE` request when the OS pointer is
+    physically over the client area. Called from `WM_SETFOCUS` (focus regain) and from the `WM_REFRESH_CURSOR`
+    handler when `CURSOR_CONTROL` just turned on. It only ever SETS inside — clearing stays `WM_MOUSELEAVE`'s
+    job — so it cannot leave the OS cursor stuck hidden.
+  * **No regression on macOS/Linux** — the idle re-present is in the shared engine loop; those presenters
+    re-present `last_frame` (whose backing surface the decoder still owns, since the held frame keeps it
+    alive) exactly as the decoded path does. macOS/Linux cursor-hide behaviour is untouched.
+  * **Not changed:** platform-api traits, host capture/input/injection, the D9 shape path, the catch-up /
+    backlog / size-report logic, the reveal/toolbar.
+* Acceptance (device, checklists/D11.md): controlling over the relay with the host screen static, the cursor
+  tracks the local pointer smoothly with NO multi-second freeze; correct host shape; view-only still shows the
+  host cursor; nothing vanishes when the host cursor report blips.
 
 ### U2 — Settings/Update is unreachable while hosting a session  (size XS–S, UI; owner report 2026-11-02)
 * Problem: the Updates control (U1) lives in the Settings modal, opened by the gear button. But the gear

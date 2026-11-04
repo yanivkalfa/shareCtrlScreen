@@ -62,7 +62,6 @@ use platform_api::{
     VideoInput, VideoSurface,
 };
 use raw_window_handle::{WaylandDisplayHandle, WaylandWindowHandle};
-use surface_wgpu::reveal::Reveal;
 use surface_wgpu::SurfaceState;
 use wayland_backend::client::ObjectId;
 use wayland_client::protocol::wl_subsurface::WlSubsurface;
@@ -89,7 +88,6 @@ enum Mode {
 /// What the surface lock protects.
 struct Locked {
     geo: Geometry,
-    reveal: Reveal,
     /// `area`'s role object under GTK's current toplevel surface; `None` while
     /// the toplevel is unmapped (GDK destroyed its surface).
     area_sub: Option<WlSubsurface>,
@@ -282,27 +280,20 @@ impl Shared {
     }
 
     /// A position on the video (surface-local logical px) in physical px of
-    /// the **full** content rect. `feed_reveal`: also run the hover reveal on
-    /// it (pointer motion), applying any change atomically.
-    pub(crate) fn to_full_px(&self, x: f64, y: f64, feed_reveal: bool) -> (f64, f64) {
-        let mut l = lock(&self.locked);
+    /// the **full** content rect. Task M15: the top-edge hover reveal is retired
+    /// on Linux (the native menu replaces it), so pointer motion no longer
+    /// drives it — `geo.revealed` is never set, `bar_logical()` is always 0 and
+    /// `y_full == y`. The term is kept for symmetry with the other backends.
+    pub(crate) fn to_full_px(&self, x: f64, y: f64) -> (f64, f64) {
+        let l = lock(&self.locked);
         let scale = l.geo.scale();
-        // Surface-local y is relative to the (possibly cropped) video; the
-        // full content rect starts `bar` px higher.
         let y_full = y + f64::from(l.geo.bar_logical());
-        if feed_reveal
-            && self.mode == Mode::InWindow
-            && l.reveal.on_pointer(y_full * scale, scale).is_some()
-        {
-            l.geo.revealed = l.reveal.is_revealed();
-            self.commit_layout(&l);
-        }
         (x * scale, y_full * scale)
     }
 
     /// Pointer motion on the video (input thread).
     fn pointer_moved(&self, x: f64, y: f64) {
-        let (px, py) = self.to_full_px(x, y, true);
+        let (px, py) = self.to_full_px(x, y);
         let (nx, ny) = self.state.normalize(px, py);
         self.state.input().moved(nx, ny);
         // Task D10: predict the cursor sprite at the real mouse. The OS cursor
@@ -321,13 +312,14 @@ impl Shared {
 
     /// Pointer button on the video at its last position (input thread).
     fn pointer_button(&self, button: u8, down: bool, x: f64, y: f64) {
-        let (px, py) = self.to_full_px(x, y, false);
+        let (px, py) = self.to_full_px(x, y);
         let (nx, ny) = self.state.normalize(px, py);
         self.state.input().button(button, down, nx, ny);
     }
 
+    /// M15: the reveal is retired on Linux; this only keeps `geo.revealed`
+    /// cleared (it is never set true now) so the layout stays full.
     fn reset_reveal(&self, l: &mut Locked) {
-        l.reveal.reset();
         l.geo.revealed = false;
     }
 }
@@ -558,7 +550,6 @@ pub(crate) fn create(
         mode,
         locked: Mutex::new(Locked {
             geo: Geometry::new(viewport),
-            reveal: Reveal::default(),
             area_sub: None,
             parent: None,
         }),

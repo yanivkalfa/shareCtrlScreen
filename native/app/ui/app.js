@@ -603,6 +603,23 @@ async function openSettingsOverVideo() {
 $('btn-view-settings').addEventListener('click', openSettingsOverVideo);
 $('btn-host-settings').addEventListener('click', openSettingsOverVideo);
 
+// Native menu (macOS + Linux; task M15). The menu bar replaces the top-edge
+// drawer there — Settings/Disconnect/Check-for-updates are wired to the SAME
+// flows the toolbar buttons use. (Disconnect is handled in Rust straight on the
+// engine; the role-changed event then updates the UI, exactly like the
+// end-session buttons.) No menu exists on Windows, so these never fire there.
+listen('menu://settings', () => {
+  openSettingsOverVideo();
+});
+listen('menu://check-updates', () => {
+  openSettingsOverVideo().then(() => {
+    checkForUpdates(false);
+    // Bring the Updates panel into view inside the settings modal.
+    const el = $('btn-update-check');
+    if (el) el.scrollIntoView({ block: 'center' });
+  });
+});
+
 $('btn-copy').addEventListener('click', async () => {
   try {
     await navigator.clipboard.writeText(config.uuid);

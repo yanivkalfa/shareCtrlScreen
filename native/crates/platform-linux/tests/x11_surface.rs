@@ -1,6 +1,7 @@
 //! The X11 video surface under a private Xvfb (plan task L5 acceptance, run by
 //! the T3 CI job): presents 100 `Cpu(Nv12)` frames that really reach the
-//! window, keeps `client_size` stable under the toolbar clip, and turns
+//! window, keeps the surface full at the top edge (the toolbar reveal is
+//! retired on Linux — task M15) with a stable `client_size`, and turns
 //! scripted XTest pointer, wheel and key events into `VideoInput`. Also checks
 //! the `native_handles` / hide-unmaps invariants the L7 shortcut hook needs.
 //!
@@ -451,30 +452,32 @@ mod x11 {
             format!("KeyA down/up missing in {events:?}"),
         )?;
 
-        // --- toolbar clip: reveal at the top edge, client_size unchanged.
+        // --- M15: the top-edge hover reveal is retired on Linux. A pointer at
+        // the very top no longer cuts a bounding/input shape — the window stays
+        // the full rect everywhere, and client_size never changes.
         let before = surface.client_size();
         xt.move_to(xt.root_point(video, (w / 2) as i16, 1)?)?;
         common::pump_for(Duration::from_millis(100));
         let rects = xt.bounding_rects(video)?;
         check(
-            rects == vec![(0, 40, w as u16, h as u16 - 40)],
-            format!("revealed shape is {rects:?}"),
+            rects == vec![(0, 0, w as u16, h as u16)],
+            format!("the top edge still cut a reveal shape: {rects:?}"),
         )?;
         check(
             surface.client_size() == before,
-            "client_size changed under the clip",
+            "client_size changed at the top edge (no reveal expected)",
         )?;
-        // Deeper than 56 px hides the bar again: the whole window is back.
+        // Deeper in: still the full window, still the full client_size.
         xt.move_to(xt.root_point(video, (w / 2) as i16, 200)?)?;
         common::pump_for(Duration::from_millis(100));
         let rects = xt.bounding_rects(video)?;
         check(
             rects == vec![(0, 0, w as u16, h as u16)],
-            format!("unrevealed shape is {rects:?}"),
+            format!("the window shape is not the full rect: {rects:?}"),
         )?;
         check(
             surface.client_size() == before,
-            "client_size changed after the clip",
+            "client_size changed in the body",
         )?;
 
         // --- a file dropped on the video reaches the drop sink.
@@ -547,7 +550,9 @@ mod x11 {
 
         drop(surface);
         common::pump_for(Duration::from_millis(100));
-        println!("x11_surface ({pass}): ok (100 frames, readback, input, clip, drop, hide/show)");
+        println!(
+            "x11_surface ({pass}): ok (100 frames, readback, input, full surface, drop, hide/show)"
+        );
         Ok(true)
     }
 }

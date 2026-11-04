@@ -293,33 +293,34 @@ mod wayland {
             format!("wheel notch missing in {events:?}"),
         )?;
 
-        // Toolbar reveal: at the top edge the strip leaves the video, so a
-        // pointer inside it is the page's, not ours; client_size is unchanged.
+        // Task M15: the top-edge hover reveal is retired on Linux — the surface
+        // is always full. A pointer at the very top edge therefore reaches the
+        // video like anywhere else (no strip is cut out of hit-testing), and
+        // client_size never changes.
         let before = surface.client_size();
         pointer.move_to(cw / 2, 1)?;
-        common::collect(&rx, Duration::from_millis(200));
-        pointer.move_to(cw / 2, 20)?;
-        let in_bar = common::collect(&rx, Duration::from_millis(300));
+        let at_top = common::collect(&rx, Duration::from_millis(300));
         check(
-            !in_bar.iter().any(|e| matches!(e, VideoInput::Move { .. })),
-            format!("the revealed strip still reaches the video: {in_bar:?}"),
+            at_top.iter().any(|e| matches!(e, VideoInput::Move { .. })),
+            format!("a top-edge move did not reach the full video: {at_top:?}"),
         )?;
         check(
             surface.client_size() == before,
-            "client_size changed under the clip",
+            "client_size changed at the top edge (no reveal expected)",
+        )?;
+        pointer.move_to(cw / 2, 20)?;
+        let near_top = common::collect(&rx, Duration::from_millis(300));
+        check(
+            near_top
+                .iter()
+                .any(|e| matches!(e, VideoInput::Move { .. })),
+            format!("a near-top move did not reach the video: {near_top:?}"),
         )?;
         pointer.move_to(cw / 2, 300)?;
         let deep = common::collect(&rx, Duration::from_millis(300));
         check(
             deep.iter().any(|e| matches!(e, VideoInput::Move { .. })),
-            format!("no input below the strip: {deep:?}"),
-        )?;
-        // Hidden again past 56 px: the top strip is video once more.
-        pointer.move_to(cw / 2, 20)?;
-        let top = common::collect(&rx, Duration::from_millis(300));
-        check(
-            top.iter().any(|e| matches!(e, VideoInput::Move { .. })),
-            format!("the strip stayed revealed: {top:?}"),
+            format!("no input in the body of the video: {deep:?}"),
         )?;
 
         // Hidden: not hit-testable.
@@ -346,7 +347,7 @@ mod wayland {
         surface.set_input_sink(None);
         drop(surface);
         common::pump_for(Duration::from_millis(100));
-        println!("wayland_surface: ok (100 frames, input, reveal, hide/show)");
+        println!("wayland_surface: ok (100 frames, input, full surface, hide/show)");
         Ok(())
     }
 }

@@ -5,16 +5,17 @@
 //! Everything here runs on the main thread (AppKit views are main-thread
 //! only); state other threads need lives in the shared [`SurfaceState`].
 //!
-//! ## Toolbar reveal
-//! The view's frame is shrunk from the VISUAL top by the bar height, so the
-//! strip is outside the view: AppKit hit-tests it to the web view underneath
-//! (the bar's buttons work) and nothing of ours paints there. The Metal
-//! drawable keeps the **full** surface size and the layer's `contentsGravity`
-//! pins it to the bottom edge, so the picture is cropped, not moved or
-//! rescaled — and that holds even when no new frame arrives (a static remote
-//! screen sends none).
+//! ## Toolbar reveal (retired on macOS — task M15)
+//! The top-edge hover reveal that uncovered the web toolbar is gone on macOS:
+//! the native menu bar (Settings / Disconnect / Check for updates) replaces it,
+//! so a top-edge hover does nothing and the surface is always full (never
+//! inset). `mouseMoved` and `mouseExited` no longer feed the reveal, and the
+//! layout below always computes a zero inset. The inset-aware `apply_layout`
+//! and `view_to_px` code is kept intact (the inset is simply always zero) so
+//! the hard-won M13 layer-flip handling is untouched.
 //!
-//! Which frame edge the inset comes off depends on the coordinate system, and
+//! Which frame edge the (now always zero) inset comes off depends on the
+//! coordinate system, and
 //! the view and its layer live in **different** ones: the view's frame is in
 //! the parent *view*'s system (bottom-left unless `isFlipped`), the hosted
 //! layer's frame is in the parent *layer*'s system (`isGeometryFlipped`). Those
@@ -51,13 +52,18 @@
 //!   it returns `true`): <https://developer.apple.com/documentation/appkit/nsresponder/becomefirstresponder()>
 //! * `viewDidHide` / `viewDidUnhide` (also sent when an ancestor hides):
 //!   <https://developer.apple.com/documentation/appkit/nsview/viewdidhide()>
-//! * `NSCursor.hide()` / `unhide()` — the balanced hide/show counter used to
-//!   hide the OS cursor over the video while controlling (task D10); each
-//!   `hide` needs a matching `unhide`, so a `Cell<bool>` keeps it at 0 or 1:
-//!   <https://developer.apple.com/documentation/appkit/nscursor/hide()>,
-//!   <https://developer.apple.com/documentation/appkit/nscursor/unhide()>.
-//!   The cross-platform analogue is winit/tao `set_cursor_visible`:
-//!   <https://docs.rs/winit/latest/winit/window/struct.Window.html#method.set_cursor_visible>.
+//! * Cursor rects (`resetCursorRects` / `addCursorRect:cursor:`,
+//!   `invalidateCursorRectsForView:`) — task M15's rect-scoped OS-cursor hide.
+//!   While this viewer controls, the whole video rect carries a transparent
+//!   cursor, so only the drawn D10 sprite shows; AppKit restores the normal
+//!   cursor the instant the pointer leaves the rect or the window stops being
+//!   key, so it can never leak onto the desktop. This replaces D10's
+//!   `NSCursor.hide()` + `mouseExited` restore, whose `unhide` could be missed
+//!   when the pointer left the whole window (the cursor stayed hidden on the
+//!   Mac desktop until the app lost focus):
+//!   <https://developer.apple.com/documentation/appkit/nsview/resetcursorrects()>,
+//!   <https://developer.apple.com/documentation/appkit/nsview/addcursorrect(_:cursor:)>,
+//!   <https://developer.apple.com/documentation/appkit/nswindow/invalidatecursorrects(for:)>.
 //! * Client-side cursor prediction (AnyDesk / Microsoft RDP): the sprite is
 //!   drawn at the local pointer, not the host's delayed echo, so it feels
 //!   instant on a high-RTT link (task D10; position chosen in the engine's
@@ -74,10 +80,10 @@ use objc2::runtime::{AnyObject, Bool, ProtocolObject};
 use objc2::{define_class, msg_send, sel, AnyThread, ClassType, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSAutoresizingMaskOptions, NSCursor, NSDragOperation, NSDraggingDestination, NSDraggingInfo,
-    NSEvent, NSEventMask, NSEventPhase, NSEventType, NSPasteboardTypeFileURL,
+    NSEvent, NSEventMask, NSEventPhase, NSEventType, NSImage, NSPasteboardTypeFileURL,
     NSPasteboardURLReadingFileURLsOnlyKey, NSResponder, NSTrackingArea, NSTrackingAreaOptions,
     NSView, NSWindow, NSWindowDidBecomeKeyNotification, NSWindowDidResignKeyNotification,
-    NSWindowOrderingMode, NSWindowStyleMask,
+    NSWindowOrderingMode,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSDictionary, NSNotification, NSNotificationCenter, NSNumber,
@@ -86,7 +92,7 @@ use objc2_foundation::{
 use objc2_quartz_core::{kCAGravityBottom, kCAGravityTop, CAMetalLayer, CATransaction};
 use platform_api::{FileDrop, SurfaceError};
 use surface_wgpu::input::WheelAccumulator;
-use surface_wgpu::reveal::{exited_through_top, Reveal, RevealChange, BAR_CSS_PX};
+use surface_wgpu::reveal::{Reveal, RevealChange};
 use surface_wgpu::SurfaceState;
 
 use crate::{keymap, shortcut_filter};
@@ -106,23 +112,26 @@ const UNITS_PER_LINE: f64 = 120.0;
 /// per 40 px, the pixel distance Chromium/WebKit scroll per Cocoa line, so a
 /// trackpad swipe moves the remote about as far as it moves a local page.
 const UNITS_PER_PIXEL: f64 = 3.0;
-/// The macOS menu bar's height in points on a display without a camera
-/// housing (macOS 11 and later); a notched display reports more through its
-/// safe-area inset, which then wins.
-const MENU_BAR_PT: f64 = 24.0;
-
 pub(crate) struct ViewIvars {
     state: Arc<SurfaceState>,
     layer: Retained<CAMetalLayer>,
+    /// Task M15: the top-edge toolbar reveal is retired on macOS (the native
+    /// menu bar replaces it), so this is never driven to the revealed state and
+    /// the surface always stays full (zero inset). Kept only because
+    /// [`VideoView::apply_layout`]/[`VideoView::view_to_px`] still read its
+    /// (always-zero) inset and `reset_reveal` still clears it; nothing feeds it
+    /// a pointer any more.
     reveal: Cell<Reveal>,
     wheel: Cell<WheelAccumulator>,
     /// A pointer event reached the view since it was last shown or hidden
     /// (for the one-time "events arrive" debug line).
     pointer_seen: Cell<bool>,
-    /// Task D10: whether we have currently hidden the OS cursor (via
-    /// `NSCursor::hide`). The `Cell` keeps `hide`/`unhide` balanced — exactly
-    /// one hide per unhide — so the cursor can never get stuck hidden.
-    cursor_hidden: Cell<bool>,
+    /// Task M15: a fully transparent cursor. While this viewer controls, it is
+    /// set over the whole video rect (`resetCursorRects`) so the OS pointer is
+    /// invisible there and only the drawn D10 sprite shows. AppKit scopes it to
+    /// the rect and the key window, so — unlike D10's `NSCursor::hide` — it can
+    /// never leak onto the desktop and needs no hide/unhide balancing.
+    blank_cursor: Retained<NSCursor>,
 }
 
 define_class!(
@@ -173,8 +182,6 @@ define_class!(
             // capture too early is harmless, capturing for another view is not.
             self.ivars().state.set_key_focus(false);
             self.ivars().state.input().release_all();
-            // Task D10: focus left — restore the OS cursor.
-            self.update_cursor_hidden();
             // SAFETY: forwarding the same selector to NSResponder.
             unsafe { msg_send![super(self), resignFirstResponder] }
         }
@@ -201,11 +208,10 @@ define_class!(
         fn view_did_hide(&self) {
             self.ivars().state.set_key_focus(false);
             // Task D10: an ancestor-driven hide skips `reset_reveal`, so clear
-            // "pointer over the video" here too — otherwise a later
-            // `becomeFirstResponder` could re-hide the cursor app-wide from a
-            // stale inside flag. Then restore the OS cursor.
+            // "pointer over the video" here too, so the sprite does not keep
+            // predicting from a stale position. The OS cursor restores itself
+            // (M15: a hidden view adds no cursor rect).
             self.ivars().state.set_pointer_inside(false);
-            self.update_cursor_hidden();
             // SAFETY: forwarding the same selector to NSView.
             let () = unsafe { msg_send![super(self), viewDidHide] };
         }
@@ -263,8 +269,8 @@ define_class!(
             // of the shortcut hook — from here on Cmd+Tab is local again.
             self.ivars().state.set_key_focus(false);
             self.ivars().state.input().release_all();
-            // Task D10: our window is no longer key — restore the OS cursor.
-            self.update_cursor_hidden();
+            // Task M15: our window is no longer key — AppKit stops applying our
+            // cursor rect, so the normal OS cursor returns on its own.
         }
 
         /// Back in front (a click, or Cmd+Tab to us): the shortcut hook may
@@ -288,7 +294,7 @@ define_class!(
         fn mouse_moved(&self, event: &NSEvent) {
             let (px, py) = self.pointer_px(event);
             self.note_pointer("move", py);
-            self.feed_reveal(py);
+            // Task M15: no reveal on macOS — a top-edge hover does nothing.
             let (nx, ny) = self.ivars().state.normalize(px, py);
             self.ivars().state.input().moved(nx, ny);
             // Task D10: predict the cursor sprite at the real mouse and hide the
@@ -305,31 +311,30 @@ define_class!(
             self.track_local_pointer(nx, ny);
         }
 
-        /// The pointer left the view. Leaving through the top edge counts as
-        /// reaching it: a quick flick upwards can skip the top 2 px between
-        /// two coalesced move events, and when a window covers the top under
-        /// the pointer (the full-screen menu bar sliding down) the exit is
-        /// reported a little *below* the edge (`exited_through_top`).
+        /// The pointer left the view. Task M15: the reveal is retired on
+        /// macOS, so a top-edge exit no longer does anything; this now only
+        /// restores the OS cursor (D10) the instant the pointer is gone.
         #[unsafe(method(mouseExited:))]
         fn mouse_exited(&self, event: &NSEvent) {
-            let (px, py) = self.pointer_px(event);
+            let (_, py) = self.pointer_px(event);
             self.note_pointer("exit", py);
-            // Task D10: the pointer is gone — stop predicting and restore the OS
-            // cursor at once (the sprite falls back to the host's position).
+            // Task D10: the pointer is gone — stop predicting so the sprite
+            // falls back to the host's position. The OS cursor restores itself
+            // (M15: it is scoped to a cursor rect, not hidden app-wide).
             self.ivars().state.set_pointer_inside(false);
-            self.update_cursor_hidden();
-            let (w, h) = self.ivars().state.size();
-            let scale = self.ivars().state.scale();
-            // An exit mapped far ABOVE the top edge is a coordinate artifact of
-            // a fast flick, not a genuine top-edge departure: the owner's
-            // app.log showed such exits at y ≈ -470 / -1025 px, each toggling
-            // the bar from nowhere. A real flick's last sample sits just above
-            // the edge, so trust a top exit only within one bar height above it
-            // (M13 secondary). Exits at or below the edge are unaffected.
-            let above_limit = -(BAR_CSS_PX * scale.max(1.0));
-            if py >= above_limit && exited_through_top(px, py, f64::from(w), f64::from(h), scale) {
-                // Counts as reaching the edge, wherever exactly it was seen.
-                self.feed_reveal(py.min(0.0));
+        }
+
+        /// Task M15: AppKit rebuilds the window's cursor rectangles here (after
+        /// `invalidateCursorRectsForView:`, resize, key changes…). While this
+        /// viewer controls and we are visible, cover the whole video with the
+        /// transparent cursor so only the drawn D10 sprite shows. AppKit applies
+        /// it only while the pointer is inside this rect and our window is key,
+        /// and restores the normal cursor otherwise — so it can never leak onto
+        /// the desktop (the D10 `mouseExited`/`NSCursor.hide` bug).
+        #[unsafe(method(resetCursorRects))]
+        fn reset_cursor_rects(&self) {
+            if self.ivars().state.cursor_control() && !self.isHiddenOrHasHiddenAncestor() {
+                self.addCursorRect_cursor(self.bounds(), &self.ivars().blank_cursor);
             }
         }
 
@@ -492,6 +497,15 @@ fn without_animation<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// Task M15: a fully transparent cursor. A 1×1 `NSImage` with no drawn content
+/// composites as transparent, so the pointer is invisible within the cursor
+/// rect it is set on — the AppKit analogue of the X11 backend's 1×1 transparent
+/// pixmap cursor (`create_blank_cursor`). No bitmap representation is needed.
+fn blank_cursor() -> Retained<NSCursor> {
+    let image = NSImage::initWithSize(NSImage::alloc(), NSSize::new(1.0, 1.0));
+    NSCursor::initWithImage_hotSpot(NSCursor::alloc(), &image, NSPoint::new(0.0, 0.0))
+}
+
 impl VideoView {
     /// Create the view as the topmost subview of `parent`, hidden, filling it.
     pub(crate) fn create(
@@ -514,7 +528,7 @@ impl VideoView {
             reveal: Cell::new(Reveal::default()),
             pointer_seen: Cell::new(false),
             wheel: Cell::new(WheelAccumulator::default()),
-            cursor_hidden: Cell::new(false),
+            blank_cursor: blank_cursor(),
         });
         // SAFETY: NSView's designated initializer.
         let view: Retained<Self> =
@@ -676,8 +690,6 @@ impl VideoView {
             && !self.isHiddenOrHasHiddenAncestor()
             && self.window().is_some_and(|w| w.isKeyWindow());
         self.ivars().state.set_key_focus(focused);
-        // Task D10: focus gates the OS-cursor hide, so re-evaluate it here.
-        self.update_cursor_hidden();
     }
 
     fn drag(&self, event: &NSEvent) {
@@ -699,39 +711,27 @@ impl VideoView {
         let (px, py) = self.pointer_px(event);
         let (nx, ny) = self.ivars().state.normalize(px, py);
         self.ivars().state.input().button(button, down, nx, ny);
-        // Task D10: the pointer is over us; predict and (now that we have focus)
-        // hide the OS cursor if we control.
+        // Task D10: the pointer is over us; keep predicting the sprite from here.
         self.track_local_pointer(nx, ny);
     }
 
     /// Task D10: record the local pointer position and that it is over the
-    /// video, then re-evaluate the OS-cursor hide. Called from every pointer
-    /// event so the sprite follows the real mouse and the hide tracks it.
+    /// video. Called from every pointer event so the sprite follows the real
+    /// mouse. The OS cursor itself is handled by the M15 cursor rect, not here.
     fn track_local_pointer(&self, nx: f64, ny: f64) {
         self.ivars().state.set_local_pointer(nx, ny);
         self.ivars().state.set_pointer_inside(true);
-        self.update_cursor_hidden();
     }
 
-    /// Task D10: hide the OS cursor only while we control, the pointer is over
-    /// the video, and we hold the keyboard; otherwise show it. Toggles
-    /// `NSCursor` on a real transition only, so its hide/unhide counter stays
-    /// balanced and the cursor can never stick hidden.
-    pub(crate) fn update_cursor_hidden(&self) {
-        let st = &self.ivars().state;
-        let want = st.cursor_control() && st.pointer_inside() && st.has_key_focus();
-        self.set_cursor_hidden(want);
-    }
-
-    /// Apply a desired hidden state, balancing `NSCursor::hide`/`unhide`.
-    fn set_cursor_hidden(&self, hidden: bool) {
-        if self.ivars().cursor_hidden.replace(hidden) == hidden {
-            return; // already in that state — keep the counter at 0 or 1
-        }
-        if hidden {
-            NSCursor::hide();
-        } else {
-            NSCursor::unhide();
+    /// Task M15: re-evaluate the OS-cursor hide. Control state (whether this
+    /// viewer controls) is owned by the engine and pushed through
+    /// `VideoSurface::set_cursor_control`; invalidating the window's cursor
+    /// rects makes AppKit call `resetCursorRects` again, which adds or drops the
+    /// transparent cursor over the video. Pointer-inside and key-window are then
+    /// AppKit's to track, so the cursor can never leak outside the video.
+    pub(crate) fn refresh_cursor(&self) {
+        if let Some(window) = self.window() {
+            window.invalidateCursorRectsForView(self);
         }
     }
 
@@ -744,30 +744,12 @@ impl VideoView {
 
     fn view_to_px(&self, p: NSPoint) -> (f64, f64) {
         let scale = self.ivars().state.scale();
-        // Our own coordinates start below the revealed strip; the full
-        // surface starts at the strip's top.
+        // Task M15: the reveal is retired on macOS, so the inset is always
+        // zero and our coordinates coincide with the full surface. The term is
+        // kept (it computes to 0) so the maths reads the same as every other
+        // backend's.
         let inset_pt = self.ivars().reveal.get().inset_px(scale) / scale;
         (p.x * scale, (p.y + inset_pt) * scale)
-    }
-
-    fn feed_reveal(&self, y_px: f64) {
-        let scale = self.ivars().state.scale();
-        let cover_px = self.system_cover_pt() * scale;
-        let mut reveal = self.ivars().reveal.get();
-        let change = reveal.on_pointer_under_cover(y_px, scale, cover_px);
-        self.ivars().reveal.set(reveal);
-        if let Some(change) = change {
-            self.apply_layout();
-            // WHY at debug: the device pass (checklists/M6.md §6) reads this
-            // to tell "the transition never fired" (no line) from "it fired
-            // but nothing moved" (frames unchanged).
-            tracing::debug!(
-                "toolbar reveal: {change:?} at y={y_px:.1}px (scale {scale}, system cover \
-                 {cover_px:.0}px); view frame {:?}, layer frame {:?}",
-                self.frame(),
-                self.ivars().layer.frame(),
-            );
-        }
     }
 
     /// Log, once per show, that pointer events reach the view at all.
@@ -777,43 +759,15 @@ impl VideoView {
         }
     }
 
-    /// Height in points of what macOS draws over the window's top while the
-    /// pointer is up there: in native full screen, the menu bar (taller on a
-    /// display with a camera housing: the screen's top safe-area inset) plus
-    /// the title bar that slides down with it. Zero outside full screen,
-    /// where the title bar is above the content, not over it.
-    fn system_cover_pt(&self) -> f64 {
-        let Some(window) = self.window() else {
-            return 0.0;
-        };
-        if !window.styleMask().contains(NSWindowStyleMask::FullScreen) {
-            return 0.0;
-        }
-        let menu_bar = window
-            .screen()
-            .map_or(0.0, |s| s.safeAreaInsets().top)
-            .max(MENU_BAR_PT);
-        // The title bar's height for a standard titled window, as AppKit
-        // computes it (what the full-screen overlay shows).
-        let content = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(100.0, 100.0));
-        let frame = NSWindow::frameRectForContentRect_styleMask(
-            content,
-            NSWindowStyleMask::Titled,
-            self.mtm(),
-        );
-        let title_bar = (frame.size.height - content.size.height).max(0.0);
-        menu_bar + title_bar
-    }
-
-    /// Forget the reveal (show / hide) and restore the full frame if the bar
-    /// was up.
+    /// Reset the per-show pointer state on show / hide. (M15: there is no more
+    /// reveal to drive on macOS, so `reveal.reset()` is a harmless no-op kept
+    /// for symmetry; the frame is always full.)
     pub(crate) fn reset_reveal(&self) {
         self.ivars().pointer_seen.set(false);
-        // Task D10: show / hide both reset "pointer over the video" — a stale
-        // inside flag must never carry a hidden cursor across sessions. The
-        // next move re-confirms it.
+        // Task D10: clear "pointer over the video" so the sprite does not keep
+        // predicting from a stale position across a show/hide. The next move
+        // re-confirms it.
         self.ivars().state.set_pointer_inside(false);
-        self.update_cursor_hidden();
         let mut reveal = self.ivars().reveal.get();
         let change = reveal.reset();
         self.ivars().reveal.set(reveal);

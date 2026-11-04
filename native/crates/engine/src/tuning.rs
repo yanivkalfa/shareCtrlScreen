@@ -1,6 +1,6 @@
 //! Session tuning shared by the transport driver and the media threads.
 //!
-//! ## Congestion policy (V2)
+//! ## Congestion policy (V3)
 //!
 //! The encoder's CBR target FOLLOWS str0m's bandwidth estimate (BWE / Google
 //! Congestion Control) down to a low floor and back up, and that is the ONLY thing
@@ -13,6 +13,26 @@
 //! behaviour: no hand-rolled source pacer, the encoder follows BWE down, str0m's
 //! pacer meters egress.
 //!
+//! ### V3: the applied target is SMOOTHED, not the raw estimate
+//!
+//! V2 fed the encoder the raw estimate (clamped) with a weak 15% hysteresis. On a
+//! capable but noisy link GCC's estimate swings WILDLY — the owner's live host log
+//! showed it bouncing 4574→3000→1432→692→4130→500 kbps within ~2 minutes — and the
+//! encoder bitrate followed it 1:1, so the full-resolution picture PULSED
+//! blurry→sharp→blurry every few seconds (sharp at ~4 Mbps, blocky at ~500 kbps).
+//! The frequent reconfigs also made Media Foundation emit 1–4 keyframes per 5 s
+//! despite a 600-frame GOP, and each IDR burst destabilised GCC further — a
+//! feedback loop.
+//!
+//! V3 replaces the raw-follow with [`RateFilter`]: a light exponential moving
+//! average (EMA) of the estimate, plus ASYMMETRIC sustained-window gating on the
+//! applied target. The target only moves after the smoothed estimate stays out of
+//! a dead-band CONTINUOUSLY for a hold window (longer to drop than to raise), so
+//! transient dips and single-sample spikes never reconfigure the encoder; a
+//! GENUINE sustained trend still moves it within a few seconds. The result: the
+//! applied bitrate is STEADY on a noisy-but-stable link and the encoder is
+//! reconfigured rarely, which also cuts the reconfig→keyframe feedback.
+//!
 //! ## No resolution ladder (V2 removes V1's)
 //!
 //! V1 (commit 003fbf8) additionally scaled the ENCODE RESOLUTION down a
@@ -24,7 +44,8 @@
 //! the ladder entirely: the encoder ALWAYS encodes at the full viewer-fit
 //! resolution, and a constrained link is absorbed purely by the bitrate following
 //! BWE down (a softer but STEADY picture), never by changing the encode size. The
-//! encode size changes only when the viewer window actually resizes.
+//! encode size changes only when the viewer window actually resizes. V3 keeps this
+//! unchanged — it only smooths HOW the bitrate follows BWE.
 //!
 //! ## References
 //! * str0m 0.21 `bwe` (TWCC/REMB Google Congestion Control): the estimate is
@@ -67,9 +88,133 @@ pub(crate) const MAX_FPS_INTERVAL: std::time::Duration =
 /// The encoder's CBR target for a given bandwidth estimate: the estimate clamped
 /// into `[MIN_BITRATE, TARGET_BITRATE]`. Below the floor the picture stays full
 /// resolution and simply softens; above the ceiling there is nothing to gain. Pure
-/// so the driver and the tests agree on exactly one rule.
+/// so the driver and the tests agree on exactly one rule. [`RateFilter`] clamps the
+/// SMOOTHED estimate through this; the raw estimate is never applied directly.
 pub(crate) fn encoder_target(bwe_bps: u32) -> u32 {
     bwe_bps.clamp(MIN_BITRATE, TARGET_BITRATE)
+}
+
+// --- V3 smoothing constants (tuned against the owner's live host log) ----------
+//
+// The log swung bwe 4574→3892→3000→3597→1432→1206→3693→1743→692→936→782→4130→
+// 3221→500 kbps within ~2 min — individual dips to ~500–900 kbps that RECOVERED
+// within a second or two, on a link that was really ~3–4 Mbps capable. The goal:
+// ignore those transient dips entirely, follow only a trend that PERSISTS.
+
+/// EMA time constant for the raw estimate (seconds). A light average: it removes
+/// single-sample estimate spikes/notches (str0m emits ~1–2 estimates/s) without
+/// lagging a real trend. Kept short because the sustained-window gate below — not
+/// this EMA — is what rejects multi-second transients; the EMA only de-noises the
+/// signal the gate watches.
+const SMOOTH_TAU_SECS: f64 = 1.5;
+/// How far (fraction of the CURRENT applied target) the smoothed estimate must sit
+/// OUTSIDE the target before the hold timer even starts. V2's 15% reacted to
+/// nearly every swing; a ±25% dead-band means ordinary link noise never qualifies.
+const DEAD_BAND_FRAC: f64 = 0.25;
+/// The smoothed estimate must stay BELOW the dead-band continuously this long
+/// before the target drops — longer than any transient dip in the log (~1–2 s),
+/// short enough that a genuine sustained congestion is followed within a few
+/// seconds (the "don't over-damp a really slow link" / V1 regression risk).
+const DROP_HOLD_SECS: f64 = 3.0;
+/// The smoothed estimate must stay ABOVE the dead-band continuously this long
+/// before the target rises. Shorter than the drop hold: raising quality back is
+/// safe (we only raise when BWE itself sustains high, so the capacity is real) and
+/// desirable, but still gated so a transient spike can't bump it.
+const RAISE_HOLD_SECS: f64 = 2.0;
+
+/// Smooths the encoder's CBR target against bandwidth-estimate noise.
+///
+/// PURE and timer-free: [`RateFilter::next`] takes the raw estimate, the elapsed
+/// wall-clock seconds since the previous sample, and the prior state, and returns
+/// the new state. Because the EMA weight is `1 - exp(-dt/τ)` it depends only on
+/// elapsed time, not on how OFTEN it is called — so the real path (once per str0m
+/// estimate, ~1–2/s) and the test path (re-applied every driver tick) converge on
+/// the same trajectory. The tests drive it directly with fixed `dt`, no clocks.
+///
+/// Policy:
+/// * `smoothed` is a light EMA of the raw estimate (kills single-sample spikes).
+/// * the applied `target` only changes after `smoothed` (clamped to the bitrate
+///   range) stays OUTSIDE a ±[`DEAD_BAND_FRAC`] band around the current target for
+///   a continuous hold window — [`DROP_HOLD_SECS`] to lower, [`RAISE_HOLD_SECS`]
+///   to raise. Any sample that falls back inside the band resets both timers, so a
+///   transient dip/spike never moves the target.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RateFilter {
+    /// The applied CBR target (bps) — what the encoder is actually reconfigured to.
+    target: u32,
+    /// EMA of the raw estimate (bps), clamped into the bitrate range on read.
+    smoothed: f64,
+    /// Continuous seconds the smoothed estimate has sat below the drop dead-band.
+    below_secs: f64,
+    /// Continuous seconds the smoothed estimate has sat above the raise dead-band.
+    above_secs: f64,
+}
+
+impl RateFilter {
+    /// Start from a known applied target (the initial encoder bitrate), with the
+    /// EMA seeded there so the first samples don't lurch.
+    pub(crate) fn new(initial_target: u32) -> Self {
+        let t = encoder_target(initial_target);
+        Self {
+            target: t,
+            smoothed: t as f64,
+            below_secs: 0.0,
+            above_secs: 0.0,
+        }
+    }
+
+    /// The current applied CBR target (bps).
+    pub(crate) fn target(&self) -> u32 {
+        self.target
+    }
+
+    /// Fold one raw estimate (bps) sampled `dt_secs` after the previous one into
+    /// the filter and return the updated state. Pure: no clocks, no I/O.
+    pub(crate) fn next(mut self, raw_bps: u32, dt_secs: f64) -> Self {
+        // Guard against a zero/negative/absurd dt (first sample, clock quirks).
+        let dt = dt_secs.clamp(0.0, 5.0);
+
+        // 1) Light EMA of the raw estimate. alpha = 1 - exp(-dt/τ): the weight of
+        //    the new sample grows with elapsed time, so the smoothed curve is the
+        //    same whether we sample fast (every tick) or slow (every estimate).
+        let alpha = 1.0 - (-dt / SMOOTH_TAU_SECS).exp();
+        self.smoothed += alpha * (raw_bps as f64 - self.smoothed);
+
+        // 2) Compare the clamped smoothed estimate to the current target.
+        let est = (self.smoothed as u32).clamp(MIN_BITRATE, TARGET_BITRATE);
+        let target_f = self.target as f64;
+        let drop_edge = target_f * (1.0 - DEAD_BAND_FRAC);
+        let raise_edge = target_f * (1.0 + DEAD_BAND_FRAC);
+
+        if (est as f64) < drop_edge {
+            // Below the band: accumulate toward a drop, forget any rise.
+            self.below_secs += dt;
+            self.above_secs = 0.0;
+        } else if (est as f64) > raise_edge {
+            // Above the band: accumulate toward a raise, forget any drop.
+            self.above_secs += dt;
+            self.below_secs = 0.0;
+        } else {
+            // Inside the dead-band: the trend didn't persist — reset both.
+            self.below_secs = 0.0;
+            self.above_secs = 0.0;
+        }
+
+        // 3) Commit a change only once a trend has PERSISTED for its hold window.
+        //    On commit, snap the target to the smoothed value and reset the timers
+        //    (the next change needs a fresh, sustained departure from the new
+        //    target — this is what keeps the encoder from being reconfigured on
+        //    every swing).
+        if self.below_secs >= DROP_HOLD_SECS {
+            self.target = est;
+            self.below_secs = 0.0;
+        } else if self.above_secs >= RAISE_HOLD_SECS {
+            self.target = est;
+            self.above_secs = 0.0;
+        }
+
+        self
+    }
 }
 
 #[cfg(test)]
@@ -94,6 +239,119 @@ mod tests {
             let t = encoder_target(bwe);
             assert!(t >= prev);
             prev = t;
+        }
+    }
+
+    /// Drive the filter for `secs` at `dt`, flipping the raw estimate between
+    /// `lo`/`hi` every `half_period` seconds, and return (filter, number of times
+    /// the applied target changed).
+    fn oscillate(
+        mut f: RateFilter,
+        lo: u32,
+        hi: u32,
+        half_period: f64,
+        secs: f64,
+        dt: f64,
+    ) -> (RateFilter, u32) {
+        let mut t = 0.0;
+        let mut changes = 0u32;
+        let mut high = false;
+        let mut next_flip = half_period;
+        while t < secs {
+            if t >= next_flip {
+                high = !high;
+                next_flip += half_period;
+            }
+            let prev = f.target();
+            f = f.next(if high { hi } else { lo }, dt);
+            if f.target() != prev {
+                changes += 1;
+            }
+            t += dt;
+        }
+        (f, changes)
+    }
+
+    /// Drive the filter holding a single raw estimate for `secs`.
+    fn hold(mut f: RateFilter, raw: u32, secs: f64, dt: f64) -> RateFilter {
+        let mut t = 0.0;
+        while t < secs {
+            f = f.next(raw, dt);
+            t += dt;
+        }
+        f
+    }
+
+    #[test]
+    fn noise_in_steady_out() {
+        // The real-log pattern: a ~3 Mbps link whose estimate stabs down to ~300k
+        // and back to ~4M roughly every second. The applied target must NOT chase
+        // it — it should barely move.
+        let start = RateFilter::new(2_150_000); // near the oscillation's mean
+        let (f, changes) = oscillate(start, 300_000, 4_000_000, 1.0, 20.0, 0.05);
+        assert!(
+            changes <= 2,
+            "applied target pulsed with the noise ({changes} changes in 20 s)"
+        );
+        // Whatever it settled on stays in a sane mid-band, never cratering to the
+        // floor or pinning the ceiling on the transients.
+        assert!(
+            (1_200_000..=3_500_000).contains(&f.target()),
+            "target drifted out of band under noise: {} bps",
+            f.target()
+        );
+    }
+
+    #[test]
+    fn sustained_drop_is_followed() {
+        // Start high, then the link genuinely drops to ~800 kbps and STAYS there.
+        // The target must come down (within a few seconds, not instantly).
+        let f = RateFilter::new(4_000_000);
+        let f = hold(f, 800_000, 20.0, 0.05);
+        assert!(
+            f.target() <= 1_200_000,
+            "target did not follow a sustained drop: {} bps",
+            f.target()
+        );
+        assert!(f.target() >= MIN_BITRATE);
+    }
+
+    #[test]
+    fn sustained_rise_is_followed() {
+        // Start low (floor), then the link genuinely opens up to ~6 Mbps and STAYS.
+        let f = RateFilter::new(MIN_BITRATE);
+        let f = hold(f, 6_000_000, 20.0, 0.05);
+        assert!(
+            f.target() >= 4_000_000,
+            "target did not follow a sustained rise: {} bps",
+            f.target()
+        );
+        assert!(f.target() <= TARGET_BITRATE);
+    }
+
+    #[test]
+    fn a_brief_dip_does_not_move_the_target() {
+        // A single ~1 s dip to the floor on an otherwise steady 4 Mbps link must
+        // leave the target untouched — this is the exact transient the owner saw.
+        let f = RateFilter::new(4_000_000);
+        let f = hold(f, 4_000_000, 2.0, 0.05); // steady
+        let before = f.target();
+        let f = hold(f, 400_000, 1.0, 0.05); // brief dip (< DROP_HOLD)
+        let f = hold(f, 4_000_000, 2.0, 0.05); // recovered
+        assert_eq!(
+            f.target(),
+            before,
+            "a sub-hold dip moved the target (should be ignored)"
+        );
+    }
+
+    #[test]
+    fn target_stays_in_range() {
+        // Even hammered with absurd values the target stays clamped.
+        let mut f = RateFilter::new(TARGET_BITRATE);
+        for &v in &[0u32, u32::MAX, 50_000_000, 1, 9_000_000] {
+            f = hold(f, v, 10.0, 0.1);
+            assert!(f.target() >= MIN_BITRATE && f.target() <= TARGET_BITRATE);
         }
     }
 }

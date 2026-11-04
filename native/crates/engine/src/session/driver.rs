@@ -22,16 +22,21 @@ use super::{serialize, Shared, DESIRED_BITRATE};
 /// * `link` — the RAW capacity, unfloored: the telemetry / test-observation value
 ///   (the loopback asserts on it). V2 has no resolution ladder, so nothing steers
 ///   the encode size from it; it records what the estimate actually read.
-/// * `bitrate` — the encoder's CBR target, the estimate clamped into
-///   `[MIN_BITRATE, TARGET_BITRATE]` (see [`crate::tuning::encoder_target`]), so
-///   the encoder FOLLOWS the estimate down instead of overshooting a slow link.
-///   This is the ONLY thing the link estimate changes — a constrained link gets a
-///   softer but STEADY full-resolution picture.
+/// * `bitrate` — the encoder's CBR target. V3 no longer applies the raw estimate:
+///   it folds the estimate into a [`RateFilter`] (a light EMA + asymmetric
+///   sustained-window gate) and applies the SMOOTHED target. The encoder is
+///   reconfigured only when the smoothed target actually changes — which, on a
+///   noisy-but-stable link, is rarely — so the full-resolution picture stays
+///   STEADY instead of pulsing with every GCC swing. This is still the ONLY thing
+///   the link estimate steers; the encode size never changes with it.
 ///
-/// A 15% hysteresis on the target keeps estimate jitter from becoming visible
-/// quality flicker.
+/// `dt_secs` is the wall-clock time since the previous estimate; the filter's EMA
+/// is time-based, so this path behaves the same whether called once per real
+/// estimate or re-applied every tick under the test hook.
 fn apply_bwe(
     bps: u32,
+    dt_secs: f64,
+    filter: &mut crate::tuning::RateFilter,
     bitrate: &Option<Arc<std::sync::atomic::AtomicU32>>,
     link: &Option<Arc<std::sync::atomic::AtomicU32>>,
 ) {
@@ -39,11 +44,12 @@ fn apply_bwe(
         lk.store(bps, Ordering::SeqCst);
     }
     if let Some(br) = bitrate {
-        let next = crate::tuning::encoder_target(bps);
-        let cur = br.load(Ordering::SeqCst);
-        if next.abs_diff(cur) * 100 > cur * 15 {
+        let prev = filter.target();
+        *filter = filter.next(bps, dt_secs);
+        let next = filter.target();
+        if next != prev {
             tracing::info!(
-                "bwe: link {} kbps → encoder {} kbps",
+                "bwe: link {} kbps → encoder {} kbps (smoothed)",
                 bps / 1000,
                 next / 1000
             );
@@ -285,6 +291,16 @@ pub(super) fn transport_driver(d: Driver) {
     let mut stat_dropped: u64 = 0;
     let mut stat_pli: u64 = 0;
     let mut last_est: u32 = 0;
+    // V3: smooth the encoder target against BWE noise. Seeded from the initial
+    // encoder bitrate so the first estimates don't lurch, and `last_bwe_at` gives
+    // the filter the wall-clock gap between estimates (its EMA is time-based).
+    let mut rate_filter = crate::tuning::RateFilter::new(
+        bitrate
+            .as_ref()
+            .map(|b| b.load(Ordering::SeqCst))
+            .unwrap_or(crate::tuning::TARGET_BITRATE),
+    );
+    let mut last_bwe_at = std::time::Instant::now();
 
     let mut buf = [0u8; 2048];
     let mut video_count: u64 = 0;
@@ -463,7 +479,9 @@ pub(super) fn transport_driver(d: Driver) {
         {
             let forced = shared.bwe_inject.load(Ordering::Relaxed);
             if forced != 0 {
-                apply_bwe(forced, &bitrate, &link_bw);
+                let dt = last_bwe_at.elapsed().as_secs_f64();
+                last_bwe_at = std::time::Instant::now();
+                apply_bwe(forced, dt, &mut rate_filter, &bitrate, &link_bw);
             }
         }
 
@@ -628,12 +646,15 @@ pub(super) fn transport_driver(d: Driver) {
                         }
                         Inbound::BweEstimate(bps) => {
                             last_est = bps;
-                            // Steer the encoder bitrate (clamped) and record the raw
-                            // estimate from the one value. While a test is holding
-                            // the link at a fixed value, the real estimate is ignored
-                            // so the scenario is deterministic (see `apply_bwe`).
+                            // Smooth the encoder bitrate (V3 `RateFilter`) and record
+                            // the raw estimate from the one value. While a test is
+                            // holding the link at a fixed value, the real estimate is
+                            // ignored so the scenario is deterministic (see
+                            // `apply_bwe`).
                             if !bwe_overridden(&shared) {
-                                apply_bwe(bps, &bitrate, &link_bw);
+                                let dt = last_bwe_at.elapsed().as_secs_f64();
+                                last_bwe_at = std::time::Instant::now();
+                                apply_bwe(bps, dt, &mut rate_filter, &bitrate, &link_bw);
                             }
                         }
                         Inbound::Ctl(bytes) => {

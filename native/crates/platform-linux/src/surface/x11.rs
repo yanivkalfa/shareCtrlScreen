@@ -64,7 +64,7 @@ use platform_api::{
     VideoInput, VideoSurface,
 };
 use raw_window_handle::{XlibDisplayHandle, XlibWindowHandle};
-use surface_wgpu::reveal::{bar_px, Reveal, RevealChange};
+use surface_wgpu::reveal::{bar_px, Reveal};
 use surface_wgpu::SurfaceState;
 use x11rb::connection::Connection;
 use x11rb::protocol::shape::{self, ConnectionExt as _};
@@ -292,23 +292,19 @@ impl Shared {
         self.flush();
     }
 
-    /// Feed the reveal state machine; apply the shape when it changes.
-    fn feed_reveal(&self, y_px: f64) {
-        let change = lock(&self.reveal).on_pointer(y_px, self.state.scale());
-        if let Some(change) = change {
-            self.apply_shape(change == RevealChange::Reveal);
-        }
-    }
-
     fn reset_reveal(&self) {
-        if lock(&self.reveal).reset().is_some() {
-            self.apply_shape(false);
-        }
+        // Task M15: the top-edge reveal is retired on Linux, so this now just
+        // asserts the window's full (default) bounding + input region on every
+        // show/hide. `apply_shape(false)` sets the NULL mask, which is the full
+        // window and idempotent — nothing ever cuts the top strip any more.
+        lock(&self.reveal).reset();
+        self.apply_shape(false);
     }
 
     fn pointer(&self, x: i16, y: i16) {
         let (px, py) = (f64::from(x), f64::from(y));
-        self.feed_reveal(py);
+        // Task M15: the top-edge hover reveal is retired on Linux (the native
+        // menu replaces it), so pointer motion no longer drives it.
         let (nx, ny) = self.state.normalize(px, py);
         self.state.input().moved(nx, ny);
         // Task D10: the pointer is over the video — predict the sprite here so
@@ -386,13 +382,8 @@ impl Shared {
                 Event::LeaveNotify(e) if e.mode == NotifyMode::NORMAL => {
                     // Task D10: the pointer left the video — stop predicting the
                     // sprite (it falls back to the host's out-of-band position).
+                    // M15: no reveal to drive on a top-edge exit any more.
                     self.state.set_pointer_inside(false);
-                    // Leaving through the top edge counts as reaching it: a
-                    // quick flick upwards can skip the top 2 px between two
-                    // motion events.
-                    if e.event_y < 0 {
-                        self.feed_reveal(f64::from(e.event_y));
-                    }
                 }
                 // The last of a series: draw once for the whole exposure.
                 Event::Expose(e) if e.count == 0 => self.repaint(),

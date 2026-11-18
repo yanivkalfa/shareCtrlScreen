@@ -165,15 +165,28 @@ App.UI = (function () {
     clear.type = 'button';
     clear.className = 'recent-clear';
     clear.textContent = 'Clear';
-    clear.addEventListener('click', async () => {
-      try {
-        config.recentIds = await window.native.recentsClear();
-      } catch (_) {
-        config.recentIds = [];
-      }
-      renderRecents();
-    });
+    clear.addEventListener('click', openClearRecents);
     row.appendChild(clear);
+  }
+
+  // ---- clear-recents confirmation -----------------------------------------
+  function openClearRecents() {
+    $('modal-clear-recents').classList.remove('hidden');
+    $('btn-clear-recents-cancel').focus();
+  }
+
+  function closeClearRecents() {
+    $('modal-clear-recents').classList.add('hidden');
+  }
+
+  async function confirmClearRecents() {
+    closeClearRecents();
+    try {
+      config.recentIds = await window.native.recentsClear();
+    } catch (_) {
+      config.recentIds = [];
+    }
+    renderRecents();
   }
 
   // ---- settings modal ----------------------------------------------------
@@ -258,6 +271,15 @@ App.UI = (function () {
     $('btn-settings').addEventListener('click', openSettings);
     $('btn-settings-cancel').addEventListener('click', closeSettings);
     $('btn-settings-save').addEventListener('click', saveSettings);
+
+    $('btn-clear-recents-cancel').addEventListener('click', closeClearRecents);
+    $('btn-clear-recents-ok').addEventListener('click', confirmClearRecents);
+    $('modal-clear-recents').addEventListener('click', (e) => {
+      if (e.target === e.currentTarget) closeClearRecents(); // backdrop click
+    });
+    $('modal-clear-recents').addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') closeClearRecents();
+    });
 
     $('btn-copy').addEventListener('click', async () => {
       try {

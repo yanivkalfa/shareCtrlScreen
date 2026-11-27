@@ -239,7 +239,8 @@ I1..I4 after all lanes (hardware validation)
   second launch raises the running one and exits). The standalone `sharectrl-service.exe`
   asset still installs by hand next to a portable `sharectrl.exe`. Whether a service-run host
   can see/control a UAC prompt or the lock screen is NOT a W4 outcome (the service launches
-  the host with the user's token, unchanged by W4; that capability is tracked separately).
+  the host with the user's token, unchanged by W4, so it cannot); that capability is
+  [plans/10-REMOTE-UNLOCK.md](10-REMOTE-UNLOCK.md), whose U1 tells the viewer meanwhile.
   Orchestrator smoke on machine A.
 
 * As built (branch `task/W4`, in review; Rust proven in the lane, the installer only by the

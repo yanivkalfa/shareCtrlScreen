@@ -21,7 +21,7 @@ pub use config::{
     account_key, AccountRef, Config, IceServer, IdStamp, Loaded, Mode, Permission, Prefs,
     Workspace, LOCAL_WORKSPACE,
 };
-pub use control::{ControlMsg, PopoutStream, RemoteDisplay};
+pub use control::{ControlMsg, HostScreen, PopoutStream, RemoteDisplay};
 pub use input::{Button, InputMsg};
 pub use signaling::{HostCaps, IceCandidate, IceServers, SignalData, SignalMsg};
 pub use sync::{Stamper, SyncDoc, SyncEntry};

@@ -32,8 +32,11 @@ Run the installer from the Releases page.
 - The installer **sets up the Windows service for you**. It installs
   `sharectrl-service.exe` next to the app in `C:\Program Files\ShareCtrlScreen\`, then
   registers and starts the `ShareCtrlScreenHost` service (one administrator consent). The
-  service launches the host at every sign-in and reaches the lock screen and UAC prompts.
-  Uninstalling removes the service.
+  service launches the host at every sign-in. It does **not** yet reach the lock screen, UAC
+  prompts or the sign-in screen: while one is up, the viewer shows a message saying so
+  instead of a black screen, and the picture returns once someone at the computer unlocks
+  it. Reaching them is planned in [plans/10](plans/10-REMOTE-UNLOCK.md). Uninstalling removes
+  the service.
 - The host the service starts lives in the notification area. **Closing its window does
   not disconnect the machine**: it ends any live session and hides the window, and the
   machine stays reachable. Click the tray icon to bring the window back, or right-click
@@ -129,7 +132,7 @@ been tested on hardware.
 | Feature | Windows | macOS 13+ | Linux, X11 | Linux, Wayland |
 |---|---|---|---|---|
 | Screen capture | Yes (DXGI) | Yes, with Screen Recording permission (ScreenCaptureKit) | Yes, no prompt | Yes, after the portal consent dialog (ScreenCast) |
-| Remote mouse and keyboard | Yes. The installer sets up the Windows service, which runs the host as the signed-in user. That host still **cannot** control UAC prompts or elevated apps (the UIPI boundary — see Known limitations; run the host as administrator for those), and the secure desktop is out of reach. Alt+Tab / Windows-key passthrough is a separate feature (W5) | Yes, with Accessibility permission | Yes (XTest) | Yes on GNOME 46+ and KDE Plasma 6 (RemoteDesktop portal). Sway and Hyprland: through wlroots virtual input, no dialog (unverified). Others, such as Weston: view only unless the uinput setting is on |
+| Remote mouse and keyboard | Yes. The installer sets up the Windows service, which runs the host as the signed-in user. That host still **cannot** control UAC prompts or elevated apps (the UIPI boundary — see Known limitations; run the host as administrator for those), and the secure desktop (lock screen, UAC prompts, sign-in screen) is out of reach: the viewer is told when it is up. Alt+Tab / Windows-key passthrough is a separate feature (W5) | Yes, with Accessibility permission | Yes (XTest) | Yes on GNOME 46+ and KDE Plasma 6 (RemoteDesktop portal). Sway and Hyprland: through wlroots virtual input, no dialog (unverified). Others, such as Weston: view only unless the uinput setting is on |
 | The remote computer's real mouse pointer (arrow, I-beam, hand, resize), drawn on the viewer | Yes (pointer images from DXGI) | Yes (pointer images from AppKit) | Yes (XFixes) | Yes, when the portal sends pointer images (cursor metadata) |
 | Clipboard text, both ways | Yes | Yes | Yes. The clipboard lives only while the app runs | Yes, same as X11 |
 | Clipboard files, pasted on this side | Yes | Yes | Yes | Yes |
@@ -137,8 +140,8 @@ been tested on hardware.
 | Drop a file on a remote window | Yes | Yes, with Accessibility permission | Yes | No. The file stays on the clipboard and a notice shows |
 | Shortcut passthrough (Alt+Tab, Cmd+Tab, Super) | Experimental, off by default. Alt+Tab and the Windows key take effect on the host only when it runs under the Windows service (installed by the installer) — a host you start yourself captures them but the host's shell ignores them. Ctrl+Alt+Del and Win+L can never be captured | Every Cmd shortcut (Cmd+C/V, Cmd+Tab, Cmd+Space, Cmd+Shift+4, Cmd+Option+D…) and Ctrl+arrows (Spaces, Mission Control) while the remote picture has the keyboard; clicking anywhere else gives them back at once. **Cmd+Q always quits the viewer** (the escape hatch). Cannot be taken: Force Quit (Cmd+Option+Esc), Lock Screen (Cmd+Ctrl+Q), Touch ID / power and the media keys, and anything while Secure Input is on (password fields). With "Translate modifiers" on (Settings → Advanced) Cmd arrives on a Windows/Linux host as Ctrl; with it off, as the Win/Super key | Yes, the window grabs the keyboard | Depends on the compositor. If refused, the app says shortcuts are unsupported here |
 | Modifier translation for the remote OS (default on, Settings → Advanced) | From a Mac viewer: Cmd is sent as Ctrl, Cmd+Tab as Alt+Tab, Mac Control as Win. To a Mac host: Ctrl is sent as Cmd, Win as Control, Alt+Tab as Cmd+Tab | Same | Same | Same |
-| Lock screen (a user is logged in) | Through the Windows service the installer sets up (SYSTEM + desktop-follow). Unverified on a device | In scope. Unverified | In scope. Unverified | In scope. Unverified |
-| Login window (nobody logged in) | Yes, through the Windows service the installer sets up | No | No | No |
+| Lock screen (a user is logged in) | Not yet. The viewer shows "The remote computer is locked" instead of a black screen, and the picture returns by itself after a local unlock (unverified on a device). Reaching it is planned in [plans/10](plans/10-REMOTE-UNLOCK.md) | In scope. Unverified | In scope. Unverified | In scope. Unverified |
+| Login window (nobody logged in) | Not yet: someone must sign in on the machine before you can connect. Planned in [plans/10](plans/10-REMOTE-UNLOCK.md) (U6) | No | No | No |
 | Hardware video encode | Yes (Media Foundation, H.264 and HEVC) | Yes (VideoToolbox, H.264 and HEVC) | Intel and AMD via VA-API, when libva is 2.20 or newer. NVIDIA via NVENC (optional) | Same as X11 |
 | Hardware video decode | Yes (Direct3D 11) | Yes (VideoToolbox). AV1 on M3 and later | Intel and AMD via VA-API, when libva is 2.20 or newer. NVIDIA via NVDEC (optional) | Same as X11 |
 | Software video (OpenH264) | Not yet (planned: downloaded from Cisco on first use) | Yes, downloaded from Cisco on first use | Yes, downloaded from Cisco on first use | Yes, downloaded from Cisco on first use |
@@ -304,7 +307,7 @@ GitHub Release with these assets:
 |---|---|
 | `ShareCtrlScreen_<version>_x64-setup.exe` | Windows installer (not code-signed: SmartScreen warns, More info → Run anyway) |
 | `sharectrl.exe` | Windows portable app, the same binary the installer puts in Program Files; run it from any folder (needs the WebView2 runtime, present on Windows 10/11) |
-| `sharectrl-service.exe` | Windows service for UAC prompts and the lock screen. The installer already bundles, registers and starts it; this standalone copy is only for a manual install beside a portable `sharectrl.exe` (`--install-service`, it launches the host from its own folder) |
+| `sharectrl-service.exe` | Windows service that starts the host at every sign-in (it does not reach UAC prompts or the lock screen yet, see [plans/10](plans/10-REMOTE-UNLOCK.md)). The installer already bundles, registers and starts it; this standalone copy is only for a manual install beside a portable `sharectrl.exe` (`--install-service`, it launches the host from its own folder) |
 | `ShareCtrlScreen_<version>_universal.dmg` | macOS 13+, Apple Silicon and Intel |
 | `ShareCtrlScreen_<version>_amd64.deb` / `ShareCtrlScreen-<version>-1.x86_64.rpm` / `ShareCtrlScreen_<version>_amd64.AppImage` | Linux |
 | `THIRD-PARTY-LICENSES-<os>.html` | Licences of the open-source code in that OS's build (also inside each installer) |
@@ -327,9 +330,14 @@ publishes nothing. To build this machine's assets locally the same way, run
 
 - **Platforms.** Windows is shipped. macOS 13+ and Linux (Ubuntu 22.04+) are in the
   port; see [What works where](#what-works-where) for each feature.
-- **Login window (macOS and Linux).** When nobody is logged in, the sign-in screen cannot
-  be shared or controlled on macOS or Linux. Windows can, through the service. The lock
-  screen with a user logged in is in scope on all three systems.
+- **Login window.** When nobody is logged in, the sign-in screen cannot be shared or
+  controlled on macOS or Linux, and not yet on Windows (planned in
+  [plans/10](plans/10-REMOTE-UNLOCK.md), U6). The lock screen with a user logged in is in
+  scope on all three systems.
+- **Lock screen and UAC prompts (Windows).** Not reachable yet, with or without the service.
+  While one is up the viewer shows a message instead of the picture and the remote mouse and
+  keyboard do nothing; the picture comes back by itself once someone at that computer
+  unlocks it or answers the prompt. Planned in [plans/10](plans/10-REMOTE-UNLOCK.md).
 - **Wayland focus.** On Wayland the app cannot bring a remote window to the front without a
   click, because no focus request is possible for other apps. A file dropped on a remote
   window stays on the clipboard, and a notice shows.

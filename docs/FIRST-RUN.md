@@ -21,12 +21,16 @@ is not code-signed. This is expected.
 
 The installer sets up the Windows service for you: it puts `sharectrl-service.exe` next to
 the app, then registers and starts the `ShareCtrlScreenHost` service after you approve one
-administrator prompt. That service is what lets the remote side reach UAC prompts, the lock
-screen and the sign-in screen, and it starts the app at every sign-in. Uninstalling removes
-it. You do not need to run anything by hand.
+administrator prompt. That service starts the app at every sign-in. It does not yet let the
+remote side reach UAC prompts, the lock screen or the sign-in screen: while one of those is
+up, the remote side sees a message saying so, and the picture returns once someone here
+unlocks the computer or answers the prompt (planned in
+[plans/10](../plans/10-REMOTE-UNLOCK.md)). Uninstalling removes it. You do not need to run
+anything by hand.
 
-If you run the **portable** `sharectrl.exe` instead of installing, and you want that same
-reach, put the standalone `sharectrl-service.exe` next to it and run this once from a
+If you run the **portable** `sharectrl.exe` instead of installing, and you want the service
+to start it at every sign-in (see below for Alt+Tab and the Windows key), put the standalone
+`sharectrl-service.exe` next to it and run this once from a
 terminal opened as administrator (`--uninstall-service` removes it):
 
 ```

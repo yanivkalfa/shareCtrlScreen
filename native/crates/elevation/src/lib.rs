@@ -1,7 +1,11 @@
 //! Elevation & the SYSTEM service (Plan 04 §8b). A LocalSystem Windows service
-//! is mandatory to reach the secure desktop (UAC / lock / login), which "only
-//! Windows processes can access". The app needs no code-signing certificate
-//! (§8b/§11.4): the UIAccess that Alt+Tab / Windows-key passthrough needs is
+//! is mandatory to reach the secure desktop (UAC / lock / login), which only
+//! LocalSystem and a few other accounts may open — but the service alone does
+//! not reach it: the host it launches is the user's process, so nothing reaches
+//! it today (plans/10 §2 facts 1–2; the SYSTEM agent of plans/10 U3 will).
+//!
+//! The app needs no code-signing certificate (§8b/§11.4): the UIAccess that
+//! Alt+Tab / Windows-key passthrough needs is
 //! given by the service as a TOKEN flag on the host it launches (W5,
 //! [`uiaccess`]), not by a signed `uiAccess="true"` manifest.
 //!
@@ -13,8 +17,8 @@
 //!     `lpDesktop = "winsta0\\default"`, `CreateEnvironmentBlock`), with the
 //!     UIAccess token flag when it can be set,
 //!   * follow the input desktop (`OpenInputDesktop` → `GetUserObjectInformation`
-//!     → `SetThreadDesktop`) so the secure desktop / UAC prompt can be captured
-//!     and clicked,
+//!     → `SetThreadDesktop`). In the user's host it keeps capture and input on
+//!     the `Default` desktop; the secure desktop refuses that process,
 //!   * install / start / stop / uninstall / query the service (the NSIS
 //!     installer's hooks drive these through `sharectrl-service.exe`).
 //!

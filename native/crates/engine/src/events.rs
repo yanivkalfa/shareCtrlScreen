@@ -111,6 +111,17 @@ pub enum SessionEvent {
     },
     /// A message about this session (a file sent, a monitor unavailable).
     Toast(String),
+    /// Viewer: what the host's screen is (its `hstate`, plans/10 U1). Sent
+    /// for every `hstate` the host sends; a host that never sends one (an
+    /// older version) means `Normal` throughout. While `Blocked` the engine
+    /// hides the session's video and pop-outs; the UI says why, from `why`
+    /// (a `protocol::control::hstate::WHY_*` value, or one it does not know).
+    /// `kind` names the secure screen while `Secure`.
+    HostScreen {
+        screen: protocol::HostScreen,
+        kind: Option<String>,
+        why: Option<String>,
+    },
     /// The session's threads are joined and its decoder released: its video
     /// surface may now be destroyed (08a §5.2). Always follows
     /// `Phase(Ended(..))`. It covers every surface the session held: its

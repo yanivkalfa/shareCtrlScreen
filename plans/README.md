@@ -18,6 +18,8 @@ executed **in one go**, in parallel lanes — see [05-TASKS.md](05-TASKS.md).
 | [08a-STRUCTURE-AND-FLOWS.md](08a-STRUCTURE-AND-FLOWS.md) | How tabs are built: layering, file layout, types, commands/events, state machines, every flow, invariants |
 | [09-DETACHABLE-TABS.md](09-DETACHABLE-TABS.md) | Detachable tab windows (several remotes live at once, each in its own window), placement synced per account: design, phases W1–W5 + Final, decisions, design review |
 | [09a-STRUCTURE-AND-FLOWS.md](09a-STRUCTURE-AND-FLOWS.md) | How detached windows are built: ownership, sync schema, engine and platform API, state machines, flows, invariants J1–J10 |
+| [10-REMOTE-UNLOCK.md](10-REMOTE-UNLOCK.md) | Windows: the lock screen, UAC prompts and the sign-in screen through a remote session (a SYSTEM agent next to the host): facts, design, phases U1–U6 + Final, decisions, design review, what is unverified |
+| [10a-STRUCTURE-AND-FLOWS.md](10a-STRUCTURE-AND-FLOWS.md) | How remote unlock is built: ownership, file layout, the pipe's messages, state machines, flows, invariants K1–K21 |
 | [appendix-codemap/](appendix-codemap/) | The raw per-subsystem maps from the 20-reader code sweep (line-level) |
 | [../.claude/skills/orchestrate/SKILL.md](../.claude/skills/orchestrate/SKILL.md) | **How planned work is run** (`/orchestrate`): design review, builder and reviewer briefs, the build lane, the merge gate, releasing, hardware hand-off |
 | [checklists/](checklists/) | Tester checklists for hardware-verified tasks |

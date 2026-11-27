@@ -203,9 +203,10 @@ pub struct Engine {
     pending_nonce: Arc<Mutex<std::collections::HashMap<String, String>>>,
     /// Viewer decode capabilities per requesting peer, for codec negotiation (§3).
     pending_caps: Arc<Mutex<std::collections::HashMap<String, Vec<String>>>>,
-    /// Requesting peers that advertised pop-out support (D14); consumed at
-    /// accept time like `pending_caps`.
-    popout_peers: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// What each requesting peer's viewer advertised besides its codecs
+    /// (pop-outs D14, `hstate` plans/10 U1); consumed at accept time like
+    /// `pending_caps`.
+    viewer_features: Arc<Mutex<std::collections::HashMap<String, session::ViewerFeatures>>>,
     /// TURN relay servers minted by the signaling server (Cloudflare TURN),
     /// expanded to one `IceServer` per URL. Fetched on register and cached; the
     /// pipeline reads them when gathering the relayed candidate.
@@ -284,7 +285,7 @@ impl Engine {
             ui: ui_tx,
             pending_nonce: Arc::new(Mutex::new(Default::default())),
             pending_caps: Arc::new(Mutex::new(Default::default())),
-            popout_peers: Arc::new(Mutex::new(Default::default())),
+            viewer_features: Arc::new(Mutex::new(Default::default())),
             turn_servers: Arc::new(Mutex::new(Vec::new())),
             peer_queues: Mutex::new(Default::default()),
             platform,
@@ -452,11 +453,11 @@ impl Engine {
                 // none, and keeps what the first said); each first attempt
                 // replaces what an earlier, possibly declined one said.
                 if let Some(c) = &caps {
-                    if c.popout {
-                        self.popout_peers.lock().insert(from.clone());
-                    } else {
-                        self.popout_peers.lock().remove(&from);
-                    }
+                    let features = session::ViewerFeatures {
+                        popout: c.popout,
+                        hstate: c.hstate,
+                    };
+                    self.viewer_features.lock().insert(from.clone(), features);
                 }
                 let decode = caps.map(|c| c.decode).unwrap_or_default();
                 self.on_connect_request(from, password, decode).await;
@@ -700,6 +701,28 @@ impl Engine {
         if let Some(s) = session {
             s.sever();
         }
+    }
+
+    /// Hand viewer session `id`'s most recent main-stream delta frames to its
+    /// media loop once more: video that arrives later than the control
+    /// channel, as on a slow link.
+    #[doc(hidden)]
+    pub fn test_replay_viewer_video(&self, id: SessionId) {
+        let reg = self.reg.lock();
+        if let Some(s) = reg.viewers.get(&id).and_then(|v| v.session.as_ref()) {
+            s.replay_video();
+        }
+    }
+
+    /// How many frames [`test_replay_viewer_video`](Self::test_replay_viewer_video)
+    /// has handed on in session `id`.
+    #[doc(hidden)]
+    pub fn test_viewer_video_replayed(&self, id: SessionId) -> u32 {
+        let reg = self.reg.lock();
+        reg.viewers
+            .get(&id)
+            .and_then(|v| v.session.as_ref())
+            .map_or(0, |s| s.replayed_video())
     }
 
     /// Make every viewer session's start wait `ms` before building anything,

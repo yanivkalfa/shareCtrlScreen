@@ -7,7 +7,9 @@
 //
 // The tab on screen shows, below the session bar, either the native video (a
 // live tab: the app shows its surface under this page) or a card: connecting,
-// its password prompt, or why it is disconnected.
+// its password prompt, why it is disconnected, or — live, but the host says
+// its screen cannot be shown (its lock screen, plans/10 U1) — why there is no
+// picture.
 
 import * as api from './api.js';
 import { peerLabel, reloadConfig } from './connect.js';
@@ -226,6 +228,73 @@ function setCard(title, text, primary, secondary) {
   s.onclick = secondary ? secondary.run : null;
 }
 
+// ---- the host's screen (plans/10 U1, 10a §3.9) ---------------------------------------
+// What the host says its screen is: `{ screen, kind, why }`, or null (an older
+// host never says: its screen is the ordinary one). The words follow the
+// host's `why` / `kind`; a value this version does not know gets the generic
+// words, so a later host can add one.
+const BLOCKED_WORDS = {
+  // Before the secure-desktop helper exists (plans/10 U3) a Windows host
+  // cannot tell its lock screen from a UAC prompt, so the text names both.
+  unsupported: [
+    'The remote computer is locked',
+    'Or it is showing a security prompt, such as User Account Control. ShareCtrlScreen ' +
+      'cannot show or control that screen yet. Someone at that computer has to unlock it ' +
+      'or answer the prompt; the picture comes back by itself.'
+  ],
+  disabled: [
+    'The remote computer is locked',
+    'Control of its lock screen is turned off in ShareCtrlScreen on that computer. ' +
+      'Someone there has to unlock it; the picture comes back by itself.'
+  ],
+  policy: [
+    'The remote computer is showing a security prompt',
+    "That computer's settings do not allow its security prompts to be shown or answered " +
+      'remotely. Someone there has to answer it; the picture comes back by itself.'
+  ],
+  agent: [
+    "The remote computer's lock screen cannot be shown",
+    'The part of ShareCtrlScreen that shows it is not answering on that computer. It is ' +
+      'restarted automatically; meanwhile someone there can unlock it, and the picture ' +
+      'comes back by itself.'
+  ],
+  'view-only': [
+    'The remote computer is showing a secure screen',
+    'Lock screens and security prompts are not shown to a view-only connection. The ' +
+      'picture comes back once that screen is gone.'
+  ]
+};
+const BLOCKED_GENERIC = [
+  "The remote computer's screen cannot be shown right now",
+  'It is showing a screen that cannot be shared, such as a lock screen. The picture ' +
+    'comes back by itself.'
+];
+const SECURE_BADGES = { lock: 'LOCK SCREEN', prompt: 'WINDOWS PROMPT', signin: 'SIGN-IN' };
+// The host's strings index these tables: only their own entries count (a
+// `why` of "constructor" must get the generic words, not Object's).
+const own = (table, key) =>
+  typeof key === 'string' && Object.prototype.hasOwnProperty.call(table, key) ? table[key] : null;
+
+/** Whether the host says its screen cannot be shown. */
+const hostBlocked = (t) => !!(t.hostScreen && t.hostScreen.screen === 'blocked');
+
+function renderHostScreen(t, live) {
+  const hs = live ? t.hostScreen : null;
+  const badge = $('view-screen-badge');
+  const secure = !!(hs && hs.screen === 'secure');
+  badge.classList.toggle('hidden', !secure);
+  badge.textContent = secure ? own(SECURE_BADGES, hs.kind) || 'SECURE SCREEN' : '';
+  if (live && hostBlocked(t)) {
+    const words = own(BLOCKED_WORDS, t.hostScreen.why) || BLOCKED_GENERIC;
+    // The saved-password line belongs to the connecting card, not this one.
+    $('tab-card-auto').classList.add('hidden');
+    setCard(words[0], words[1], null, {
+      label: 'Disconnect',
+      run: () => api.tabDisconnect(t.remoteId)
+    });
+  }
+}
+
 function renderActive() {
   const t = activeTab();
   if (!t) {
@@ -234,8 +303,11 @@ function renderActive() {
     return;
   }
   const live = t.phase === 'live';
-  $('tab-card').classList.toggle('hidden', live);
-  $('video-wrap').classList.toggle('hidden', !live);
+  // Live without a picture: the host's screen cannot be shown. The engine
+  // hides the video; the card says why, under the session bar.
+  const picture = live && !hostBlocked(t);
+  $('tab-card').classList.toggle('hidden', picture);
+  $('video-wrap').classList.toggle('hidden', !picture);
   // The session bar belongs to a live session; a card has its own buttons.
   $('view-bar').classList.toggle('hidden', !live);
 
@@ -302,6 +374,7 @@ function renderActive() {
     default:
       passwordFor = null;
   }
+  renderHostScreen(t, live);
 }
 
 function submitPassword(remote) {
@@ -414,6 +487,15 @@ export function wireTabs() {
   });
   api.on('tab-displays', (e) => {
     if (e.payload.remoteId === currentRemote()) renderDisplays(e.payload);
+  });
+  // The host's screen changed (plans/10 U1). The snapshot that follows says
+  // the same; this redraws the tab on screen at once.
+  api.on('host-screen', (e) => {
+    const p = e.payload;
+    const t = [...S.tabs.tabs, ...(S.tabs.detached || [])].find((x) => x.remoteId === p.remoteId);
+    if (!t) return;
+    t.hostScreen = { screen: p.screen, kind: p.kind, why: p.why };
+    if (p.remoteId === currentRemote()) renderActive();
   });
 }
 

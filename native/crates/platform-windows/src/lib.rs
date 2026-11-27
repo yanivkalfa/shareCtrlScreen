@@ -138,7 +138,9 @@ impl Platform for WindowsPlatform {
             shortcut_capture_hint: "Alt+Tab and the Windows key act on the remote machine \
                                     while the session window is focused. Ctrl+Alt+Del is \
                                     reserved by Windows and can never be captured.",
-            login_screen_supported: true,
+            // Not until plans/10 U6: nothing reaches the sign-in screen yet, so
+            // Settings says someone must sign in here before a connection.
+            login_screen_supported: false,
         }
     }
 

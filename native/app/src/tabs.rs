@@ -91,6 +91,10 @@ struct TabLive {
     permission: Option<Permission>,
     /// Seconds left of the link-trouble grace period, while it runs.
     trouble: Option<u32>,
+    /// What the host says its screen is (plans/10 U1): a `host-screen`
+    /// payload, `None` until the host says (an older host never does: its
+    /// screen is taken as normal).
+    host_screen: Option<Value>,
     /// Why its last session ended, in a sentence (cleared on reconnect).
     last_end: Option<String>,
     /// The host's monitors, for the session bar (a `tab-displays` payload)
@@ -407,6 +411,7 @@ impl TabManager {
                         tab.session = Some(id);
                         tab.phase = Phase::Connecting;
                         tab.trouble = None;
+                        tab.host_screen = None;
                         tab.displays = None;
                         tab.menu = None;
                         return Attempt::Connected;
@@ -1183,6 +1188,7 @@ impl TabManager {
                     tab.phase = Phase::Disconnected;
                     tab.session = None;
                     tab.trouble = None;
+                    tab.host_screen = None;
                     tab.displays = None;
                     tab.menu = None;
                     tab.permission = None;
@@ -1211,6 +1217,16 @@ impl TabManager {
                 }
                 SessionEvent::Toast(message) => {
                     out.push(("tab-toast", json!({ "remoteId": peer, "message": message })));
+                }
+                SessionEvent::HostScreen { screen, kind, why } => {
+                    let payload = json!({
+                        "remoteId": peer,
+                        "screen": screen.as_str(),
+                        "kind": kind,
+                        "why": why,
+                    });
+                    tab.host_screen = Some(payload.clone());
+                    out.push(("host-screen", payload));
                 }
                 // Handled above: they concern surfaces and windows.
                 SessionEvent::Released | SessionEvent::SurfaceReleased { .. } => {}
@@ -1443,6 +1459,8 @@ impl TabManager {
                 "passwordReason": reason,
                 "permission": live.and_then(|t| t.permission).map(|p| p.as_str()),
                 "troubleSecs": live.and_then(|t| t.trouble),
+                // `{ screen, kind, why }` from the host (plans/10 U1), or null.
+                "hostScreen": live.and_then(|t| t.host_screen.clone()),
                 "lastEnd": live.and_then(|t| t.last_end.clone()),
                 "autoSignIn": ws.saved_logins.contains_key(&remote),
                 "displays": live.and_then(|t| t.displays.clone()),

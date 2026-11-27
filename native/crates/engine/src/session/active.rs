@@ -4,8 +4,10 @@
 //!
 //! A session's video is shown exactly when it is **on screen** (the strip's
 //! active tab, or a detached window that is not minimised), **ready** (its
-//! decoder and presenter exist), its link is **not in trouble** and **no web
-//! overlay** (Settings, a confirm) is open **in its window**. Nothing else in
+//! decoder and presenter exist), its link is **not in trouble**, **no web
+//! overlay** (Settings, a confirm) is open **in its window** and the host has
+//! not said its screen is **blocked** (a lock screen it cannot show, plans/10
+//! U1: the tab shows why instead of a black or frozen picture). Nothing else in
 //! the engine shows or hides a main surface. Several sessions may be on screen
 //! at once; one of them is **focused** (it has the keyboard, the clipboard and
 //! the shortcut hook — see `TabGate`).
@@ -100,6 +102,8 @@ struct ViewState {
     focused: bool,
     ready: bool,
     trouble: bool,
+    /// The host's screen cannot be shown (`hstate` `blocked`).
+    host_blocked: bool,
     /// Ended: never shown again.
     gone: bool,
     /// What was last queued.
@@ -148,6 +152,7 @@ impl SessionView {
                 focused: false,
                 ready: false,
                 trouble: false,
+                host_blocked: false,
                 gone: false,
                 shown: false,
                 focus_owed: false,
@@ -186,6 +191,14 @@ impl SessionView {
     /// again.
     pub(crate) fn set_trouble(&self, trouble: bool) {
         self.update(|s| s.trouble = trouble);
+    }
+
+    /// The host said its screen cannot be shown, or that it can again.
+    /// Hiding is the gate's part; dropping the frame the present loop holds
+    /// is `Shared::host_block`'s (K21), so the show that follows the block's
+    /// end repaints nothing from before it.
+    pub(crate) fn set_host_blocked(&self, blocked: bool) {
+        self.update(|s| s.host_blocked = blocked);
     }
 
     pub(crate) fn set_on_screen(&self, on: bool) {
@@ -255,7 +268,8 @@ impl SessionView {
 
     /// Show or hide to match the state; called under the view's lock.
     fn decide(&self, s: &mut ViewState) {
-        let want = !s.gone && s.on_screen && s.ready && !s.trouble && !self.covered();
+        let want =
+            !s.gone && s.on_screen && s.ready && !s.trouble && !s.host_blocked && !self.covered();
         if want == s.shown {
             return;
         }
@@ -340,6 +354,35 @@ mod tests {
         view.set_on_screen(true);
         view.refresh();
         assert!(!view.is_shown(), "an ended session never shows again");
+    }
+
+    /// plans/10 U1: a host that cannot show its screen hides the video like
+    /// link trouble does, and each condition keeps it hidden on its own.
+    #[test]
+    fn a_blocked_host_screen_hides_the_video_until_it_is_back() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let surface = MockSurface::new((10, 10));
+        let view = SessionView::new(
+            surface.clone(),
+            Arc::default(),
+            Overlays::default(),
+            applier(rt.handle()),
+        );
+        view.set_on_screen(true);
+        view.set_ready();
+        settle(&surface, true);
+        view.set_host_blocked(true);
+        assert!(!view.is_shown());
+        settle(&surface, false);
+        view.set_trouble(true);
+        view.set_host_blocked(false);
+        assert!(!view.is_shown(), "still in link trouble");
+        view.set_host_blocked(true);
+        view.set_trouble(false);
+        assert!(!view.is_shown(), "still blocked");
+        view.set_host_blocked(false);
+        assert!(view.is_shown());
+        settle(&surface, true);
     }
 
     #[test]

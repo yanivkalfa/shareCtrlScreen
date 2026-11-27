@@ -145,6 +145,12 @@ pub struct Caps {
     /// single-track session they understand; older hosts ignore it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub popout: bool,
+    /// The viewer understands [`crate::ControlMsg::HostState`] (plans/10
+    /// U1): the host tells it when its screen is a lock screen or another
+    /// secure screen. A host sends `hstate` only to a viewer that set this;
+    /// older viewers omit it and never receive one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hstate: bool,
 }
 
 /// The host's capabilities, in its connect-response (the counterpart of the
@@ -198,6 +204,7 @@ mod tests {
         let none = Caps {
             decode: vec!["H264".into()],
             popout: false,
+            hstate: false,
         };
         assert_eq!(
             serde_json::to_string(&none).unwrap(),
@@ -206,10 +213,33 @@ mod tests {
         let new = Caps {
             decode: vec![],
             popout: true,
+            hstate: false,
         };
         assert!(serde_json::to_string(&new)
             .unwrap()
             .contains(r#""popout":true"#));
+    }
+
+    /// plans/10 U1: `hstate` support rides on `caps` like `popout`: an old
+    /// viewer's caps read as "no hstate" (so it is never sent one), and the
+    /// flag is on the wire only when set.
+    #[test]
+    fn hstate_capability_is_optional_both_ways() {
+        let old: Caps = serde_json::from_str(r#"{"decode":["H264"],"popout":true}"#).unwrap();
+        assert!(!old.hstate);
+        let new = Caps {
+            decode: vec!["H264".into()],
+            popout: true,
+            hstate: true,
+        };
+        let s = serde_json::to_string(&new).unwrap();
+        assert_eq!(s, r#"{"decode":["H264"],"popout":true,"hstate":true}"#);
+        assert!(serde_json::from_str::<Caps>(&s).unwrap().hstate);
+        let off = Caps {
+            hstate: false,
+            ..new
+        };
+        assert!(!serde_json::to_string(&off).unwrap().contains("hstate"));
     }
 
     use super::*;

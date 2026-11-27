@@ -54,8 +54,9 @@
 
 ; ---- service ----
 ;
-; The SYSTEM service (sharectrl-service.exe, Plan 04 §8b) is what reaches UAC
-; prompts, the lock screen and the sign-in screen. It is installed next to
+; The SYSTEM service (sharectrl-service.exe, Plan 04 §8b) launches the host at
+; every sign-in. It does not reach UAC prompts, the lock screen or the sign-in
+; screen yet (plans/10-REMOTE-UNLOCK.md tracks that). It is installed next to
 ; sharectrl.exe (it launches the app from its own folder) and managed through its
 ; own command line, which waits for each state change and exits non-zero with a
 ; readable reason on failure (native/service/src/main.rs).

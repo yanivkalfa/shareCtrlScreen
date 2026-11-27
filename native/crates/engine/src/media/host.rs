@@ -25,7 +25,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
-use platform_api::{CaptureError, Codec, DisplayInfo, EncoderConfig, Platform, ScreenCapture};
+use platform_api::{
+    BlockReason, CaptureError, Codec, DisplayInfo, EncoderConfig, Platform, ScreenCapture,
+    ScreenState, SecureKind,
+};
+use protocol::control::hstate;
 
 use crate::session::Shared;
 use crate::tuning::{MAX_FPS, MAX_FPS_INTERVAL};
@@ -58,6 +62,175 @@ pub(crate) struct HostCtx {
     pub bitrate: Arc<AtomicU32>,
     /// The session's stop flag.
     pub stop: Arc<AtomicBool>,
+    /// The viewer advertised `Caps::hstate`: the session's transport thread
+    /// tells it what the screen is ([`SessionScreen`], plans/10 U1). Never
+    /// sent to a viewer without it.
+    pub hstate: bool,
+}
+
+/// The `hstate` message for `state` (10a §3.2).
+pub(crate) fn host_state_msg(state: ScreenState) -> protocol::ControlMsg {
+    let (screen, kind, why) = match state {
+        ScreenState::Normal => (protocol::HostScreen::Normal, None, None),
+        ScreenState::Secure(k) => (
+            protocol::HostScreen::Secure,
+            Some(match k {
+                SecureKind::Lock => hstate::KIND_LOCK,
+                SecureKind::Prompt => hstate::KIND_PROMPT,
+                SecureKind::SignIn => hstate::KIND_SIGNIN,
+            }),
+            None,
+        ),
+        ScreenState::Blocked(r) => (
+            protocol::HostScreen::Blocked,
+            None,
+            Some(match r {
+                BlockReason::NotSupported => hstate::WHY_UNSUPPORTED,
+                BlockReason::Disabled => hstate::WHY_DISABLED,
+                BlockReason::NotAllowed => hstate::WHY_POLICY,
+                BlockReason::AgentUnavailable => hstate::WHY_AGENT,
+            }),
+        ),
+    };
+    protocol::ControlMsg::HostState {
+        screen,
+        kind: kind.map(str::to_string),
+        why: why.map(str::to_string),
+    }
+}
+
+/// The session's screen state (plans/10 U1, 10a §3.3, invariant K13). It
+/// belongs to the session, not to a stream: while the main stream runs it is
+/// what the main stream's capture reports; while the main stream is paused (a
+/// background tab, P6) it is what the pop-out streams' captures report —
+/// blocked if any of them is blocked — because those are then all the viewer
+/// shows of this host. With the main stream paused and no pop-out open,
+/// nothing of the host is on screen at the viewer, and the state stays as it
+/// was until the main stream acquires again.
+///
+/// Each stream contributes only what its capture observed since the stream
+/// last acquired (or reinitialised, or opened): a resumed main stream counts
+/// again only after its first acquire, so its state from before the pause is
+/// never reported (no stale `normal` between two `blocked`). The streams only
+/// record here, under `Shared::host_screen` (a leaf lock: nothing is taken or
+/// sent while it is held); the session's transport thread alone takes the
+/// changes and sends them ([`pending_hstate`]), so one change is one message,
+/// in order, whichever streams took part.
+#[derive(Debug, Default)]
+pub(crate) struct SessionScreen {
+    /// The main stream's last observation; `None` before its first one and
+    /// from a pause until its first acquire after it.
+    main: Option<ScreenState>,
+    /// The main stream is paused (or resumed and has not acquired yet).
+    main_paused: bool,
+    /// Each live pop-out stream's last observation, by slot.
+    popouts: std::collections::BTreeMap<u8, ScreenState>,
+    /// The session's state as last decided; `None` until first known.
+    current: Option<ScreenState>,
+    /// What the transport thread last took (and sent, if the viewer reads
+    /// `hstate`).
+    taken: Option<ScreenState>,
+}
+
+impl SessionScreen {
+    /// Stream `slot` (0 = main) observed `state` right after an acquire, a
+    /// reinit or opening its capture.
+    pub(crate) fn observe(&mut self, slot: u8, state: ScreenState) {
+        if slot == 0 {
+            self.main = Some(state);
+            self.main_paused = false;
+        } else {
+            self.popouts.insert(slot, state);
+        }
+        self.decide();
+    }
+
+    /// The main stream is paused: what it saw before no longer counts.
+    pub(crate) fn main_paused(&mut self) {
+        if !self.main_paused {
+            self.main = None;
+            self.main_paused = true;
+            self.decide();
+        }
+    }
+
+    /// Pop-out stream `slot` ended.
+    pub(crate) fn forget(&mut self, slot: u8) {
+        if self.popouts.remove(&slot).is_some() {
+            self.decide();
+        }
+    }
+
+    /// The session's state for the host itself (a dropped file is pasted
+    /// only on `Normal`). `Normal` until anything was observed.
+    pub(crate) fn state(&self) -> ScreenState {
+        self.current.unwrap_or(ScreenState::Normal)
+    }
+
+    /// The state to send now, if it changed since the last call. Called by
+    /// the transport thread only.
+    pub(crate) fn take_change(&mut self) -> Option<ScreenState> {
+        let now = self.current?;
+        if self.taken == Some(now) {
+            return None;
+        }
+        self.taken = Some(now);
+        Some(now)
+    }
+
+    fn decide(&mut self) {
+        let decided = if self.main_paused {
+            // Blocked beats secure beats normal: if any window could show a
+            // secure screen it cannot, the viewer must hear `blocked`.
+            let mut it = self.popouts.values().copied();
+            let first = it.next();
+            first.map(|f| {
+                it.fold(f, |acc, s| match (acc, s) {
+                    (ScreenState::Blocked(_), _) => acc,
+                    (_, ScreenState::Blocked(_)) => s,
+                    (ScreenState::Secure(_), _) => acc,
+                    (_, ScreenState::Secure(_)) => s,
+                    _ => acc,
+                })
+            })
+        } else {
+            self.main
+        };
+        if let Some(d) = decided {
+            if self.current != Some(d) {
+                // Not logged for the very first, ordinary state: every
+                // session has it.
+                if self.current.is_some() || d != ScreenState::Normal {
+                    tracing::info!("host: the screen is now {d:?}");
+                }
+                self.current = Some(d);
+            }
+        }
+    }
+}
+
+/// Transport thread: the `hstate` to queue now, if the session's screen
+/// state changed — `None` for a viewer that did not advertise `hstate` (an
+/// older one is never sent it; the change is still taken, so the host's own
+/// record stays current).
+pub(crate) fn pending_hstate(shared: &Shared, hstate: bool) -> Option<Vec<u8>> {
+    // Taken under the lock, serialised after it is released.
+    let change = shared.host_screen.lock().take_change()?;
+    hstate.then(|| serde_json::to_vec(&host_state_msg(change)).unwrap_or_default())
+}
+
+/// A pop-out stream's contribution ends with its loop, however it ends.
+struct ForgetOnExit<'a> {
+    shared: &'a Shared,
+    slot: u8,
+}
+
+impl Drop for ForgetOnExit<'_> {
+    fn drop(&mut self) {
+        if self.slot != 0 {
+            self.shared.host_screen.lock().forget(self.slot);
+        }
+    }
 }
 
 /// One video stream of the host.
@@ -292,15 +465,21 @@ type OpenedCapture = (Box<dyn ScreenCapture>, Option<String>);
 /// self-recovers exactly as it does for a mid-session desktop switch. A missing
 /// saved display falls back to the primary; any other (terminal) error is returned.
 /// Also returns the display actually opened (`None` = the primary, including
-/// after that fallback).
+/// after that fallback). `on_wait` runs once, at the second refusal in a row:
+/// the stream reports its screen as blocked then (plans/10 U1), so a session
+/// started on a lock screen explains itself instead of staying black, while a
+/// single transient refusal at open (a mode change, a service host's start-up
+/// race) shows no card. The second refusal comes about 100 ms after the first.
 fn open_capture(
     platform: &dyn Platform,
     display: Option<&str>,
     fallback_to_primary: bool,
     stop: &dyn Fn() -> bool,
+    on_wait: &mut dyn FnMut(),
 ) -> Result<OpenedCapture, Box<dyn std::error::Error>> {
     let mut backoff = std::time::Duration::from_millis(100);
     let mut waited = false;
+    let mut refusals: u32 = 0;
     loop {
         if stop() {
             return Err("session stopped before screen capture became available".into());
@@ -335,6 +514,10 @@ fn open_capture(
                          unavailable (service host starting off the desktop, or a secure \
                          desktop / lock screen is up); retrying until it returns"
                     );
+                }
+                refusals += 1;
+                if refusals == 2 {
+                    on_wait();
                 }
                 std::thread::sleep(backoff);
                 backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
@@ -393,7 +576,29 @@ pub(crate) fn host_media_loop(
     // the record of what the viewer holds (one cache on the viewer).
     let mut cursor_images = shared.host_cursor_root.sharing();
     let codecs = platform.codecs();
-    let (mut cap, opened) = open_capture(platform.as_ref(), display.as_deref(), main, &stopped)?;
+    let _forget = ForgetOnExit { shared, slot };
+    // Before a capture object exists there is no backend to ask. Refusals
+    // that keep the capture from even being created are a screen this host
+    // cannot reach — before plans/10 U3, every secure desktop on Windows — so
+    // this stream observes `blocked`; the first `screen_state` of the capture
+    // that finally opens takes it back to what it really is.
+    let mut on_wait = || {
+        shared
+            .host_screen
+            .lock()
+            .observe(slot, ScreenState::Blocked(BlockReason::NotSupported));
+    };
+    let (mut cap, opened) = open_capture(
+        platform.as_ref(),
+        display.as_deref(),
+        main,
+        &stopped,
+        &mut on_wait,
+    )?;
+    shared.host_screen.lock().observe(slot, cap.screen_state());
+    // An acquire happened since this stream last observed (K13: a stream
+    // contributes only what its capture found since it last acquired).
+    let mut acquired_since = false;
     // The monitor being shared, as an id from `platform.displays()`, announced
     // to both sides so either can offer a switch.
     let mut current_display = {
@@ -471,6 +676,10 @@ pub(crate) fn host_media_loop(
             std::thread::sleep(MAX_FPS_INTERVAL - since);
         }
         last_frame_at = std::time::Instant::now();
+        // What the last acquire found out (a field read, no OS call).
+        if std::mem::take(&mut acquired_since) {
+            shared.host_screen.lock().observe(slot, cap.screen_state());
+        }
 
         // A monitor switch (host UI, or a controlling viewer). The new capture
         // is opened next to the old one and only replaces it once it AND an
@@ -658,10 +867,13 @@ pub(crate) fn host_media_loop(
         // the resume carries every change since the pause, and the viewer —
         // which decoded everything up to the pause — follows on from there.
         if main && shared.video_paused.load(Ordering::SeqCst) {
+            // The pop-out streams speak for the session meanwhile (K13).
+            shared.host_screen.lock().main_paused();
             std::thread::sleep(PAUSED_POLL);
             continue;
         }
         let acquired = cap.acquire(std::time::Duration::from_millis(16));
+        acquired_since = true;
         match acquired {
             Ok(Some(frame)) => {
                 // Cursor moves travel out-of-band on the cursor channel and never
@@ -788,7 +1000,12 @@ pub(crate) fn host_media_loop(
             // and re-acquires the duplication; if that still fails (secure desktop
             // up), back off and keep trying until the desktop returns.
             Err(CaptureError::Lost) => {
-                if let Err(e) = cap.reinit() {
+                let reinit = cap.reinit();
+                // At once, not after the back-off below: the viewer hears
+                // of a lock within one pass (plans/10 U1 acceptance: 2 s).
+                acquired_since = false;
+                shared.host_screen.lock().observe(slot, cap.screen_state());
+                if let Err(e) = reinit {
                     if capture_down_since.is_none() {
                         capture_down_since = Some(std::time::Instant::now());
                         tracing::warn!(
@@ -847,7 +1064,128 @@ pub(crate) fn fit_within(want: (u32, u32), src: (u32, u32)) -> (u32, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::fit_within;
+    use super::{fit_within, host_state_msg, pending_hstate, SessionScreen};
+    use platform_api::{BlockReason, ScreenState, SecureKind};
+    use protocol::{ControlMsg, HostScreen};
+
+    fn wire(state: ScreenState) -> String {
+        serde_json::to_string(&host_state_msg(state)).unwrap()
+    }
+
+    #[test]
+    fn every_screen_state_has_its_wire_words() {
+        assert_eq!(
+            wire(ScreenState::Normal),
+            r#"{"t":"hstate","screen":"normal"}"#
+        );
+        for (k, word) in [
+            (SecureKind::Lock, "lock"),
+            (SecureKind::Prompt, "prompt"),
+            (SecureKind::SignIn, "signin"),
+        ] {
+            assert_eq!(
+                wire(ScreenState::Secure(k)),
+                format!(r#"{{"t":"hstate","screen":"secure","kind":"{word}"}}"#)
+            );
+        }
+        for (r, word) in [
+            (BlockReason::NotSupported, "unsupported"),
+            (BlockReason::Disabled, "disabled"),
+            (BlockReason::NotAllowed, "policy"),
+            (BlockReason::AgentUnavailable, "agent"),
+        ] {
+            assert_eq!(
+                wire(ScreenState::Blocked(r)),
+                format!(r#"{{"t":"hstate","screen":"blocked","why":"{word}"}}"#)
+            );
+        }
+    }
+
+    const BLOCKED: ScreenState = ScreenState::Blocked(BlockReason::NotSupported);
+
+    fn changes(screen: &mut SessionScreen) -> Option<ScreenState> {
+        screen.take_change()
+    }
+
+    /// K13: the first state goes out (it is what the viewer starts from),
+    /// then only changes — a reinit retried every 250 ms on a lock screen
+    /// gives `blocked` once.
+    #[test]
+    fn the_main_stream_speaks_for_the_session_and_each_change_counts_once() {
+        let mut s = SessionScreen::default();
+        assert_eq!(changes(&mut s), None, "nothing observed yet");
+        s.observe(0, ScreenState::Normal);
+        assert_eq!(changes(&mut s), Some(ScreenState::Normal));
+        for _ in 0..10 {
+            s.observe(0, BLOCKED);
+        }
+        assert_eq!(changes(&mut s), Some(BLOCKED));
+        assert_eq!(changes(&mut s), None);
+        assert_eq!(s.state(), BLOCKED);
+        // A pop-out does not speak while the main stream runs.
+        s.observe(1, ScreenState::Normal);
+        assert_eq!(changes(&mut s), None);
+        s.observe(0, ScreenState::Normal);
+        assert_eq!(changes(&mut s), Some(ScreenState::Normal));
+    }
+
+    /// K13: with the main stream paused the pop-outs speak (blocked if any is
+    /// blocked); a resumed main stream counts only from its first
+    /// observation, so its pre-pause state is never reported.
+    #[test]
+    fn a_paused_main_stream_leaves_the_session_to_its_popouts() {
+        let mut s = SessionScreen::default();
+        s.observe(0, ScreenState::Normal);
+        s.observe(1, ScreenState::Normal);
+        s.observe(2, ScreenState::Normal);
+        assert_eq!(changes(&mut s), Some(ScreenState::Normal));
+        s.main_paused();
+        assert_eq!(changes(&mut s), None, "the pop-outs say the same");
+        s.observe(2, BLOCKED);
+        assert_eq!(changes(&mut s), Some(BLOCKED));
+        s.observe(1, ScreenState::Secure(SecureKind::Lock));
+        assert_eq!(changes(&mut s), None, "blocked beats secure");
+        s.observe(2, ScreenState::Normal);
+        assert_eq!(changes(&mut s), Some(ScreenState::Secure(SecureKind::Lock)));
+        s.observe(1, BLOCKED);
+        s.observe(2, BLOCKED);
+        assert_eq!(changes(&mut s), Some(BLOCKED));
+        // Every pop-out closes: nothing of the host is on screen, the state
+        // stays until the main stream acquires again.
+        s.forget(1);
+        s.forget(2);
+        assert_eq!(changes(&mut s), None);
+        assert_eq!(s.state(), BLOCKED);
+        // Paused again (polled every 50 ms): nothing changes.
+        s.main_paused();
+        assert_eq!(changes(&mut s), None);
+        // Resumed: its first acquire on the lock screen keeps `blocked`
+        // without a `normal` in between; the unlock then counts.
+        s.observe(0, BLOCKED);
+        assert_eq!(changes(&mut s), None);
+        s.observe(0, ScreenState::Normal);
+        assert_eq!(changes(&mut s), Some(ScreenState::Normal));
+    }
+
+    /// An old viewer (no `Caps::hstate`) is never sent `hstate`; the host
+    /// still knows its own screen (a dropped file is not pasted onto it).
+    #[test]
+    fn an_old_viewer_never_receives_hstate() {
+        let shared = crate::session::Shared::default();
+        shared.host_screen.lock().observe(0, BLOCKED);
+        assert!(pending_hstate(&shared, false).is_none());
+        assert_eq!(shared.host_screen.lock().state(), BLOCKED);
+        shared.host_screen.lock().observe(0, ScreenState::Normal);
+        let msg = pending_hstate(&shared, true).expect("a change");
+        assert!(matches!(
+            serde_json::from_slice::<ControlMsg>(&msg).unwrap(),
+            ControlMsg::HostState {
+                screen: HostScreen::Normal,
+                ..
+            }
+        ));
+        assert!(pending_hstate(&shared, true).is_none(), "change-only");
+    }
 
     #[test]
     fn fit_within_never_upscales() {

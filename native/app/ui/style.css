@@ -189,6 +189,7 @@ html, body {
 }
 .badge-view { background: #3a3f4d; color: #c8cede; }
 .badge-control { background: #1f5c38; color: #8ff0b5; }
+.badge-secure { background: #4a3d1c; color: #f0d58a; }
 
 .video-wrap {
   flex: 1;

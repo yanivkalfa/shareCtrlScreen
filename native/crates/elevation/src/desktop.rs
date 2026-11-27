@@ -1,8 +1,9 @@
-//! Input-desktop follower (Plan 04 §8b). A SYSTEM-context capture/inject helper
-//! thread must re-attach to whichever desktop currently has input focus
-//! (Default ↔ Winlogon/secure ↔ screen-saver) before injecting, so the secure
-//! desktop / UAC prompt can be captured and clicked. This is exactly how the
-//! UAC prompt gets driven.
+//! Input-desktop follower (Plan 04 §8b). A thread re-attaches to whichever
+//! desktop currently has input focus (Default ↔ Winlogon/secure ↔ screen-saver)
+//! before capturing or injecting. In the user's host (today's only caller) the
+//! `Winlogon` desktop refuses the process, so this keeps capture and input on the
+//! `Default` desktop and nothing reaches a UAC prompt or the lock screen; a
+//! SYSTEM-context helper in the user's session would reach them (plans/10 U3).
 
 use windows::Win32::System::StationsAndDesktops::{
     CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, SetThreadDesktop,

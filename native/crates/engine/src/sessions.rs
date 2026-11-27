@@ -306,8 +306,12 @@ impl Engine {
             SessionEvent::Phase(SessionPhase::Negotiating { permission }),
         );
         self.add_recent(&peer);
-        let popouts = self.popout_peers.lock().remove(&peer);
-        session::begin_host(self, id, peer, permission, popouts, codec);
+        let features = self
+            .viewer_features
+            .lock()
+            .remove(&peer)
+            .unwrap_or_default();
+        session::begin_host(self, id, peer, permission, features, codec);
     }
 
     /// Host action: switch the live permission (view↔control) mid-session.
@@ -429,6 +433,9 @@ impl Engine {
                 caps: Some(protocol::signaling::Caps {
                     decode,
                     popout: true,
+                    // It shows why the picture is gone when the host is on
+                    // its lock screen (plans/10 U1).
+                    hstate: true,
                 }),
             });
             (id, started_in)

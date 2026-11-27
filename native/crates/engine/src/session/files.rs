@@ -139,12 +139,18 @@ pub(super) fn file_send_loop(
 /// synthetic click could press whatever button sits under the drop point.
 /// Returns whether the paste was actually attempted; the file is on the
 /// clipboard (and on disk) either way.
+///
+/// `screen_normal`: the host's screen is the ordinary desktop (plans/10a
+/// §3.3). On a lock screen or another secure screen the focus request and
+/// the paste chord would go to that screen — a password field, a prompt — so
+/// the file is left on the clipboard.
 pub(super) fn deliver_received_file(
     path: &std::path::Path,
     drop_at: Option<(f64, f64)>,
     injector: Option<&mut dyn InputInjector>,
     platform: &dyn Platform,
     paste_dropped: bool,
+    screen_normal: bool,
 ) -> bool {
     let clipboard = platform.create_clipboard();
     if clipboard
@@ -155,6 +161,10 @@ pub(super) fn deliver_received_file(
         return false;
     }
     if !paste_dropped {
+        return false;
+    }
+    if !screen_normal {
+        tracing::info!("the screen is a secure screen — file left on the clipboard, not pasted");
         return false;
     }
     let (Some((nx, ny)), Some(inj)) = (drop_at, injector) else {
@@ -168,7 +178,8 @@ pub(super) fn deliver_received_file(
     std::thread::sleep(std::time::Duration::from_millis(120));
     let chord = inj.paste_chord();
     press_chord(inj, chord);
-    tracing::info!("pasted {path:?} at ({nx:.3}, {ny:.3})");
+    // No drop position here: pointer positions never go to a log (plans/10a K4).
+    tracing::info!("pasted {path:?} at the drop point");
     true
 }
 
@@ -209,6 +220,7 @@ mod tests {
             Some((0.2, 0.3)),
             Some(inj.as_mut()),
             &p,
+            true,
             true
         ));
         let log = p.injector.lock().unwrap();
@@ -236,7 +248,8 @@ mod tests {
             Some((0.5, 0.5)),
             Some(inj.as_mut()),
             &p,
-            false
+            false,
+            true
         ));
         assert!(p.injector.lock().unwrap().events.is_empty());
 
@@ -247,9 +260,32 @@ mod tests {
             Some((0.5, 0.5)),
             Some(inj.as_mut()),
             &p,
+            true,
             true
         ));
         assert!(p.injector.lock().unwrap().events.is_empty());
+        assert_eq!(p.clipboard.0.lock().unwrap().files, vec![file]);
+    }
+
+    /// plans/10a §3.3: on a lock screen (or any secure screen) the file is
+    /// filed on the clipboard and nothing is focused or typed — the chord
+    /// would land in whatever the secure screen has focused.
+    #[test]
+    fn delivery_never_pastes_onto_a_secure_screen() {
+        let p = MockPlatform::new(&std::env::temp_dir());
+        let file = temp_file("c.txt");
+        let mut inj = p.create_injector().unwrap();
+        assert!(!deliver_received_file(
+            &file,
+            Some((0.5, 0.5)),
+            Some(inj.as_mut()),
+            &p,
+            true,
+            false
+        ));
+        let log = p.injector.lock().unwrap();
+        assert!(log.events.is_empty());
+        assert!(log.focus_requests.is_empty());
         assert_eq!(p.clipboard.0.lock().unwrap().files, vec![file]);
     }
 }

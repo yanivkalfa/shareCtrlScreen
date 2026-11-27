@@ -122,6 +122,73 @@ pub enum ControlMsg {
     /// changes; keys are not positional and ignore it.
     #[serde(rename = "itgt")]
     InputTarget { s: u8 },
+    /// Host → Viewer: what the host's screen is (plans/10 §3.6, 10a §3.2).
+    /// Sent when the ctl channel opens and on every change, and only to a
+    /// viewer that advertised [`crate::signaling::Caps::hstate`]; a viewer
+    /// that never receives one (an older host) assumes `normal`. While
+    /// `blocked`, the viewer shows a message instead of the picture.
+    #[serde(rename = "hstate")]
+    HostState {
+        screen: HostScreen,
+        /// `secure` only: which secure screen, one of the `KIND_*` strings
+        /// in [`hstate`]. A value the viewer does not know is shown
+        /// generically, so a later host can add one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        /// `blocked` only: why it cannot be shown, one of the `WHY_*`
+        /// strings in [`hstate`]; unknown values are shown generically.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        why: Option<String>,
+    },
+}
+
+/// What a [`ControlMsg::HostState`] says the host's screen is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HostScreen {
+    /// A secure screen (the lock screen, a system prompt, the sign-in
+    /// screen) that is being streamed.
+    Secure,
+    /// A secure screen that cannot be shown: no picture until it is gone.
+    Blocked,
+    /// The ordinary desktop; the picture is what the person there sees.
+    /// Also what an unknown value from a later host parses as (serde puts
+    /// that catch-all on the last variant).
+    #[default]
+    #[serde(other)]
+    Normal,
+}
+
+impl HostScreen {
+    /// The wire value (for the UI, which uses the same words).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HostScreen::Normal => "normal",
+            HostScreen::Secure => "secure",
+            HostScreen::Blocked => "blocked",
+        }
+    }
+}
+
+/// The `kind` and `why` values of [`ControlMsg::HostState`] (10a §3.2).
+pub mod hstate {
+    /// `secure`: the lock screen of a signed-in user.
+    pub const KIND_LOCK: &str = "lock";
+    /// `secure`: a system prompt (Windows: User Account Control, the
+    /// Ctrl+Alt+Del screen).
+    pub const KIND_PROMPT: &str = "prompt";
+    /// `secure`: the sign-in screen with nobody signed in.
+    pub const KIND_SIGNIN: &str = "signin";
+    /// `blocked`: this host has no way to show the screen.
+    pub const WHY_UNSUPPORTED: &str = "unsupported";
+    /// `blocked`: the host's own setting is off.
+    pub const WHY_DISABLED: &str = "disabled";
+    /// `blocked`: the host machine's policy does not allow it.
+    pub const WHY_POLICY: &str = "policy";
+    /// `blocked`: the host's helper for the screen is not answering.
+    pub const WHY_AGENT: &str = "agent";
+    /// `blocked`: a view-only viewer is not shown secure screens.
+    pub const WHY_VIEW_ONLY: &str = "view-only";
 }
 
 /// A monitor streamed to a pop-out window (see [`ControlMsg::Displays`]).
@@ -241,6 +308,83 @@ mod tests {
         })
         .unwrap();
         assert_eq!(s, "{\"t\":\"seldisp\",\"id\":\"x11:HDMI-1\"}");
+    }
+
+    #[test]
+    fn host_state_wire_shape_roundtrips_and_omits_what_is_unset() {
+        let normal = ControlMsg::HostState {
+            screen: HostScreen::Normal,
+            kind: None,
+            why: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&normal).unwrap(),
+            r#"{"t":"hstate","screen":"normal"}"#
+        );
+        let blocked = ControlMsg::HostState {
+            screen: HostScreen::Blocked,
+            kind: None,
+            why: Some(hstate::WHY_UNSUPPORTED.into()),
+        };
+        let s = serde_json::to_string(&blocked).unwrap();
+        assert_eq!(
+            s,
+            r#"{"t":"hstate","screen":"blocked","why":"unsupported"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<ControlMsg>(&s).unwrap(),
+            ControlMsg::HostState { screen: HostScreen::Blocked, kind: None, why: Some(ref w) }
+                if w == "unsupported"
+        ));
+        let secure = ControlMsg::HostState {
+            screen: HostScreen::Secure,
+            kind: Some(hstate::KIND_LOCK.into()),
+            why: None,
+        };
+        let s = serde_json::to_string(&secure).unwrap();
+        assert_eq!(s, r#"{"t":"hstate","screen":"secure","kind":"lock"}"#);
+        assert!(matches!(
+            serde_json::from_str::<ControlMsg>(&s).unwrap(),
+            ControlMsg::HostState { screen: HostScreen::Secure, kind: Some(ref k), why: None }
+                if k == "lock"
+        ));
+    }
+
+    /// A later host may add screens and reasons: an unknown `screen` reads
+    /// as `normal`, unknown `kind` / `why` strings arrive as they are.
+    #[test]
+    fn host_state_from_a_later_host_still_parses() {
+        let m = serde_json::from_str::<ControlMsg>(
+            r#"{"t":"hstate","screen":"dimmed","kind":"kiosk","why":"later","extra":1}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            m,
+            ControlMsg::HostState { screen: HostScreen::Normal, kind: Some(ref k), why: Some(ref w) }
+                if k == "kiosk" && w == "later"
+        ));
+        assert!(matches!(
+            serde_json::from_str::<ControlMsg>(r#"{"t":"hstate","screen":"blocked"}"#).unwrap(),
+            ControlMsg::HostState {
+                screen: HostScreen::Blocked,
+                kind: None,
+                why: None
+            }
+        ));
+        for screen in [HostScreen::Normal, HostScreen::Secure, HostScreen::Blocked] {
+            assert_eq!(
+                serde_json::to_string(&screen).unwrap(),
+                format!("\"{}\"", screen.as_str())
+            );
+        }
+    }
+
+    /// `hstate` shares the ctl channel with input: no tag may collide, or an
+    /// old host would read it as input (10a §3.2).
+    #[test]
+    fn host_state_is_not_input() {
+        let s = r#"{"t":"hstate","screen":"blocked","why":"unsupported"}"#;
+        assert!(serde_json::from_str::<crate::InputMsg>(s).is_err());
     }
 
     #[test]

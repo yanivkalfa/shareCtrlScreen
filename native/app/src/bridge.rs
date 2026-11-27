@@ -143,8 +143,11 @@ fn host_session(
                 displays_json(&list, &current, can_switch, &popouts),
             )]
         }
-        SessionEvent::Phase(_) | SessionEvent::Released | SessionEvent::SurfaceReleased { .. } => {
-            Vec::new()
-        }
+        // `HostScreen` is the viewer's (what the remote screen is); this side
+        // is the host.
+        SessionEvent::Phase(_)
+        | SessionEvent::Released
+        | SessionEvent::SurfaceReleased { .. }
+        | SessionEvent::HostScreen { .. } => Vec::new(),
     }
 }

@@ -37,6 +37,12 @@ pub(crate) struct Moves {
 /// tracks the local pointer smoothly; a flowing stream returns sooner on data.
 const IDLE_REPAINT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
+/// How long after the host's screen came back the viewer waits for the
+/// keyframe that restarts the picture before it asks for one itself. Longer
+/// than a keyframe normally takes to arrive behind the message, so the usual
+/// case sends no request; short enough that a still screen is not left black.
+const POST_BLOCK_KEYFRAME_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// Viewer decode → present loop, with backlog catch-up, a keyframe watchdog and
 /// debounced view-size reports. The presenter and decoder are created here.
 pub(crate) fn viewer_media_loop(
@@ -64,9 +70,14 @@ pub(crate) fn viewer_media_loop(
         .codecs()
         .new_decoder(presenter.device(), codec, 1920, 1080)?;
     tracing::info!("viewer: decoder+presenter ready ({})", codec.as_caps_str());
+    // A pop-out shows itself, but not while the host's screen is blocked
+    // (K21): it then owes its show until the block ends. The transport
+    // thread shows the pop-outs it knows of when the block ends; this
+    // covers one that was not registered yet at that moment.
+    let mut owes_show = false;
     match &view {
         Some(v) => v.set_ready(),
-        None => surface.show(),
+        None => owes_show = !show_unless_blocked(surface.as_ref(), &shared),
     }
 
     let mut ts = 0i64;
@@ -85,6 +96,13 @@ pub(crate) fn viewer_media_loop(
     // Catch-up state: after locally dumping a delta backlog, deltas are useless
     // (their reference frames were skipped) until the requested IDR arrives.
     let mut awaiting_keyframe = false;
+    // When the host's last block ended, while the keyframe that restarts the
+    // picture after it has not come yet (plans/10 U1, K21). See the top of the
+    // loop and the idle tick.
+    let mut block_ended_at: Option<std::time::Instant> = None;
+    // Whether this loop has asked for that keyframe since the block ended
+    // (for the log level only).
+    let mut post_block_asked = false;
     // Tell the host what size we're actually displaying at, so it encodes to that
     // and we can present 1:1 (no resampling blur). Debounced: a drag-resize would
     // otherwise rebuild the host's encoder on every intermediate size.
@@ -102,7 +120,39 @@ pub(crate) fn viewer_media_loop(
     // re-presents only when the cursor actually moved (bounding the GPU work).
     let mut last_frame: Option<Frame<'_>> = None;
     let mut last_cursor: Option<(f64, f64)> = None;
+    // The host-block epoch `last_frame` was decoded in (plans/10 U1, K21).
+    // A held frame from before a block is never presented again: not by the
+    // repaint that follows the re-show, not by a cursor move. Compared at the
+    // top of each pass (so even a block that ended before this loop looked
+    // drops it) and again right before any present: a block can arrive while
+    // a pass waits for or decodes a frame.
+    let mut held_epoch = shared.host_block.epoch();
     while !stop.load(Ordering::SeqCst) {
+        let epoch = shared.host_block.epoch();
+        let host_blocked = epoch % 2 == 1;
+        if epoch != held_epoch {
+            last_frame = None;
+            held_epoch = epoch;
+            // The control channel and video are not ordered against each
+            // other. Frames encoded before the block can still be in flight
+            // (the host's pacer, the network, this queue) when the block's end
+            // has already arrived, and decoding them would show the screen
+            // from before the lock after it (K21; seen on a slow machine,
+            // where they came a second late). The host starts again with a
+            // keyframe (10a K5), so nothing older than the next keyframe is
+            // decoded: the catch-up state below skips deltas and asks for a
+            // keyframe, at most once a second, until one comes.
+            awaiting_keyframe = true;
+            // The other order: that keyframe can arrive before the block's
+            // end does, and is then decoded while still blocked, so never
+            // shown. On a still screen nothing would follow it. The idle tick
+            // asks for another once the block has been over for a moment.
+            block_ended_at = (!host_blocked).then(std::time::Instant::now);
+            post_block_asked = false;
+        }
+        if owes_show && !host_blocked {
+            owes_show = !show_unless_blocked(surface.as_ref(), &shared);
+        }
         // A move to another window (plans/09 W2): a presenter on the new
         // surface, on the decoder's device — the decoder and its held frame
         // stay, so nothing waits for a keyframe an idle host would not send.
@@ -184,6 +234,7 @@ pub(crate) fn viewer_media_loop(
                     }
                     pending.drain(..k);
                     awaiting_keyframe = false;
+                    block_ended_at = None;
                 } else if awaiting_keyframe {
                     // Deltas can't decode until the requested IDR arrives.
                     skipped += pending.len() as u64;
@@ -256,7 +307,13 @@ pub(crate) fn viewer_media_loop(
                             // frame is then exactly the screen at the pause,
                             // which is what an idle host — sending nothing
                             // until its screen changes — shows on return.
-                            if view.as_ref().is_none_or(|v| v.is_shown()) {
+                            // Read again, not this pass's copy: a block that
+                            // came while decoding stops the present (K21).
+                            let block_changed = shared.host_block.epoch() != held_epoch;
+                            if !host_blocked
+                                && !block_changed
+                                && view.as_ref().is_none_or(|v| v.is_shown())
+                            {
                                 present_frame(
                                     presenter.as_mut(),
                                     &shared,
@@ -268,7 +325,12 @@ pub(crate) fn viewer_media_loop(
                                 );
                             }
                             last_cursor = cursor;
-                            last_frame = Some(frame);
+                            // Decoded while blocked (in flight from before) or
+                            // across a change: kept for its references only,
+                            // never held.
+                            if !host_blocked && !block_changed {
+                                last_frame = Some(frame);
+                            }
                         }
                         Ok(None) => {
                             on_no_picture(&mut undecoded_streak, &mut last_kf_req, &ctl_tx, slot)
@@ -285,6 +347,39 @@ pub(crate) fn viewer_media_loop(
                 // otherwise stay black until the next frame). `swap` reads and
                 // clears the request atomically so it fires exactly once.
                 let repaint = shared.repaint_requested.swap(false, Ordering::SeqCst);
+                // The block is over and no keyframe has come since (see the
+                // top of the loop): ask for one, so a still screen does not
+                // stay black. The host defers a request that follows its own
+                // keyframe too closely, and never drops one. Only while the
+                // video is on screen: a background tab's stream is paused and
+                // its host sends nothing, so asking would repeat for as long
+                // as the tab stays there; when it returns, this tick asks.
+                if block_ended_at.is_some_and(|at| at.elapsed() >= POST_BLOCK_KEYFRAME_WAIT)
+                    && last_kf_req.elapsed() >= std::time::Duration::from_secs(1)
+                    && view.as_ref().is_none_or(|v| v.is_shown())
+                {
+                    // Once at info; a host that cannot answer yet (a still
+                    // screen delivers it no frame to encode) is asked again
+                    // every second, and that is not worth a line each time.
+                    if post_block_asked {
+                        tracing::debug!(
+                            "viewer: still no keyframe since the host's screen came back"
+                        );
+                    } else {
+                        tracing::info!("viewer: no keyframe since the host's screen came back — requesting one");
+                    }
+                    post_block_asked = true;
+                    let _ = ctl_tx.send(serialize(&protocol::ControlMsg::KeyframeRequest {
+                        s: slot,
+                    }));
+                    last_kf_req = std::time::Instant::now();
+                }
+                // Looked at again: a block (or a block and its end) may have
+                // come while this pass waited, and the re-show's repaint
+                // must not find the frame from before it (K21).
+                if shared.host_block.epoch() != held_epoch {
+                    last_frame = None;
+                }
                 match &last_frame {
                     Some(frame) => {
                         let (cursor, shape) = current_cursor(&shared, surface.as_ref());
@@ -320,6 +415,23 @@ pub(crate) fn viewer_media_loop(
         }
     }
     Ok(())
+}
+
+/// Show a pop-out's surface unless the host's screen is blocked; returns
+/// whether it is shown. Re-checked after the show: a block that starts
+/// between the check and the show finds the surface not yet registered or not
+/// yet shown, so the transport thread's hide may have come first — this
+/// hides it again and the show stays owed (K21).
+fn show_unless_blocked(surface: &dyn VideoSurface, shared: &Shared) -> bool {
+    if shared.host_block.blocked() {
+        return false;
+    }
+    surface.show();
+    if shared.host_block.blocked() {
+        surface.hide();
+        return false;
+    }
+    true
 }
 
 /// A decode error: logged, with the access unit's first bytes for the

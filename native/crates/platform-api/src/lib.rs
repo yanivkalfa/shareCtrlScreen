@@ -38,7 +38,10 @@ pub mod unavailable;
 #[cfg(feature = "mock")]
 pub mod mock;
 
-pub use capture::{CaptureError, CapturedFrame, CursorShape, CursorUpdate, ScreenCapture};
+pub use capture::{
+    BlockReason, CaptureError, CapturedFrame, CursorShape, CursorUpdate, ScreenAccess,
+    ScreenCapture, ScreenState, SecureKind,
+};
 pub use codec::{
     Codec, CodecError, CodecFactory, EncodedUnit, EncoderConfig, VideoDecoder, VideoEncoder,
 };
